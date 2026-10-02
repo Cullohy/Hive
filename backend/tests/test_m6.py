@@ -1,0 +1,770 @@
+"""M6 测试: 变更对比 / 导出 / 告警推送 / 周期监控 / 截图。
+
+重点验证五件事:
+  1. diff 能正确区分"新增 / 消失 / 变化"
+  2. 导出（含 xlsx）内容正确
+  3. 钉钉与飞书的签名算法与 ARL 一致（这两家签名最容易写错）
+  4. 监控首次运行只建基线、不告警；第二次才推变更
+  5. 截图模块在浏览器不可用时**软失败**，而不是把扫描搞挂
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import shutil
+import threading
+import unittest
+import uuid
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from unittest import mock
+
+from core.engine.event import Event, EventType
+from core.services.diff import ChangeSet, diff_scans
+from core.services.export import SHEET_KEYS, collect_assets, to_csv, to_json, to_xlsx
+from core.services.notify import (
+    DingTalkNotifier,
+    FeishuNotifier,
+    NotifyConfig,
+    NotifyHub,
+    dingtalk_sign,
+    feishu_sign,
+)
+from .pgutil import drop_storage, make_storage
+from core.web.manager import ScanManager
+from core.web.scheduler import MonitorScheduler
+
+TEST_TMP_ROOT = Path(__file__).resolve().parents[1] / ".testtmp"
+
+OFFLINE_PRESET = """
+name: offline
+description: 离线
+include:
+  - demo_expand
+settings:
+  forbidden_domains: []
+  max_events: 500
+"""
+
+
+def ev(etype: str, data: str, **tags) -> Event:
+    return Event(type=etype, data=data, module="test", tags=tags)
+
+
+# --------------------------------------------------------------------- 变更对比
+
+class DiffTestCase(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        self.root = TEST_TMP_ROOT / f"d{uuid.uuid4().hex[:10]}"
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.storage = await make_storage()
+
+    async def asyncTearDown(self) -> None:
+        await drop_storage(self.storage)
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def preset_file(self) -> Path:
+        path = self.root / "offline.yml"
+        path.write_text(OFFLINE_PRESET, encoding="utf-8")
+        return path
+
+    async def seed_old(self) -> int:
+        """旧扫描: 含 a/b 两个子域、一个 IP、一个端点、一个技术栈。"""
+        scan_id = await self.storage.create_scan(targets=["example.com"], preset="t")
+        for event in (
+            ev(EventType.SEED, "example.com"),
+            ev(EventType.DNS_NAME, "a.example.com", source="brute"),
+            ev(EventType.DNS_NAME, "b.example.com", source="brute"),
+            ev(EventType.IP_ADDRESS, "1.1.1.1", asn="AS1", org="OldOrg"),
+            ev(EventType.OPEN_TCP_PORT, "1.1.1.1:443", ip="1.1.1.1", port=443),
+            ev(EventType.HTTP_RESPONSE, "https://a.example.com",
+               url="https://a.example.com", domain="a.example.com", ip="1.1.1.1",
+               port=443, scheme="https", status=200, title="Hello", server="nginx"),
+            ev(EventType.TECHNOLOGY, "Nginx", host="a.example.com", evidence="header:server"),
+        ):
+            await self.storage.save_event(scan_id, event)
+            await self.storage.project(scan_id, event)
+        return scan_id
+
+    async def seed_new(self) -> int:
+        """新扫描: a 消失、c 新增、IP 归属变了、端点状态码变了、多了一个技术栈。"""
+        scan_id = await self.storage.create_scan(targets=["example.com"], preset="t")
+        for event in (
+            ev(EventType.SEED, "example.com"),
+            ev(EventType.DNS_NAME, "b.example.com", source="brute"),
+            ev(EventType.DNS_NAME, "c.example.com", source="passive"),
+            ev(EventType.IP_ADDRESS, "1.1.1.1", asn="AS1", org="NewOrg"),
+            ev(EventType.HTTP_RESPONSE, "https://a.example.com",
+               url="https://a.example.com", domain="a.example.com", ip="1.1.1.1",
+               port=443, scheme="https", status=403, title="Hello", server="cloudflare"),
+            ev(EventType.TECHNOLOGY, "Nginx", host="a.example.com", evidence="header:server"),
+            ev(EventType.TECHNOLOGY, "PHP", host="a.example.com", evidence="cookie:PHPSESSID"),
+        ):
+            await self.storage.save_event(scan_id, event)
+            await self.storage.project(scan_id, event)
+        return scan_id
+
+
+class TestDiff(DiffTestCase):
+    async def test_added_removed_changed(self) -> None:
+        old = await self.seed_old()
+        new = await self.seed_new()
+        changes = await diff_scans(self.storage, new, old)
+
+        added_domains = {i["key"] for i in changes.added.get("domains", [])}
+        removed_domains = {i["key"] for i in changes.removed.get("domains", [])}
+        self.assertEqual(added_domains, {"c.example.com"})
+        self.assertEqual(removed_domains, {"a.example.com"})
+
+        # IP 归属变化被识别为"变化"而不是"新增+消失"
+        ip_change = changes.changed.get("ips", [])
+        self.assertEqual(len(ip_change), 1)
+        self.assertEqual(ip_change[0]["diff"]["org"]["old"], "OldOrg")
+        self.assertEqual(ip_change[0]["diff"]["org"]["new"], "NewOrg")
+
+        # 端点的状态码与 Server 变化
+        endpoint_change = changes.changed.get("endpoints", [])
+        self.assertEqual(len(endpoint_change), 1)
+        self.assertEqual(endpoint_change[0]["diff"]["status"], {"old": 200, "new": 403})
+
+        # 技术栈只新增了 PHP
+        self.assertEqual(
+            {i["key"] for i in changes.added.get("technologies", [])},
+            {"a.example.com|PHP"},
+        )
+
+    async def test_first_scan_marks_everything_added(self) -> None:
+        new = await self.seed_new()
+        changes = await diff_scans(self.storage, new, None)
+        self.assertTrue(changes.added)
+        self.assertFalse(changes.removed)
+        self.assertFalse(changes.changed)
+        self.assertIn("首次", changes.to_markdown())
+
+    async def test_markdown_and_roundtrip(self) -> None:
+        old = await self.seed_old()
+        new = await self.seed_new()
+        changes = await diff_scans(self.storage, new, old)
+
+        text = changes.to_markdown()
+        self.assertIn("example.com", text)
+        self.assertIn("c.example.com", text)
+
+        # to_dict 产出可以再装回 ChangeSet（Web 的 POST /api/monitors/{id}/run 就是这么干的）
+        payload = changes.to_dict()
+        rebuilt = ChangeSet(
+            new_scan_id=payload["new_scan_id"], old_scan_id=payload["old_scan_id"],
+            target=payload["target"], added=payload["added"],
+            removed=payload["removed"], changed=payload["changed"],
+        )
+        self.assertEqual(rebuilt.total, changes.total)
+
+    async def test_unknown_scan_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            await diff_scans(self.storage, 99999, None)
+
+
+# --------------------------------------------------------------------- 导出
+
+class TestExport(DiffTestCase):
+    async def test_export_shapes(self) -> None:
+        scan_id = await self.seed_old()
+        assets = await collect_assets(self.storage, scan_id)
+        row = await self.storage.get_scan(scan_id)
+        scan = dict(row)
+        scan["scan_id"] = scan_id
+        scan["targets"] = json.loads(scan["targets_json"])
+
+        # JSON
+        payload = json.loads(to_json(scan, assets))
+        self.assertEqual(payload["scan"]["scan_id"], scan_id)
+        self.assertEqual(len(payload["assets"]["domains"]), 3)
+
+        # CSV
+        text = to_csv(assets, "domains")
+        lines = text.strip().splitlines()
+        self.assertIn("域名", lines[0])
+        self.assertEqual(len(lines), 4)  # 表头 + 3 个域名
+
+        with self.assertRaises(ValueError):
+            to_csv(assets, "nope")
+
+        # XLSX
+        data = to_xlsx(scan, assets)
+        self.assertTrue(data.startswith(b"PK"))  # zip 魔数
+        import io
+
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(io.BytesIO(data))
+        self.assertIn("概览", workbook.sheetnames)
+        self.assertIn("域名", workbook.sheetnames)
+        self.assertEqual(workbook["域名"].max_row, 4)
+
+    async def test_all_sheet_keys_exportable(self) -> None:
+        scan_id = await self.seed_old()
+        assets = await collect_assets(self.storage, scan_id)
+        for key in SHEET_KEYS:
+            self.assertIsInstance(to_csv(assets, key), str)
+
+
+# --------------------------------------------------------------------- 告警
+
+class TestSignatures(unittest.TestCase):
+    def test_dingtalk_sign_matches_manual_hmac(self) -> None:
+        import base64
+        import hashlib
+        import hmac
+        import urllib.parse
+
+        secret = "SEC000abc"
+        ts = "1700000000000"
+        expected_raw = hmac.new(
+            secret.encode(), f"{ts}\n{secret}".encode(), hashlib.sha256
+        ).digest()
+        expected = urllib.parse.quote_plus(base64.b64encode(expected_raw))
+        self.assertEqual(dingtalk_sign(secret, ts), expected)
+
+    def test_feishu_sign_uses_string_as_key_and_empty_message(self) -> None:
+        import base64
+        import hashlib
+        import hmac
+
+        secret = "FS000abc"
+        ts = "1700000000"
+        expected = base64.b64encode(
+            hmac.new(f"{ts}\n{secret}".encode(), b"", hashlib.sha256).digest()
+        ).decode()
+        self.assertEqual(feishu_sign(secret, ts), expected)
+
+    def test_dingtalk_url_contains_sign_only_with_secret(self) -> None:
+        notifier = DingTalkNotifier(None, "tok")  # type: ignore[arg-type]
+        self.assertEqual(
+            notifier.build_url("1700000000000"),
+            "https://oapi.dingtalk.com/robot/send?access_token=tok",
+        )
+        notifier = DingTalkNotifier(None, "tok", "sec")  # type: ignore[arg-type]
+        url = notifier.build_url("1700000000000")
+        self.assertIn("timestamp=1700000000000", url)
+        self.assertIn("&sign=", url)
+
+    def test_feishu_body_shape(self) -> None:
+        notifier = FeishuNotifier(None, "http://x", "sec")  # type: ignore[arg-type]
+        body = notifier.build_body("T", "hello", "1700000000")
+        self.assertEqual(body["msg_type"], "post")
+        self.assertEqual(body["timestamp"], "1700000000")
+        self.assertIn("sign", body)
+        content = body["content"]["post"]["zh_cn"]
+        self.assertEqual(content["title"], "T")
+        self.assertEqual(content["content"][0][0]["text"], "hello")
+
+
+class TestNotifyHub(unittest.IsolatedAsyncioTestCase):
+    def test_config_masks_secrets(self) -> None:
+        cfg = NotifyConfig(
+            enabled=True, webhook_url="http://x", webhook_token="t0ken",
+            dingtalk_secret="s3cret", email_password="pw",
+        )
+        out = cfg.to_dict()
+        self.assertNotIn("webhook_token", out)
+        self.assertTrue(out["webhook_token_set"])
+        self.assertTrue(out["dingtalk_secret_set"])
+        self.assertTrue(out["email_password_set"])
+        self.assertEqual(out["webhook_url"], "http://x")
+
+    def test_apply_does_not_wipe_secrets_when_absent(self) -> None:
+        cfg = NotifyConfig(webhook_url="http://x", webhook_token="keepme")
+        cfg.apply({"enabled": True, "min_changes": 3})
+        self.assertEqual(cfg.webhook_token, "keepme")
+        self.assertTrue(cfg.enabled)
+        self.assertEqual(cfg.min_changes, 3)
+
+    def test_channels(self) -> None:
+        self.assertEqual(NotifyConfig().channels(), [])
+        cfg = NotifyConfig(
+            webhook_url="http://a", dingtalk_access_token="t",
+            feishu_webhook="http://b", wxwork_webhook="http://c",
+            email_host="smtp", email_to="a@b.c",
+        )
+        self.assertEqual(cfg.channels(), ["webhook", "dingtalk", "feishu", "wxwork", "email"])
+
+    async def test_broadcast_is_a_noop_when_disabled(self) -> None:
+        hub = NotifyHub(NotifyConfig(enabled=False, webhook_url="http://x"))
+        self.assertEqual(await hub.broadcast("t", "x"), [])
+        await hub.aclose()
+
+    async def test_broadcast_reports_each_channel(self) -> None:
+        cfg = NotifyConfig(enabled=True, webhook_url="http://a", wxwork_webhook="http://b")
+        hub = NotifyHub(cfg)
+        sent: list[str] = []
+
+        class FakeResponse:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def json(self, content_type=None):
+                return {"errcode": 0}
+
+        async def fake_request(self, method, url, **kwargs):
+            sent.append(url)
+            return FakeResponse()
+
+        with mock.patch("core.services.http.HTTPClient.request", fake_request):
+            results = await hub.broadcast("标题", "正文")
+        await hub.aclose()
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(r["ok"] for r in results))
+        self.assertEqual(sorted(sent), ["http://a", "http://b"])
+
+
+# --------------------------------------------------------------------- 周期监控
+
+class TestMonitorScheduler(DiffTestCase):
+    async def _scheduler(self, notify: NotifyHub) -> MonitorScheduler:
+        manager = ScanManager(self.storage)
+        scheduler = MonitorScheduler(manager, self.storage, notify, tick_seconds=5)
+        manager.on_finished = scheduler.on_scan_finished
+        return scheduler
+
+    async def _wait(self, manager: ScanManager, scan_id: int, timeout: float = 60.0) -> None:
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            record = manager.get(scan_id)
+            # finalizing 表示后处理（变更对比/告警）还没做完, 必须继续等
+            if record is None or record.is_terminal:
+                return
+            await asyncio.sleep(0.1)
+        raise AssertionError("扫描未在超时内结束")
+
+    async def test_due_monitor_runs_and_builds_baseline_without_alert(self) -> None:
+        preset = self.preset_file()
+        monitor_id = await self.storage.create_monitor(
+            name="m1", targets=["example.com"], preset=str(preset), interval_minutes=1
+        )
+
+        notified: list[str] = []
+
+        class SpyHub(NotifyHub):
+            async def broadcast(self, title, text, level="info"):
+                notified.append(title)
+                return []
+
+        hub = SpyHub(NotifyConfig(enabled=True, webhook_url="http://x", min_changes=1))
+        scheduler = await self._scheduler(hub)
+        manager = scheduler.manager
+
+        started = await scheduler.run_due()
+        self.assertEqual(len(started), 1)
+        await self._wait(manager, started[0])
+
+        # 基线建立: 有 change 记录, 但**不告警**
+        change = await self.storage.change_for_scan(started[0])
+        self.assertIsNotNone(change)
+        self.assertEqual(notified, [])
+
+        row = await self.storage.get_monitor(monitor_id)
+        self.assertEqual(row["last_scan_id"], started[0])
+        self.assertIsNotNone(row["next_run_at"])
+
+        # 下一次不再立刻到期
+        self.assertEqual(await self.storage.due_monitors(), [])
+        await hub.aclose()
+
+    async def test_second_run_alerts_on_changes(self) -> None:
+        preset = self.preset_file()
+        await self.storage.create_monitor(
+            name="m2", targets=["example.com"], preset=str(preset), interval_minutes=1
+        )
+
+        notified: list[tuple[str, str]] = []
+
+        class SpyHub(NotifyHub):
+            async def broadcast(self, title, text, level="info"):
+                notified.append((title, text))
+                return [{"channel": "spy", "ok": True, "detail": ""}]
+
+        hub = SpyHub(NotifyConfig(enabled=True, webhook_url="http://x", min_changes=1))
+        scheduler = await self._scheduler(hub)
+        manager = scheduler.manager
+
+        # 第一次: 建基线
+        scan1 = (await scheduler.run_due())[0]
+        await self._wait(manager, scan1)
+        self.assertEqual(notified, [])
+
+        # 人为往第一次扫描里塞一条资产, 制造"第二次会消失"的差异
+        await self.storage.save_event(scan1, ev(EventType.DNS_NAME, "ghost.example.com"))
+        await self.storage.project(scan1, ev(EventType.DNS_NAME, "ghost.example.com"))
+
+        # 让监控立刻到期, 跑第二次
+        await self.storage.update_monitor(1, next_run_at=None)
+        scans = await scheduler.run_due()
+        self.assertEqual(len(scans), 1)
+        await self._wait(manager, scans[0])
+
+        self.assertEqual(len(notified), 1)
+        title, text = notified[0]
+        self.assertIn("example.com", title)
+        self.assertIn("消失", text)
+        self.assertIn("ghost.example.com", text)
+        await hub.aclose()
+
+    async def test_run_monitor_now(self) -> None:
+        preset = self.preset_file()
+        monitor_id = await self.storage.create_monitor(
+            name="m3", targets=["example.com"], preset=str(preset)
+        )
+        hub = NotifyHub(NotifyConfig())
+        scheduler = await self._scheduler(hub)
+        scan_id = await scheduler.run_monitor_now(monitor_id)
+        await self._wait(scheduler.manager, scan_id)
+        row = await self.storage.get_monitor(monitor_id)
+        self.assertEqual(row["last_run_at"] is not None, True)
+        await hub.aclose()
+
+    async def test_trigger_failure_backs_off(self) -> None:
+        """并发打满时不该每个 tick 都撞一次。"""
+        await self.storage.create_monitor(name="m4", targets=["example.com"], preset="default")
+        hub = NotifyHub(NotifyConfig())
+        scheduler = await self._scheduler(hub)
+        scheduler.manager.max_concurrent = 0  # 强制触发 RuntimeError
+
+        started = await scheduler.run_due()
+        self.assertEqual(started, [])
+        row = await self.storage.get_monitor(1)
+        self.assertIsNotNone(row["next_run_at"])
+        await hub.aclose()
+
+
+# --------------------------------------------------------------------- 截图
+
+class TestScreenshotSoftFail(unittest.IsolatedAsyncioTestCase):
+    async def test_setup_soft_fails_without_browser(self) -> None:
+        """浏览器起不来时必须软失败（禁用模块），而不是抛错中断扫描。"""
+        from core.domains.probe.screenshot import screenshot
+
+        scanner = mock.Mock()
+        scanner.log = None
+        scanner.settings = {}
+        module = screenshot(scanner, {})
+        module.log = mock.Mock()
+
+        async def boom(self, async_playwright):
+            return False, "启动 Chromium 失败: 假装没有浏览器"
+
+        with mock.patch.object(screenshot, "_launch", boom):
+            result = await module.setup()
+        self.assertEqual(result, (None, "启动 Chromium 失败: 假装没有浏览器"))
+
+
+class TestScreenshotReal(unittest.IsolatedAsyncioTestCase):
+    """真跑一次 Playwright 截图（对着本地 http.server，不依赖外网）。"""
+
+    PORT = 8799
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        try:
+            from playwright.async_api import async_playwright  # noqa: F401
+        except ImportError:
+            raise unittest.SkipTest("未安装 playwright")
+        cls.serve_dir = TEST_TMP_ROOT / "shot_site"
+        cls.serve_dir.mkdir(parents=True, exist_ok=True)
+        (cls.serve_dir / "index.html").write_text(
+            "<html><head><title>Shot Page</title></head><body><h1>hi</h1></body></html>",
+            encoding="utf-8",
+        )
+
+        class Handler(SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=str(cls.serve_dir), **kwargs)
+
+            def log_message(self, *args):  # 静音
+                pass
+
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", cls.PORT), Handler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    async def test_capture_writes_png_to_db(self) -> None:
+        """截图落 **DB BLOB**（``http_endpoint.screenshot_data``），不再是磁盘文件 + FINDING。
+
+        这个模块改过设计：截图是二进制，塞不进事件载荷，所以从"发一条带相对路径的
+        FINDING、再由投影回填"改成"直接按 URL 写 http_endpoint"。
+        老的断言（找 ``kind == "screenshot"`` 的 finding、再去磁盘上找文件）已经
+        不成立了 —— 它们钉的是旧行为。
+        """
+        from core.engine.preset import Preset
+        from core.engine.scanner import Scanner
+
+        TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        root = TEST_TMP_ROOT / f"s{uuid.uuid4().hex[:10]}"
+        mods = root / "mods"
+        mods.mkdir(parents=True, exist_ok=True)
+        (mods / "emit_url.py").write_text(
+            "from core.engine.event import EventType\n"
+            "from core.engine.module import BaseModule\n\n\n"
+            "class emit_url(BaseModule):\n"
+            "    watched_events = (EventType.SEED,)\n"
+            "    produced_events = (EventType.HTTP_RESPONSE, EventType.URL)\n"
+            "    flags = ('passive', 'safe')\n\n"
+            "    async def handle_event(self, event):\n"
+            f"        url = 'http://127.0.0.1:{self.PORT}/'\n"
+            "        # 先把端点建出来。截图模块是**按 URL 写 http_endpoint** 的，\n"
+            "        # 真实扫描里那一行由 http_probe 产出；这里省掉它就得自己造。\n"
+            "        await self.emit_event(\n"
+            "            url, EventType.HTTP_RESPONSE, parent=event,\n"
+            "            tags={'url': url, 'domain': '127.0.0.1', 'ip': '127.0.0.1',\n"
+            f"                  'port': {self.PORT}, 'scheme': 'http', 'status': 200,\n"
+            "                  'title': 'T'})\n"
+            "        await self.emit_event(url, EventType.URL, parent=event)\n",
+            encoding="utf-8",
+        )
+
+        storage = await make_storage()
+        shots_dir = root / "screenshots"
+        try:
+            preset = Preset(
+                name="t",
+                include=["emit_url", "screenshot"],
+                module_dirs=[str(mods)],
+                settings={"forbidden_domains": [], "screenshots_dir": str(shots_dir)},
+            )
+            scanner = Scanner(targets=["example.com"], preset=preset, storage=storage)
+            try:
+                summary = await scanner.scan()
+            except Exception as e:  # 浏览器环境问题不算产品缺陷
+                self.skipTest(f"Chromium 不可用: {e}")
+
+            if "screenshot" not in summary["modules_enabled"]:
+                self.skipTest(
+                    f"screenshot 模块未启用: {summary['modules_skipped'].get('screenshot')}"
+                )
+
+            url = f"http://127.0.0.1:{self.PORT}/"
+            endpoints = await storage.endpoints(scanner.scan_id)
+            with_shot = [e for e in endpoints if e["screenshot"]]
+            self.assertEqual(len(with_shot), 1, f"endpoints={endpoints}")
+
+            # 二进制真的写进去了，而且是 PNG。
+            #
+            # ⚠️ 走 `screenshot_blob()` 而不是从 `endpoints()` 里取 —— 端点行
+            # **不该带** BYTEA（会让 API 序列化 500，见上面几条测试的说明）。
+            blob = await storage.screenshot_blob(scanner.scan_id, url)
+            self.assertIsNotNone(blob, "screenshot_data 是空的")
+            self.assertTrue(bytes(blob).startswith(b"\x89PNG"), "不是 PNG")
+            self.assertGreater(len(bytes(blob)), 1000)
+
+            # 相对路径形态保持 {scan_id}/{sha256(url)[:16]}.png —— 前端兼容它
+            expected = (
+                f"{scanner.scan_id}/"
+                f"{hashlib.sha256(url.encode()).hexdigest()[:16]}.png"
+            )
+            self.assertEqual(with_shot[0]["screenshot"], expected)
+
+            # **不再产 FINDING** —— 那正是这次设计改动的内容
+            findings = await storage.findings(scanner.scan_id)
+            self.assertEqual(
+                [f for f in findings if f["kind"] == "screenshot"], [],
+                f"不该再有截图 FINDING: {findings}",
+            )
+        finally:
+            await storage.close()
+            shutil.rmtree(root, ignore_errors=True)
+
+
+class TestScreenshotProjection(DiffTestCase):
+    async def test_save_screenshot_writes_blob_and_path(self) -> None:
+        """截图二进制 + 相对路径**一起**写进 ``http_endpoint``。
+
+        原来这条测的是"FINDING 投影回填端点"，现在那条链路已经没有了 ——
+        模块直接调 ``save_screenshot``。所以这里改成直接钉存储层的行为。
+        """
+        scan_id = await self.storage.create_scan(targets=["example.com"], preset="t")
+        for event in (
+            ev(EventType.DNS_NAME, "www.example.com", source="brute"),
+            ev(EventType.IP_ADDRESS, "1.1.1.1"),
+            ev(EventType.OPEN_TCP_PORT, "1.1.1.1:80", ip="1.1.1.1", port=80),
+            ev(EventType.HTTP_RESPONSE, "http://www.example.com",
+               url="http://www.example.com", domain="www.example.com", ip="1.1.1.1",
+               port=80, scheme="http", status=200, title="T"),
+        ):
+            await self.storage.save_event(scan_id, event)
+            await self.storage.project(scan_id, event)
+
+        url = "http://www.example.com"
+        png = b"\x89PNG\r\n\x1a\n" + b"x" * 128
+        self.assertTrue(await self.storage.save_screenshot(scan_id, url, png))
+
+        endpoints = await self.storage.endpoints(scan_id)
+        self.assertEqual(len(endpoints), 1)
+        expected = (
+            f"{scan_id}/{hashlib.sha256(url.encode()).hexdigest()[:16]}.png"
+        )
+        self.assertEqual(endpoints[0]["screenshot"], expected)
+
+        # ⚠️ **``endpoints()`` 绝不能带 ``screenshot_data``。**
+        #
+        # 它返回的 dict 会被 FastAPI 直接序列化成 JSON，而截图是 BYTEA ——
+        # 实测抛 `invalid utf-8 sequence of 1 bytes from index 0`，
+        # **整个任务详情页 500**。
+        #
+        # 这条断言以前是反的（要求 blob 在里面），所以那个 bug 被测试**钉成了
+        # 期望行为**，一直没被发现。图片本身走
+        # `GET /api/screenshots/{scan_id}/{url}` → `screenshot_blob()`。
+        self.assertNotIn(
+            "screenshot_data", endpoints[0],
+            "endpoints() 带了截图二进制 —— 会让 API 序列化直接 500",
+        )
+        # 而按需取二进制仍然拿得到
+        self.assertEqual(await self.storage.screenshot_blob(scan_id, url), png)
+
+    async def test_screenshot_blob_is_scoped_to_the_scan_that_saw_it(self) -> None:
+        """截图按"**这次扫描看到过**"取，不是按"谁最先发现的"。
+
+        跨 scan 去重之后 ``http_endpoint.scan_id`` 只是"谁最先发现的"，
+        重扫同一目标时资产行留在旧扫描名下。如果按那个字段查，**新任务取自己的
+        截图会 404**（而页面上的链接正是新任务 id）。
+        """
+        url = "http://www.example.com"
+        png = b"\x89PNG\r\n\x1a\n" + b"y" * 64
+
+        async def seed() -> int:
+            sid = await self.storage.create_scan(targets=["example.com"], preset="t")
+            for event in (
+                ev(EventType.DNS_NAME, "www.example.com", source="brute"),
+                ev(EventType.IP_ADDRESS, "1.1.1.1"),
+                ev(EventType.OPEN_TCP_PORT, "1.1.1.1:80", ip="1.1.1.1", port=80),
+                ev(EventType.HTTP_RESPONSE, url, url=url, domain="www.example.com",
+                   ip="1.1.1.1", port=80, scheme="http", status=200, title="T"),
+            ):
+                await self.storage.save_event(sid, event)
+                await self.storage.project(sid, event)
+            return sid
+
+        first = await seed()
+        self.assertTrue(await self.storage.save_screenshot(first, url, png))
+        second = await seed()          # 重扫同一个目标
+
+        self.assertEqual(await self.storage.screenshot_blob(first, url), png)
+        self.assertEqual(
+            await self.storage.screenshot_blob(second, url), png,
+            "重扫之后新任务取不到自己看到的截图",
+        )
+        # 没看到过它的扫描取不到（既没 500 也不会串）
+        third = await self.storage.create_scan(targets=["other.com"], preset="t")
+        self.assertIsNone(await self.storage.screenshot_blob(third, url))
+
+    async def test_endpoints_never_pull_the_blob(self) -> None:
+        """``endpoints()`` 的 SQL 里不该出现 ``screenshot_data``。
+
+        上面那条断言测的是"结果里没有"，这条测的是"**压根没去取**"——
+        否则每次列端点都要从数据库搬几 MB 的二进制。
+        """
+        import inspect
+        import re as _re
+
+        from core.storage.postgres import PostgresStorage
+
+        src = inspect.getsource(PostgresStorage.endpoints)
+        # ⚠️ 先把注释去掉：这个方法为了讲清"为什么不能用 SELECT *"**在注释里
+        # 提到了 screenshot_data**，直接搜源码会把注释也算命中（第一版就这么错的）。
+        code = "\n".join(
+            ln for ln in src.splitlines() if not ln.strip().startswith("#")
+        )
+        # 去掉行尾注释
+        code = _re.sub(r"#.*$", "", code, flags=_re.M)
+        self.assertNotIn("screenshot_data", code)
+        self.assertNotIn("SELECT *", code, "endpoints() 用了 SELECT *")
+        # 但截图**路径**必须留着 —— 前端靠它显示缩略图
+        self.assertIn("screenshot", code)
+
+    async def test_save_screenshot_for_unknown_url_is_a_noop(self) -> None:
+        """URL 对不上任何端点时不能报错、也不能误伤别的行。
+
+        截图是**扫描末尾**并行落盘的，目标端点可能因为超时/被删而不在表里 ——
+        那种情况下静默跳过是对的，抛出去会把整条截图链打断。
+        """
+        scan_id = await self.storage.create_scan(targets=["example.com"], preset="t")
+        for event in (
+            ev(EventType.DNS_NAME, "www.example.com", source="brute"),
+            ev(EventType.IP_ADDRESS, "1.1.1.1"),
+            ev(EventType.OPEN_TCP_PORT, "1.1.1.1:80", ip="1.1.1.1", port=80),
+            ev(EventType.HTTP_RESPONSE, "http://www.example.com",
+               url="http://www.example.com", domain="www.example.com", ip="1.1.1.1",
+               port=80, scheme="http", status=200, title="T"),
+        ):
+            await self.storage.save_event(scan_id, event)
+            await self.storage.project(scan_id, event)
+
+        self.assertTrue(
+            await self.storage.save_screenshot(scan_id, "http://nope.invalid/", b"\x89PNG")
+        )
+        endpoints = await self.storage.endpoints(scan_id)
+        self.assertEqual(len(endpoints), 1)
+        self.assertIsNone(endpoints[0]["screenshot"], "误伤了不相关的端点")
+        # 二进制也不该出现在端点行里（见上一条测试的说明）
+        self.assertNotIn("screenshot_data", endpoints[0])
+        self.assertIsNone(
+            await self.storage.screenshot_blob(scan_id, "http://nope.invalid/")
+        )
+
+
+class TestEnvironmentGuards(unittest.TestCase):
+    """两个被真实环境咬过的坑, 各留一个回归测试。"""
+
+    def test_logging_level_is_updatable(self) -> None:
+        """任何模块 import 时取 logger, 都不能把调用方设的 DEBUG 冲回 INFO。
+
+        早先 `setup_logging` 是"首次调用即定稿", 而 `core/state.py` 在 import
+        时就取了 logger —— 结果 `-v/--verbose` 完全失效, 连排查用的 debug 日志
+        也一起被吞掉。
+        """
+        import logging
+
+        from core.engine.log import get_logger, setup_logging
+
+        get_logger("early")              # 模拟 import 期提前取 logger
+        setup_logging("DEBUG")
+        root = logging.getLogger("recon")
+        self.assertEqual(root.level, logging.DEBUG)
+        self.assertEqual(root.handlers[0].level, logging.DEBUG)
+        self.assertTrue(get_logger("t").isEnabledFor(logging.DEBUG))
+
+        # 再调一次应当降到 INFO, 而不是被忽略
+        setup_logging("INFO")
+        self.assertEqual(root.handlers[0].level, logging.INFO)
+        self.assertFalse(get_logger("t").isEnabledFor(logging.DEBUG))
+
+        setup_logging("INFO")  # 复原, 免得影响后面的测试输出
+
+    def test_mimetypes_get_corrected(self) -> None:
+        """Windows 注册表可能把 .png 映射成 silenteye/png, Playwright 会因此拒拍。"""
+        import mimetypes
+
+        import core
+        from core.util.mime import CANONICAL, fix_common_mimetypes
+
+        fix_common_mimetypes()  # 幂等
+        for ext, expected in CANONICAL.items():
+            got, _ = mimetypes.guess_type("x" + ext)
+            self.assertEqual(got, expected, f"{ext} 的 MIME 没有被纠正")
+        self.assertIsInstance(core._MIME_FIXES, list)
+
+
+if __name__ == "__main__":
+    unittest.main()

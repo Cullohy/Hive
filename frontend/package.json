@@ -1,0 +1,23 @@
+{
+  "name": "recon-frontend",
+  "version": "0.7.0",
+  "private": true,
+  "type": "module",
+  "description": "recon 信息收集引擎的前端（布局与配色对标 ARL / HunterX）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@ant-design/icons-vue": "^7.0.1",
+    "ant-design-vue": "^4.2.6",
+    "axios": "^1.7.9",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "vite": "^6.0.11"
+  }
+}

@@ -1,0 +1,6 @@
+asyncpg>=0.29
+dnspython>=2.2
+PyYAML>=6.0
+rich>=13.0
+# favicon 哈希（Shodan 口径）。缺了它探测仍能跑，但 favicon 指纹静默失效。
+mmh3>=4.0

@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "recon"
+version = "0.7.0"
+description = "事件驱动信息收集引擎 (BBOT 事件模型 x ARL 能力实现), 不使用 Docker"
+# readme 指向仓库根，而 pyproject 在 backend/ 下 —— 跨出项目目录的路径
+# setuptools 不一定接受，所以这里干脆不声明，文档以仓库根 README.md 为准。
+requires-python = ">=3.11"
+dependencies = [
+    "asyncpg>=0.29",
+    "dnspython>=2.2",
+    "PyYAML>=6.0",
+    # favicon 哈希（Shodan 口径）。缺了它探测仍能跑，但 favicon 指纹静默失效。
+    "mmh3>=4.0",
+]
+
+[project.optional-dependencies]
+cli = ["rich>=13.0"]
+web = ["fastapi>=0.110", "uvicorn>=0.27"]
+screenshot = ["playwright>=1.40"]
+export = ["openpyxl>=3.1"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+recon = "core.server:main"
+
+[tool.setuptools.packages.find]
+include = ["core*"]
+
+[tool.setuptools.package-data]
+"core.presets" = ["*.yml"]
+"core.storage" = ["*.sql"]
+# 随包分发的静态资源（字典 / 指纹 / CDN 库 / 端口集）。
+# 与 <仓库根>/data/ 无关 —— 那个是运行时产物，不进包。
+"core.resources" = ["*.json", "*.txt", "*.md"]
+# 前端不再打包进 Python 包: 它是独立的 frontend/ 工程, 构建产物由后端在
+# 运行时按路径查找 (见 recon/util/paths.py::frontend_dist)
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

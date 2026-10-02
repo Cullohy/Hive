@@ -1,0 +1,239 @@
+/* ─────────────────────────────────────────────────────────────
+   主题令牌 —— 与 ARL (HunterX 配色) 一致：近黑侧栏 + 橙红强调色
+   ───────────────────────────────────────────────────────────── */
+:root {
+  --tk-primary: #1a1a1a;
+  --tk-primary-hover: #333333;
+  --tk-accent: #c2410c;
+  --tk-accent-hover: #ea580c;
+  --tk-accent-dark: #9a3412;
+  --tk-accent-soft: rgba(194, 65, 12, 0.1);
+  --tk-accent-soft-2: rgba(194, 65, 12, 0.15);
+
+  --tk-surface: #ffffff;
+  --tk-surface-2: #f5f5f5;
+  --tk-surface-3: #e6e6e6;
+
+  --tk-border: #e5e7eb;
+  --tk-border-light: #f0f0f0;
+
+  --tk-text: #1a1a1a;
+  --tk-text-secondary: #6b7280;
+  --tk-text-muted: #9ca3af;
+
+  --tk-bg: #ffffff;
+  --tk-bg-soft: #fafbfc;
+  --tk-bg-card: #f8f9fb;
+
+  /* 布局尺寸（和 ARL 一致） */
+  --tk-sider-width: 170px;
+  --tk-sider-collapsed: 50px;
+  --tk-header-height: 64px;
+  --tk-side-text: #a0a0a0;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', Roboto,
+    'Helvetica Neue', Arial, sans-serif;
+  font-size: 14px;
+  color: var(--tk-text);
+  background: var(--tk-bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--tk-accent);
+}
+a:hover {
+  color: var(--tk-accent-hover);
+}
+
+/* ─────────────────────────────────────────────────────────────
+   ant-design-vue 覆盖：默认主色是紫色，这里统一压成橙红
+   ───────────────────────────────────────────────────────────── */
+.ant-btn-primary {
+  background-color: var(--tk-accent) !important;
+  border-color: var(--tk-accent) !important;
+}
+.ant-btn-primary:not(:disabled):hover,
+.ant-btn-primary:not(:disabled):focus {
+  background-color: var(--tk-accent-hover) !important;
+  border-color: var(--tk-accent-hover) !important;
+}
+.ant-btn-primary:not(:disabled):active {
+  background-color: var(--tk-accent-dark) !important;
+  border-color: var(--tk-accent-dark) !important;
+}
+.ant-btn-default {
+  border-color: var(--tk-border);
+}
+.ant-btn-default:not(:disabled):hover {
+  border-color: var(--tk-accent);
+  color: var(--tk-accent);
+}
+.ant-btn-link,
+.ant-btn-link:hover {
+  color: var(--tk-accent) !important;
+}
+
+.ant-input:hover,
+.ant-input:focus,
+.ant-input-focused,
+.ant-input-affix-wrapper:hover,
+.ant-input-affix-wrapper-focused,
+.ant-select:not(.ant-select-disabled):hover .ant-select-selector,
+.ant-select-focused .ant-select-selector {
+  border-color: var(--tk-accent) !important;
+}
+.ant-input:focus,
+.ant-input-focused,
+.ant-input-affix-wrapper-focused,
+.ant-select-focused .ant-select-selector {
+  box-shadow: 0 0 0 2px var(--tk-accent-soft) !important;
+}
+.ant-select-item-option-selected:not(.ant-select-item-option-disabled) {
+  background-color: rgba(194, 65, 12, 0.08) !important;
+}
+
+.ant-tabs-tab.ant-tabs-tab-active .ant-tabs-tab-btn {
+  color: var(--tk-accent) !important;
+}
+.ant-tabs-ink-bar {
+  background: var(--tk-accent) !important;
+}
+.ant-tabs-tab:hover {
+  color: var(--tk-accent-hover) !important;
+}
+
+.ant-table-thead > tr > th {
+  background: var(--tk-bg-card) !important;
+  color: var(--tk-text) !important;
+  border-bottom: 1px solid var(--tk-border) !important;
+  font-weight: 600;
+}
+.ant-table-tbody > tr:hover > td {
+  background: rgba(194, 65, 12, 0.04) !important;
+}
+
+.ant-pagination-item-active {
+  border-color: var(--tk-accent) !important;
+}
+.ant-pagination-item-active a {
+  color: var(--tk-accent) !important;
+}
+.ant-switch-checked {
+  background: var(--tk-accent) !important;
+}
+.ant-progress-bg {
+  background-color: var(--tk-accent) !important;
+}
+.ant-checkbox-checked .ant-checkbox-inner {
+  background-color: var(--tk-accent) !important;
+  border-color: var(--tk-accent) !important;
+}
+.ant-radio-button-wrapper-checked:not(.ant-radio-button-wrapper-disabled) {
+  color: var(--tk-accent) !important;
+  border-color: var(--tk-accent) !important;
+}
+.ant-modal-title,
+.ant-drawer-title {
+  color: var(--tk-text) !important;
+  font-weight: 600;
+}
+.ant-spin-dot-item {
+  background-color: var(--tk-accent) !important;
+}
+
+/* 滚动条收细，和 ARL 一致 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #d1d5db;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #9ca3af;
+}
+
+/* ─────────────────────────────────────────────────────────────
+   通用小工具
+   ───────────────────────────────────────────────────────────── */
+.tk-page {
+  /* 页面内容容器：所有视图统一用它，保证留白一致 */
+  padding: 0;
+}
+
+.tk-card {
+  background: var(--tk-surface);
+  border: 1px solid var(--tk-border);
+  border-radius: 6px;
+  padding: 16px 20px;
+  margin-bottom: 16px;
+}
+
+.tk-card-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0 0 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tk-muted {
+  color: var(--tk-text-secondary);
+}
+.tk-mono {
+  font-family: Consolas, Monaco, 'Courier New', monospace;
+  font-size: 12.5px;
+  word-break: break-all;
+}
+/* 「产出 0」的源：一眼看出它是白跑的 —— 配合「源统计」页的红色错误数一起看 */
+.tk-zero {
+  color: var(--tk-text-muted);
+}
+.tk-empty {
+  color: var(--tk-text-muted);
+  text-align: center;
+  padding: 28px 0;
+}
+.tk-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 12px;
+}
+.tk-stat {
+  background: var(--tk-bg-card);
+  border: 1px solid var(--tk-border);
+  border-radius: 6px;
+  padding: 14px 16px;
+}
+.tk-stat-label {
+  color: var(--tk-text-secondary);
+  font-size: 12.5px;
+  margin-bottom: 6px;
+}
+.tk-stat-value {
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.1;
+}
+.tk-stat-value.accent {
+  color: var(--tk-accent);
+}
