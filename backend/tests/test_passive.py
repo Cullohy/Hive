@@ -18,6 +18,22 @@ from core.services.http import HTTPClient
 
 from .base import EngineTestCase
 
+#: 一个只往 SEED 上挂一条 gov.cn 子域的最小模块，用来端到端验证
+#: 「敏感域名闸门删干净了」。原来这套闸门会在分发器里把这条子域丢掉。
+GOV_EMITTER = """
+    from core.engine.event import EventType
+    from core.engine.module import BaseModule
+
+
+    class govleak(BaseModule):
+        watched_events = (EventType.SEED,)
+        produced_events = (EventType.DNS_NAME,)
+        flags = ("passive", "safe")
+
+        async def handle_event(self, event):
+            await self.emit_event("jwc.gov.cn", EventType.DNS_NAME, parent=event)
+"""
+
 # --------------------------------------------------------------------- 清洗规则
 
 class TestSanitize(unittest.TestCase):
@@ -46,12 +62,6 @@ class TestSanitize(unittest.TestCase):
             "-lead.example.com",        # 标签以连字符开头
         ]
         self.assertEqual(sanitize_subdomains(raw, "example.com"), ["ok.example.com"])
-
-    def test_forbidden_filter(self) -> None:
-        self.assertEqual(
-            sanitize_subdomains(["a.example.com"], "example.com", forbidden=["example.com"]),
-            [],
-        )
 
     def test_handles_junk_input(self) -> None:
         self.assertEqual(sanitize_subdomains(None, "example.com"), [])
@@ -472,33 +482,43 @@ class TestSourceErrorIsolation(EngineTestCase):
 
 # --------------------------------------------------------------------- 敏感域名闸门
 
-class TestForbiddenGate(EngineTestCase):
-    """敏感域名闸门 —— **默认不拦**（2026-10-04 从「默认拒绝」改回）。
+class TestSensitiveDomainGateRemoved(EngineTestCase):
+    """敏感域名闸门已于 2026-10-04 **整块删除**（不再是「默认关掉」）。
 
-    走真实的 ``demo_expand`` 模块做端到端验证：``.gov.cn`` / ``.edu.cn`` 这类
-    目标默认必须能正常展开子域，而不是在分发第一步就被静默丢掉。
+    原来的实现是硬编码 ``("gov.cn", "edu.cn", "org.cn", "mil.cn")`` 的后缀黑名单，
+    在分发器里拦掉命中的 ``SEED`` / ``DNS_NAME``。它只会挡路：全仓 40 多处测试
+    夹具都写着 ``settings={"forbidden_domains": []}`` 才能跑。而实际工作以
+    **高校 / 职院的授权测试**为主（``edu.cn`` 正是主战场），每次都得先改预设
+    yml 才扫得动。现在连机制一起删掉，edu.cn / gov.cn 直接扫。
 
-    机制本身保留 —— 显式配了 ``settings.forbidden_domains`` 仍会拦，
-    所以另一条测试守着「配置了就得生效」，免得那行配置变成骗人的摆设。
+    钉的是**不变量**：``.gov.cn`` 必须能走完整条流水线落库。
     """
 
-    async def test_gov_cn_is_not_blocked_by_default(self) -> None:
+    async def test_gov_cn_target_survives_the_whole_pipeline(self) -> None:
         """默认配置下 gov.cn 照常展开：SEED + 4 个子域 = 5 条新事件。"""
         _, summary = await self.run_scan(
             targets=["test.gov.cn"], include=["demo_expand"]
         )
-        self.assertEqual(summary["events_forbidden"], 0, "gov.cn 被默认闸门拦了")
         self.assertEqual(summary["events_new"], 5)
 
-    async def test_forbidden_list_still_arms_when_configured(self) -> None:
-        """显式配了 gov.cn 就必须拦得住 —— SEED 直接被丢，一条事件都发不出去。"""
-        _, summary = await self.run_scan(
-            targets=["test.gov.cn"],
-            include=["demo_expand"],
-            settings={"forbidden_domains": ["gov.cn"]},
-        )
-        self.assertGreaterEqual(summary["events_forbidden"], 1, "显式配了却没拦")
-        self.assertEqual(summary["events_new"], 0)
+    def test_the_mechanism_is_gone(self) -> None:
+        """闸门本身不该再存在 —— 别让人「顺手」把它加回来。"""
+        from core.engine.scanner import Scanner
+        from core.util import domain as domain_util
+
+        self.assertFalse(hasattr(Scanner, "is_forbidden"))
+        self.assertFalse(hasattr(Scanner, "forbidden_domains"))
+        self.assertFalse(hasattr(domain_util, "is_forbidden_domain"))
+
+    async def test_gov_cn_lands_in_the_asset_table(self) -> None:
+        """不是只发事件 —— 得真的进资产表。"""
+        # 文件名要跟类名小写一致：引擎是按**模块名**（类名小写）去 include 的，
+        # 不是按文件名。写成 leaky.py + class govleak 会「启用 0 个」而静默通过。
+        self.add_module_file("govleak", GOV_EMITTER)
+        scanner, _ = await self.run_scan(targets=["gov.cn"], include=["govleak"])
+        names = {d["name"] for d in await self.storage.domains(scanner.scan_id)}
+        self.assertIn("jwc.gov.cn", names)
+
 
 
 # --------------------------------------------------------------------- 递归枚举

@@ -1,7 +1,8 @@
 """多 worker 的**引擎机制**回归测试。
 
 只管引擎这一层：``worker_count()`` 的取值与兜底、多 worker 不重复处理 / 不丢
-事件 / 正常收敛、以及"内置模块声明的 workers 是否合法"。
+事件 / 正常收敛、``gather_batch`` 的批内记账、以及"内置模块声明的 workers 是否
+合法"。
 
 需要 ``dir_brute`` 自身状态的地方（比如 ``max_hosts`` 配额在并发下不被超发）
 放在 ``tests/test_fuzz.py`` —— 那边已经有 ``TestDirBrute`` 的全部辅助设施，
@@ -177,6 +178,75 @@ class TestWorkerCount(unittest.TestCase):
         self.assertGreater(found, 10, f"只发现 {found} 个模块，扫描器本身有问题")
 
 
+class TestGatherBatchAccounting(unittest.IsolatedAsyncioTestCase):
+    """``BaseModule.gather_batch`` 的记账不许把整批的成败统计搞坏。
+
+    纯单元测试，不碰数据库 —— 这里要验的是"记账这一行自己会不会炸"。
+    """
+
+    @staticmethod
+    def _scanner():
+        import logging
+
+        class _Scanner:
+            log = logging.getLogger("t")
+            settings: dict = {}
+
+        return _Scanner()
+
+    async def test_module_without_its_own_stats_dict_still_accounts(self) -> None:
+        """复刻 ``tls_cert`` / ``dns_resolve``：继承了 ``BaseModule`` 但
+        **没在 setup() 里建过 ``self.stats``**。
+
+        记账行 ``self.stats["errors"] = self.stats.get("errors", 0) + failed``
+        以前会在这里抛 ``AttributeError``。后果不是"少一个计数器"：异常从
+        ``handle_batch`` 冒到 ``_module_worker``，于是**整批**（包括成功的
+        条目）被记成 ``module.X.error``、``module.X.ok`` 一条不记，真实失败
+        原因还被这条异常顶掉。批大小为 1 时走 ``handle_event`` 分支反而正常 ——
+        同一个模块的统计准不准取决于队列里恰好有几条事件。
+        """
+        import asyncio
+
+        from core.engine.module import BaseModule
+
+        class Plain(BaseModule):
+            """故意什么都不声明。"""
+
+        m = Plain(self._scanner())
+
+        async def boom():
+            raise RuntimeError("TLS 握手失败")
+
+        await m.gather_batch(
+            [asyncio.sleep(0, result="ok"), boom(), asyncio.sleep(0, result="ok")],
+            what="plain",
+        )
+        self.assertEqual(m.stats.get("errors"), 1)
+
+    async def test_failures_do_not_propagate_out_of_the_batch(self) -> None:
+        """批内失败不许掀翻整批 —— 同批的其他条目必须照常跑完。"""
+        import asyncio
+
+        from core.engine.module import BaseModule
+
+        class Plain(BaseModule):
+            pass
+
+        m = Plain(self._scanner())
+        done: list[str] = []
+
+        async def one(name: str, *, fail: bool = False):
+            if fail:
+                raise RuntimeError(name)
+            done.append(name)
+
+        await m.gather_batch(
+            [one("a"), one("b", fail=True), one("c")], what="plain"
+        )
+        self.assertEqual(sorted(done), ["a", "c"])
+        self.assertEqual(m.stats.get("errors"), 1)
+
+
 class TestMultiWorker(EngineTestCase):
     """端到端：多 worker 不错、不丢、能收敛。"""
 
@@ -192,7 +262,6 @@ class TestMultiWorker(EngineTestCase):
             targets=["example.com"],
             include=["emit_many", "counter"],
             module_config={"counter": {"workers": workers}},
-            settings={"forbidden_domains": []},
         )
 
     async def _seen_urls(self, scan_id: int) -> set[str]:

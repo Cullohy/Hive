@@ -44,7 +44,6 @@ description: 离线
 include:
   - demo_expand
 settings:
-  forbidden_domains: []
   max_events: 500
 """
 
@@ -541,7 +540,7 @@ class TestScreenshotReal(unittest.IsolatedAsyncioTestCase):
                 name="t",
                 include=["emit_url", "screenshot"],
                 module_dirs=[str(mods)],
-                settings={"forbidden_domains": [], "screenshots_dir": str(shots_dir)},
+                settings={"screenshots_dir": str(shots_dir)},
             )
             scanner = Scanner(targets=["example.com"], preset=preset, storage=storage)
             try:

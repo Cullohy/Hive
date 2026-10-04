@@ -194,6 +194,26 @@ class emit_url(BaseModule):
         await self.emit_event("http://fuzz.example.com/", EventType.URL, parent=event)
 """
 
+#: 发**两台不同主机**的 URL。用来验"按主机记账"的东西（熔断、失败预算）。
+#:
+#: ⚠️ 顺序有意义：``a`` 在前。测跨主机污染时必须保证污染源先跑完 —— 引擎
+#: 默认单 worker，队列是 FIFO，所以事件到达顺序 = 处理顺序。
+EMIT_TWO_URLS = """
+from core.engine.event import EventType
+from core.engine.module import BaseModule
+
+
+class emit_two_urls(BaseModule):
+    watched_events = (EventType.SEED,)
+    produced_events = (EventType.URL,)
+    flags = ("passive", "safe")
+
+    async def handle_event(self, event):
+        await self.emit_event("http://a.example.com/", EventType.URL, parent=event)
+        await self.emit_event("http://b.example.com/", EventType.URL, parent=event)
+"""
+
+
 #: 先发几个**非 HTTP 端口**，最后才发真正的 HTTP 主机。
 #: 复刻 http_probe 的真实行为：它把 25/110/143/3306 也当成 URL 发出来。
 EMIT_URLS_MANY = """
@@ -330,10 +350,11 @@ class TestDirBrute(EngineTestCase):
             headers=headers if headers is not None else {},
         )
 
-    async def _scan(self, responder, max_paths: int = 20, **cfg):
+    async def _scan(self, responder, max_paths: int = 20, *,
+                    emitter: str = "emit_port", emitter_src: str = EMIT_PORT, **cfg):
         from core.services.http import HTTPClient
 
-        self.add_module_file("emit_port", EMIT_PORT)
+        self.add_module_file(emitter, emitter_src)
         # 用自己的小字典：内置默认档 dir_common 有 200 条，配合 max_paths 会把
         # 想验证的路径（robots.txt 之类）截在窗口之外，断言就失去意义了
         wl = Path(__file__).resolve().parents[1] / ".testtmp" / "dir_test.txt"
@@ -352,14 +373,13 @@ class TestDirBrute(EngineTestCase):
                 # 目标只给根域：``fuzz.example.com`` 必须**不是**种子，否则
                 # ``skip_seed`` 会把它当种子跳过（它才是被爆破的那台）。
                 targets=["example.com"],
-                include=["emit_port", "http_probe", "dir_brute"],
+                include=[emitter, "http_probe", "dir_brute"],
                 module_config={
                     "dir_brute": module_cfg,
                     # 夹具是 http:// 的，探活默认 prefer_https 会拼成
                     # https://host:80 —— URL 形状对不上，画像也就对不上
                     "http_probe": {"prefer_https": False, "schemes": ["http"]},
                 },
-                settings={"forbidden_domains": []},
             )
 
     async def _urls(self, scan_id: int) -> set[str]:
@@ -547,6 +567,74 @@ class TestDirBrute(EngineTestCase):
         self.assertIsNotNone(row, f"没收到统计: {summary['source_stats']}")
         self.assertGreater(row["requests"], 0)
         self.assertGreater(row["skipped"], 0, "软 404 丢弃数应大于 0")
+
+    async def test_in_site_link_does_not_kill_the_whole_host(self) -> None:
+        """首页里有站内链接时，字典必须照常跑完。
+
+        ``_discovered_paths`` 无条件写 ``stats["discovered_raw"]`` /
+        ``["discovered_used"]``，而这两个 key 以前**没在** ``setup()`` 里声明
+        —— 于是凡首页含 ≥1 条同源非静态链接的站点（也就是几乎所有真站点）
+        都在发出第一条字典请求**之前** KeyError 退出，``max_hosts`` 名额还
+        占着不归还。
+
+        ⚠️ 这条测试的价值全在"真的喂一个带链接的首页"。原来的夹具正文里
+        ``links=0``，``_discovered_paths`` 开头就 return 了，**永远够不到**那
+        两行 —— 所以这个 bug 能在全绿的测试套件里活这么久。
+
+        判据用 ``module.dir_brute.error``：软 404 校准的请求在崩之前已经发过了，
+        所以"请求数 > 0"区分不出修没修，只有"模块有没有抛异常"能。
+        """
+        homepage = (
+            '<html><body>'
+            '<a href="/about/team">团队</a>'
+            '<a href="/docs/guide">文档</a>'
+            '<a href="/static/app.js">静态</a>'                 # 应被丢掉
+            '<a href="https://other.example.org/x">外站</a>'   # 越界，应被丢掉
+            '</body></html>'
+        )
+
+        def responder(url: str):
+            if url.rstrip("/") == "http://fuzz.example.com":
+                return self._resp(url, 200, 0, text=homepage)
+            return self._resp(url, 404, 500)
+
+        _, summary = await self._scan(responder, max_paths=20)
+        self.assertEqual(
+            summary["stats"].get("module.dir_brute.error", 0), 0,
+            "dir_brute 抛异常了 —— 头号嫌疑是 discovered_raw/discovered_used "
+            f"没在 setup() 里声明。全量: {summary['stats']}",
+        )
+
+    async def test_breaker_does_not_inherit_another_host_401s(self) -> None:
+        """熔断判据必须只看**本机**的 401/403。
+
+        以前 403 用函数局部计数、401 用 ``self.stats["unauthorized"]``
+        （模块级累计，跨主机跨 worker），而分母 ``checked`` 是本机的 ——
+        分子被历史污染，比值虚高。于是先扫完一台"到处 401"的主机后，
+        后面那台只有 1 条 403 的正常主机也会被误判成"被 WAF 拦"而静默截断，
+        还附带发出一条**归因错误**的 finding。同一站点、同一份字典，仅因前面
+        扫过几台机器就得出相反结论。
+        """
+        def responder(url: str):
+            if "a.example.com" in url:
+                return self._resp(url, 401, 100)      # 认证墙，攒一堆 401
+            if url.endswith("/admin"):
+                return self._resp(url, 403, 100)      # b 只有这 1 条 403
+            return self._resp(url, 404, 500)
+
+        scanner, _ = await self._scan(
+            responder, max_paths=50, workers=1, max_hosts=0,
+            emitter="emit_two_urls", emitter_src=EMIT_TWO_URLS,
+        )
+        tripped = [f for f in await self._findings(scanner.scan_id) if "被拦截" in f]
+        self.assertTrue(
+            any("a.example.com" in f for f in tripped),
+            f"认证墙那台本来就该熔断，没熔断: {tripped}",
+        )
+        self.assertFalse(
+            [f for f in tripped if "b.example.com" in f],
+            f"b 只有 1 条 403，却被 a 的历史 401 连坐熔断了: {tripped}",
+        )
 
 
 
@@ -1002,7 +1090,6 @@ class TestDirmapWordlistEndToEnd(EngineTestCase):
                     # https://host:80 —— URL 形状对不上，画像也就对不上
                     "http_probe": {"prefer_https": False, "schemes": ["http"]},
                 },
-                settings={"forbidden_domains": []},
             )
 
         self.assertIn("http://fuzz.example.com/.env", seen,
@@ -1053,7 +1140,6 @@ class TestDirBruteQuotaUnderConcurrency(EngineTestCase):
                     "wordlist": str(wl), "probes": 2, "concurrency": 4,
                     "delay": 0, "max_hosts": 3, "host_budget": 60,
                 }},
-                settings={"forbidden_domains": []},
             )
 
         # 只有拿到字典请求的才是"真正开跑"的主机
@@ -1105,7 +1191,6 @@ class TestUpstreamErrorHostIsSkipped(EngineTestCase):
                     # https://host:80 —— URL 形状对不上，画像也就对不上
                     "http_probe": {"prefer_https": False, "schemes": ["http"]},
                 },
-                settings={"forbidden_domains": []},
             )
 
         # 只应该有软 404 校准的探测，不该有任何一条字典路径
@@ -1158,7 +1243,6 @@ class TestUpstreamErrorHostIsSkipped(EngineTestCase):
                 module_config={"dir_brute": {
                     "wordlist": str(wl), "probes": 2, "concurrency": 2, "delay": 0,
                 }},
-                settings={"forbidden_domains": []},
             )
 
         by_target = {
@@ -1207,7 +1291,6 @@ class TestUpstreamErrorHostIsSkipped(EngineTestCase):
                     "wordlist": str(wl), "probes": 2, "concurrency": 4,
                     "delay": 0, "max_hosts": 1, "host_budget": 60,
                 }},
-                settings={"forbidden_domains": []},
             )
 
         dict_paths = [u for u in seen
@@ -1261,7 +1344,6 @@ class TestHostBudget(EngineTestCase):
                     # https://host:80 —— URL 形状对不上，画像也就对不上
                     "http_probe": {"prefer_https": False, "schemes": ["http"]},
                 },
-                settings={"forbidden_domains": []},
             )
 
         probed = [u for u in seen if u.rsplit("/", 1)[-1].startswith("p")]
@@ -1316,7 +1398,6 @@ class TestHostBudget(EngineTestCase):
                     # https://host:80 —— URL 形状对不上，画像也就对不上
                     "http_probe": {"prefer_https": False, "schemes": ["http"]},
                 },
-                settings={"forbidden_domains": []},
             )
 
         # ⚠️ 按字典内容精确匹配，不要用"末段以 p 开头"：
@@ -1371,7 +1452,6 @@ class TestUnreachableHostIsSkipped(EngineTestCase):
                     # https://host:80 —— URL 形状对不上，画像也就对不上
                     "http_probe": {"prefer_https": False, "schemes": ["http"]},
                 },
-                settings={"forbidden_domains": []},
             )
         return scanner, seen
 
@@ -1446,7 +1526,6 @@ class TestUnreachableHostIsSkipped(EngineTestCase):
                     # 名额），所以这里不去改实现，而是把测试固定成确定性的。
                     "workers": 1,
                 }},
-                settings={"forbidden_domains": []},
             )
 
         alive_probed = [
@@ -1505,7 +1584,6 @@ class TestBusyHint(EngineTestCase):
                 # https://host:80 —— URL 形状对不上，画像也就对不上
                 "http_probe": {"prefer_https": False, "schemes": ["http"]},
             },
-            settings={"forbidden_domains": []},
         )
         return Scanner(
             targets=["example.com"], preset=preset, storage=self.storage,
@@ -1590,7 +1668,6 @@ class TestBusyHint(EngineTestCase):
             name="test",
             include=["emit_url_raisy_busy"],
             module_dirs=[str(self.module_dir)],
-            settings={"forbidden_domains": []},
         )
         scanner = Scanner(
             targets=["example.com"], preset=preset, storage=self.storage,
@@ -1638,7 +1715,6 @@ class TestDirBruteLeadingSlashEntry(EngineTestCase):
                     # https://host:80 —— URL 形状对不上，画像也就对不上
                     "http_probe": {"prefer_https": False, "schemes": ["http"]},
                 },
-                settings={"forbidden_domains": []},
             )
 
         hits = [u for u in seen if "ManageFilters" in u]
@@ -1683,7 +1759,6 @@ class TestDirBruteLeadingSlashEntry(EngineTestCase):
                     # https://host:80 —— URL 形状对不上，画像也就对不上
                     "http_probe": {"prefer_https": False, "schemes": ["http"]},
                 },
-                settings={"forbidden_domains": []},
             )
 
         with_query = [u for u in seen if "com_users" in u]
@@ -2085,7 +2160,6 @@ class TestTechDictSelectionEndToEnd(EngineTestCase):
                     # https://host:80 —— URL 形状对不上，画像也就对不上
                     "http_probe": {"prefer_https": False, "schemes": ["http"]},
                 },
-                settings={"forbidden_domains": []},
             )
 
     def _dict_urls(self, seen: list[str]) -> list[str]:
@@ -2212,7 +2286,6 @@ class TestTechDictSelectionEndToEnd(EngineTestCase):
                     # https://host:80 —— URL 形状对不上，画像也就对不上
                     "http_probe": {"prefer_https": False, "schemes": ["http"]},
                 },
-                settings={"forbidden_domains": []},
             )
 
         self.assertNotIn(f"{self.HOST}/", seen,
@@ -2256,7 +2329,6 @@ class TestTechDictSelectionEndToEnd(EngineTestCase):
                     # https://host:80 —— URL 形状对不上，画像也就对不上
                     "http_probe": {"prefer_https": False, "schemes": ["http"]},
                 },
-                settings={"forbidden_domains": []},
             )
 
         self.assertIn(f"{self.HOST}/p000", seen, "库坏了也不该影响基础爆破")
@@ -2311,7 +2383,6 @@ class TestSeedAndWafGates(EngineTestCase):
                     # https://host:80 —— URL 形状对不上，画像也就对不上
                     "http_probe": {"prefer_https": False, "schemes": ["http"]},
                 },
-                settings={"forbidden_domains": []},
             )
 
     # ------------------------------------------------------------------ ①
@@ -2443,7 +2514,6 @@ class TestRootFallbackAndServerErrors(EngineTestCase):
                     # https://host:80 —— URL 形状对不上，画像也就对不上
                     "http_probe": {"prefer_https": False, "schemes": ["http"]},
                 },
-                settings={"forbidden_domains": []},
             )
 
     async def _urls(self, scan_id: int) -> set[str]:
@@ -2634,7 +2704,6 @@ class TestZeroHitAbort(EngineTestCase):
                     # https://host:80 —— URL 形状对不上，画像也就对不上
                     "http_probe": {"prefer_https": False, "schemes": ["http"]},
                 },
-                settings={"forbidden_domains": []},
             )
 
     def _dict_probes(self, seen: list[str], npaths: int = 2000) -> list[str]:
@@ -3036,7 +3105,6 @@ class TestAuthStatusAndBypass(EngineTestCase):
                     # https://host:80 —— URL 形状对不上，画像也就对不上
                     "http_probe": {"prefer_https": False, "schemes": ["http"]},
                 },
-                settings={"forbidden_domains": []},
             )
 
     async def _urls(self, scan_id: int) -> set[str]:

@@ -357,7 +357,6 @@ class TestSeedAsset(unittest.TestCase):
                 preset = Preset(
                     name="seed",
                     include=["seed_asset"],
-                    settings={"forbidden_domains": []},
                 )
                 scanner = Scanner(targets=[seed], preset=preset, storage=storage)
                 await scanner.scan()
@@ -1328,7 +1327,6 @@ class TestParentDirDerivation(EngineTestCase):
             targets=["example.com"],
             include=["emit_html", "url_extract"],
             module_config={"url_extract": cfg},
-            settings={"forbidden_domains": []},
         )
         return scanner
 
@@ -1488,7 +1486,6 @@ class TestParentDirDerivation(EngineTestCase):
                 targets=["example.com"],
                 include=["emit_html", "url_extract"],
                 module_config={"url_extract": {}},
-                settings={"forbidden_domains": []},
             )
         self.assertEqual(called, [], "父目录推导发了请求")
 

@@ -33,7 +33,6 @@ description: 只跑离线演示源, 不联网
 include:
   - demo_expand
 settings:
-  forbidden_domains: []
   max_events: 1000
 """
 

@@ -165,10 +165,12 @@ SEED → DNS_NAME ─┬─→ IP_ADDRESS → OPEN_TCP_PORT ─┬─→ HTTP_RE
 - `BLACK_IPS`：本地的 `config.yaml` 保留了 `172.16.0.0/12`、`100.64.0.0/10`，但 **`10.0.0.0/8` 和 `192.168.0.0/16` 仍是注释状态**
 - `FORBIDDEN_DOMAINS`：**完全为空**（`edu.cn`/`org.cn`/`gov.cn` 全被注释）
 - → 内网段那条我们**收紧**了（端口扫描前默认拒绝内网与保留地址）。
-  敏感域名这条**2026-10-04 改回与 ARL 一致的空列表** —— 原先设成默认拒绝，
-  但它在全仓唯一的实际用法是被测试夹具逐个关掉，实际工作又以高校/职院授权测试
-  为主（`edu.cn` 正是主战场），每次都得先改预设才扫得动。机制保留，需要时写
-  `settings.forbidden_domains` 即可。
+  敏感域名那条 **2026-10-04 连机制一起删掉了**（不是改成默认值，是整个后缀
+  黑名单、`Scanner.is_forbidden()`、`util/domain.py::is_forbidden_domain()`、
+  `sanitize_subdomains()` 的 `forbidden` 参数全部移除）。理由是它在全仓唯一的
+  实际用法是被测试夹具逐个关掉，而实际工作以高校/职院授权测试为主
+  （`edu.cn` 正是主战场），每次都得先改预设才扫得动。需要按目标收敛时用
+  范围校验 `enforce_scope`。
 
 ---
 

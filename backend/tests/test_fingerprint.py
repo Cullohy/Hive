@@ -567,7 +567,7 @@ class emit_response(BaseModule):
 class TestFingerprintModule(EngineTestCase):
     async def _scan(self, **cfg):
         self.add_module_file("emit_response", FH_MODULE)
-        kwargs = {"settings": {"forbidden_domains": []}}
+        kwargs = {}
         if cfg:
             kwargs["module_config"] = {"fingerprint": cfg}
         return await self.run_scan(

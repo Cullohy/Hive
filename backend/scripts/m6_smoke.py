@@ -82,7 +82,7 @@ def main() -> int:
         "name: m6offline\n"
         "description: 只跑离线演示源\n"
         "include:\n  - demo_expand\n"
-        "settings:\n  forbidden_domains: []\n  max_events: 500\n",
+        "settings:\n  max_events: 500\n",
         encoding="utf-8",
     )
 

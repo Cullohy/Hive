@@ -2009,7 +2009,6 @@ class TestIpPtrModule(EngineTestCase):
             scanner, _ = await self.run_scan(
                 targets=["example.com"],
                 include=["emit_ip", "ip_ptr"],
-                settings={"forbidden_domains": []},
             )
         return scanner, seen
 
