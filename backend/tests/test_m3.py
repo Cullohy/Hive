@@ -474,6 +474,222 @@ class TestDnsxAcloseIsCancelSafe(unittest.IsolatedAsyncioTestCase):
 
 
 
+class TestCatchAllFrequency(unittest.TestCase):
+    """**频次兜底层**：同一批里过多候选共享同一个 IP / CNAME → 判 catch-all。
+
+    起因是两次真实扫描：
+
+    * ``dayinmao.com``（泛解析 + 腾讯云 EO）漏进 **702 个**假子域
+    * ``bjsxtx.com`` 漏进 **590 个** —— 590 个子域全指向 ``39.106.205.137``
+
+    采样层（``wildcard_detect`` 只看 5 个随机子域）在这两个场景里都**看不出**
+    泛解析：CDN 的 IP 池无界，5 个样本覆盖不住，每个候选都「有不在集合里的
+    IP」→ 逐条判据全部放行。
+
+    思路借鉴 OneForAll 的 ``deal_wildcard``（先统计再过滤），但阈值改成
+    **绝对数 + 比率两条**，而且比率**必须配下限**。
+    """
+
+    @staticmethod
+    def _rows(n, ip="39.106.205.137"):
+        return [(f"h{i}.example.com", [ip], []) for i in range(n)]
+
+    # ------------------------------------------------------------ 正例
+    def test_bjsxtx_shape_is_caught(self) -> None:
+        """590 个候选全指向一个 IP —— 这正是 bjsxtx.com 那次。
+
+        绝对数先命中（590 > 100），所以理由串是"被 N 个候选共用"那条。
+        """
+        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+
+        hot = find_catch_all(self._rows(590))
+        self.assertIn("39.106.205.137", hot)
+        self.assertIn("590", hot["39.106.205.137"])
+
+    def test_ratio_fires_when_absolute_does_not(self) -> None:
+        """集中度过半但没到 100 时，靠比率那条兜底。"""
+        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+
+        rows = self._rows(80) + [(f"x{i}.example.com", [f"9.9.9.{i}"], [])
+                                for i in range(20)]
+        hot = find_catch_all(rows)
+        self.assertIn("39.106.205.137", hot)
+        self.assertIn("/100", hot["39.106.205.137"], "比率那条没生效")
+
+    def test_dayinmao_shape_is_caught_by_cname(self) -> None:
+        """CNAME 侧同样要能判（腾讯云 EO 的尾巴是固定父域）。"""
+        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+
+        rows = [(f"h{i}.example.com", [f"1.2.3.{i % 5}"],
+                 ["xyz.dayinmao.com.eo.dnse2.com"]) for i in range(400)]
+        hot = find_catch_all(rows)
+        self.assertIn("xyz.dayinmao.com.eo.dnse2.com", hot)
+
+    def test_absolute_rule_fires_even_when_ratio_stays_low(self) -> None:
+        """绝对数那条必须能**独立**判掉 —— 比率接不住时它得顶上来。
+
+        ⚠️ 这里原来叫 ``test_absolute_rule_also_catches``，可它的夹具是
+        ``80 + 20``（比率 0.8），**和上面 ``test_ratio_fires_when_absolute_does_not``
+        一模一样** —— 两条判据里真正在起作用的只有比率。把 ``ip_appear_maximum``
+        整条删掉它照样绿（变异验证第 4 处实测：0 条挂）。
+
+        现在用 120/320：比率 0.375 接不住，但 120 > 100 —— 只有绝对数能判。
+        """
+        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+
+        rows = self._rows(120) + [(f"x{i}.example.com", [f"9.9.9.{i}"], [])
+                                  for i in range(200)]
+        hot = find_catch_all(rows)
+        self.assertIn("39.106.205.137", hot)
+        why = hot["39.106.205.137"]
+        self.assertIn("120", why)
+        self.assertNotIn("/", why, "命中的是比率那条 —— 绝对数判据没被钉住")
+
+    def test_cname_absolute_rule_fires_independently(self) -> None:
+        """CNAME 侧的绝对数（>50）同样得能独立判掉。
+
+        ``test_dayinmao_shape_is_caught_by_cname`` 是 400/400，比率也够，
+        删掉 ``cname_appear_maximum`` 一样不会红。这里用 60/260。
+        """
+        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+
+        tail = "xyz.dayinmao.com.eo.dnse2.com"
+        rows = [(f"h{i}.example.com", [f"1.2.3.{i}"], [tail]) for i in range(60)]
+        rows += [(f"x{i}.example.com", [f"9.9.9.{i}"], [f"cdn{i}.example.net"])
+                 for i in range(200)]
+        hot = find_catch_all(rows)
+        self.assertIn(tail, hot)
+        why = hot[tail]
+        self.assertIn("60", why)
+        self.assertNotIn("/", why, "命中的是比率那条 —— CNAME 绝对数没被钉住")
+
+    # ------------------------------------------------------------ 反例
+    def test_small_cluster_is_not_misjudged(self) -> None:
+        """**12 个子域共用一台机器**是小站点的常态，不能当 catch-all。"""
+        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+
+        self.assertEqual(find_catch_all(self._rows(12)), {})
+
+    def test_ratio_needs_a_floor(self) -> None:
+        """1 个候选也是 100% 集中 —— 比率在小批量上根本没有统计意义。
+
+        ⚠️ 第一版实现没配下限，把测试里「1 个候选」和「4 个候选」的批次
+        全判成了 catch-all，5 条老测试直接红。这是实测打脸的典型。
+        """
+        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+
+        self.assertEqual(find_catch_all(self._rows(1)), {})
+        self.assertEqual(find_catch_all(self._rows(4)), {})
+
+    def test_spread_out_batch_is_not_misjudged(self) -> None:
+        """候选分散在很多 IP 上 —— 真集群，什么都不该判。"""
+        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+
+        rows = [(f"h{i}.example.com", [f"10.0.{i // 250}.{i % 250}"], [])
+                for i in range(500)]
+        self.assertEqual(find_catch_all(rows), {})
+
+    def test_comma_separated_records_are_split(self) -> None:
+        """一条记录里多个 IP（``a,b``）也要各算一次，否则计数会被低估。"""
+        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+
+        rows = [(f"h{i}.example.com", ["1.2.3.4,5.6.7.8"], []) for i in range(150)]
+        hot = find_catch_all(rows)
+        self.assertIn("1.2.3.4", hot)
+        self.assertIn("5.6.7.8", hot)
+
+
+#: 频次兜底层的四个配置键，``dns_brute`` / ``dns_permute`` 共用。
+FREQ_KEYS = ("ip_appear_maximum", "cname_appear_maximum",
+             "ip_appear_ratio", "cname_appear_ratio")
+
+
+class TestCatchAllConfigWiring(unittest.TestCase):
+    """频次兜底层的**配置接线** —— 阈值得真调得动，且调了不被全局吃掉。
+
+    为什么要单独测：``BaseModule.cfg()`` 的解析顺序是
+    **模块段 → 全局 ``settings`` → 代码默认**。模块段缺键就会掉到全局去 ——
+    ``dns_timeout`` 当初就是这样被全局的 ``3`` 静默盖掉的：模块里写的 120
+    压根没生效，一轮 19706 条的字典跑到一半被 kill，日志只留一行 timeout warning。
+
+    这四个键如果只留代码默认值，今天不炸，以后谁往 ``settings`` 里加个同名的
+    就炸。防御分在两层（yml + 代码默认）还会**互相掩盖**，所以这里钉的是
+    **不变量**：键必须在模块段里，且模块段必须压过全局。
+    """
+
+    @staticmethod
+    def _modules(preset):
+        from core.engine.scanner import Scanner
+
+        scanner = Scanner(targets=["example.com"], preset=preset, storage=None)
+        scanner.load_modules()
+        return scanner
+
+    def test_keys_live_in_each_module_section(self) -> None:
+        """四个键都写在模块自己的段里，不是只靠代码默认值兜着。"""
+        from core.engine.preset import Preset
+
+        scanner = self._modules(Preset.load_builtin("active"))
+        for name in ("dns_brute", "dns_permute"):
+            with self.subTest(module=name):
+                cfg = scanner.modules[name].config
+                for key in FREQ_KEYS:
+                    self.assertIn(
+                        key, cfg,
+                        f"{key} 不在 {name} 的 module_config 里 —— cfg() 会先掉到"
+                        f"全局 settings、再掉到代码默认，yml 怎么改都不生效",
+                    )
+
+    def test_module_section_beats_a_conflicting_global(self) -> None:
+        """**同一个键在全局也写一份**时，模块段必须赢。
+
+        这是 ``dns_timeout`` 那次事故的直接形状：两边同名、值不同，
+        谁生效决定了 19706 条字典是跑完还是腰斩。
+        """
+        from core.engine.preset import Preset
+
+        # 加载真预设再只扰动这四个键 —— 手工 new Preset 会绕过 flag 门闩，
+        # 测出来的模块集合就不是生产那一套了
+        preset = Preset.load_builtin("active")
+        preset.settings.update({key: -1 for key in FREQ_KEYS})
+        preset.module_config["dns_brute"].update({k: 999999 for k in FREQ_KEYS})
+        preset.module_config["dns_permute"].update({k: 7 for k in FREQ_KEYS})
+
+        scanner = self._modules(preset)
+        for name, want in (("dns_brute", 999999), ("dns_permute", 7)):
+            with self.subTest(module=name):
+                module = scanner.modules[name]
+                for key in FREQ_KEYS:
+                    self.assertEqual(
+                        module.cfg(key, "该键压根没读到"), want,
+                        f"{name}.{key} 被全局 settings 的 -1 盖掉了",
+                    )
+
+    def test_active_preset_has_no_global_twins(self) -> None:
+        """``active`` 的全局 ``settings`` 里不许出现同名的键。"""
+        from core.engine.preset import Preset
+
+        settings = Preset.load_builtin("active").settings
+        for key in FREQ_KEYS:
+            with self.subTest(key=key):
+                self.assertNotIn(
+                    key, settings,
+                    f"settings 里有全局 {key} —— 模块段一旦漏写就会被它盖掉，"
+                    f"和 dns_timeout 当初一模一样",
+                )
+
+    def test_code_default_alone_still_keeps_the_layer_on(self) -> None:
+        """**不吃 yml** 时，代码默认值也得能判掉实测那 590 个。
+
+        对应 dnsx_idle_timeout 那边 ``test_the_code_default_alone_is_big_enough``：
+        yml 是给人调的，代码默认是给「预设写漏了」兜底的，两边都得站得住。
+        """
+        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+
+        rows = [(f"h{i}.example.com", ["39.106.205.137"], []) for i in range(590)]
+        self.assertIn("39.106.205.137", find_catch_all(rows))
+
+
 class TestWildcardProfile(unittest.TestCase):
     def test_describe_and_match(self) -> None:
         from core.engine.state import WildcardProfile
