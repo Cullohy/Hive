@@ -274,93 +274,16 @@ class TestPermutationYield(unittest.TestCase):
 
 
 
-class TestDnsxIdleTimeoutKeyCollision(EngineTestCase):
-    """dnsx 的「结果行静默超时」**不能**叫 ``dns_timeout``。
+class TestGlobalQueryTimeoutStillReachesResolver(EngineTestCase):
+    """全局 ``settings.dns_timeout`` 必须继续到达解析器。
 
-    起因（2026-10-04）：``cfg()`` 的回落链是 ``module_config`` → ``settings``
-            f"静默超时被全局 settings.dns_timeout 盖成了 {cfg}",
-    的**单次 DNS 查询超时**（``dns_resolve`` / ``ip_ptr`` / ``admin_plane`` /
-    ``wildcard_detect`` 四个模块都是这个语义），而 ``dns_brute`` /
-    ``dns_permute`` 要的是**另一件事**：
-
-    * 单次查询超时 3 秒 —— 合理
-    * dnsx 连续多久没有新结果行就 kill 进程、整轮收工 —— **不该是 3 秒**，
-      19706 条字典 + retry=2 下几乎必然中途被杀
-
-    两者共用一个键名，于是模块自己写的 120 永远不可达，runner 实际拿到 3。
-    表现是"字典爆破好像没跑出东西"，日志里只有一行 timeout warning。
-
-    ⚠️ 断言必须打在 ``_runner_cfg`` 上。早先一版只验「全局 ``dns_timeout``
-    是 3」，那对**用哪个键**毫无约束 —— 把两个模块的键改回 ``dns_timeout``
-    之后它照样绿。
+    2026-10-04 删掉 ``dnsx_idle_timeout`` 这个键之后，这条更该留着 ——
+    删键的目的就是让"单次查询超时"只有一个来源（``settings.dns_timeout``），
+    四个用解析器的模块都得继续拿到它。
     """
 
-    async def _runner_cfg(self, name: str) -> dict:
-        from core.domains.resolve._lib.dnsx_runner import _find_dnsx
-        from core.engine.preset import Preset
-        from core.engine.scanner import Scanner
-
-        if _find_dnsx() is None:      # pragma: no cover - 取决于环境
-            self.skipTest("dnsx 未安装")
-        scanner = Scanner(targets=["example.com"],
-                          preset=Preset.load_builtin("active"), storage=None)
-        scanner.load_modules()
-        module = scanner.modules[name]
-        ok = await module.setup()
-        self.assertNotEqual(ok, False, f"{name} setup 失败: {ok}")
-        return module._runner_cfg
-
-    async def test_brute_gets_a_real_idle_timeout(self) -> None:
-        cfg = await self._runner_cfg("dns_brute")
-        self.assertGreaterEqual(
-            cfg.get("idle_timeout") or 0, 30,
-            f"拿到 {cfg} —— 静默超时被全局 settings.dns_timeout 的 3 盖掉了",
-        )
-
-    async def test_permute_gets_a_real_idle_timeout(self) -> None:
-        cfg = await self._runner_cfg("dns_permute")
-        self.assertGreaterEqual(cfg.get("idle_timeout") or 0, 30, f"拿到 {cfg}")
-
-    async def test_the_key_is_not_named_timeout(self) -> None:
-        """键名不能再叫 ``timeout`` —— 那是撞车的根源，不只是风格问题。"""
-        for name in ("dns_brute", "dns_permute"):
-            with self.subTest(module=name):
-                cfg = await self._runner_cfg(name)
-                self.assertNotIn(
-                    "timeout", cfg,
-                    "键名又叫回 timeout 了 —— 会再次与 settings.dns_timeout 撞车",
-                )
-
-    async def test_the_code_default_alone_is_big_enough(self) -> None:
-        """**不吃 yml** 时，代码默认值本身也得够大。
-
-        防御分在两层：``active.yml`` 写 120，代码默认也写 120。而 ``cfg()``
-        只取先命中的那一层 —— 于是「改代码默认值」和「删 yml 那行」两个变异
-        会**互相掩盖**，各自都测不出来。真正该钉住的是**不变量**：
-        静默超时不能小到会把一次正常爆破腰斩。
-        """
-        from core.engine.preset import Preset
-        from core.engine.scanner import Scanner
-        from core.domains.resolve._lib.dnsx_runner import _find_dnsx
-
-        if _find_dnsx() is None:      # pragma: no cover - 取决于环境
-            self.skipTest("dnsx 未安装")
-        # 空预设 = 不吃 active.yml 的 module_config，只剩代码默认值
-        scanner = Scanner(targets=["example.com"], preset=Preset(name="bare"),
-                          storage=None)
-        scanner.load_modules()
-        for name in ("dns_brute", "dns_permute"):
-            with self.subTest(module=name):
-                module = scanner.modules[name]
-                self.assertNotEqual(await module.setup(), False)
-                self.assertGreaterEqual(
-                    module._runner_cfg.get("idle_timeout") or 0, 30,
-                    f"{name} 光靠代码默认值也不够 —— yml 一旦漏写就腰斩",
-                )
-
-
     def test_the_global_query_timeout_still_reaches_the_resolver(self) -> None:
-        """对照组：解析器那条路**仍然**是 3 —— 改名没把真正的超时弄丢。"""
+        """对照组：解析器那条路**仍然**是 3。"""
         from core.engine.preset import Preset
         from core.engine.scanner import Scanner
 
@@ -370,107 +293,6 @@ class TestDnsxIdleTimeoutKeyCollision(EngineTestCase):
         for name in ("dns_resolve", "ip_ptr", "admin_plane", "wildcard_detect"):
             with self.subTest(module=name):
                 self.assertEqual(scanner.modules[name].cfg("dns_timeout", 3), 3)
-
-
-
-class TestDnsxAcloseIsCancelSafe(unittest.IsolatedAsyncioTestCase):
-    """``aclose()`` 必须在被取消时也把 dnsx 收干净，而且**可以重入**。
-
-    起因（2026-10-04，排查泛解析过滤时顺带查出来的）：
-
-    * 原来的收尾是 ``terminate(); await wait()`` 包在 ``except Exception`` 里，
-      然后才 ``self._proc = None``。``CancelledError`` 从 3.8 起继承
-      ``BaseException``，**捕不到** —— 取消落在 ``wait()`` 上时那个赋值
-      永远执行不到；
-    * 而函数开头是 ``if not self._running: return``，进来第一件事就是把
-      ``_running`` 置 False。于是留下「``_running`` 假、``_proc`` 真」的
-      状态，**后续任何 aclose() 都直接 return**，僵尸进程和传输层 fd 就留在
-      那里了。
-
-    全部用假进程，不起真 dnsx。
-    """
-
-    class _FakeProc:
-        def __init__(self, *, wait_forever: bool = False) -> None:
-            self.terminated = 0
-            self.killed = 0
-            self.waits = 0
-            self._wait_forever = wait_forever
-            self._gate = asyncio.Event()
-
-        def terminate(self) -> None:
-            self.terminated += 1
-
-        def kill(self) -> None:
-            self.killed += 1
-            self._gate.set()
-
-        async def wait(self) -> int:
-            self.waits += 1
-            if self._wait_forever:
-                await self._gate.wait()
-            return 0
-
-    def _runner(self, proc):
-        from core.domains.resolve._lib.dnsx_runner import DnsxStdinRunner
-
-        r = DnsxStdinRunner()
-        r._running = True
-        r._proc = proc
-        return r
-
-    async def test_cancellation_still_kills_the_process(self) -> None:
-        proc = self._FakeProc(wait_forever=True)
-        runner = self._runner(proc)
-
-        task = asyncio.ensure_future(runner.aclose())
-        await asyncio.sleep(0)          # 让它走到 wait() 上
-        task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await task
-
-        self.assertEqual(proc.killed, 1, "被取消时没有 kill —— 僵尸留下了")
-        self.assertIsNone(runner._proc, "_proc 没被摘掉")
-
-    async def test_a_second_close_still_collects_the_process(self) -> None:
-        """取消之后**再调一次**必须还能收干净（可重入）。"""
-        proc = self._FakeProc(wait_forever=True)
-        runner = self._runner(proc)
-
-        task = asyncio.ensure_future(runner.aclose())
-        await asyncio.sleep(0)
-        task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await task
-
-        # 模拟"取消落在 drain() 上、_proc 还没被摘"的那种中间状态
-        proc2 = self._FakeProc()
-        runner._proc = proc2
-        runner._running = False
-        await runner.aclose()
-        self.assertEqual(proc2.terminated + proc2.killed, 1, "第二次没收到信号")
-        self.assertIsNone(runner._proc)
-
-    async def test_normal_close_terminates_and_waits(self) -> None:
-        proc = self._FakeProc()
-        runner = self._runner(proc)
-        await runner.aclose()
-        self.assertEqual(proc.terminated, 1)
-        self.assertEqual(proc.waits, 1, "没有 wait —— 收尸失败")
-        self.assertIsNone(runner._proc)
-
-    async def test_close_is_a_noop_when_there_is_nothing_to_collect(self) -> None:
-        """已经收干净之后再调一次：不该抛、也不该重复发信号。"""
-        proc = self._FakeProc()
-        runner = self._runner(proc)
-        await runner.aclose()
-        self.assertEqual((proc.terminated, proc.killed, proc.waits), (1, 0, 1))
-
-        await runner.aclose()          # 第二次：应当直接返回
-        self.assertEqual(
-            (proc.terminated, proc.killed, proc.waits), (1, 0, 1),
-            "第二次 close 又动了进程",
-        )
 
 
 
@@ -500,7 +322,7 @@ class TestCatchAllFrequency(unittest.TestCase):
 
         绝对数先命中（590 > 100），所以理由串是"被 N 个候选共用"那条。
         """
-        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+        from core.domains.subdomain._lib.sweep import find_catch_all
 
         hot = find_catch_all(self._rows(590))
         self.assertIn("39.106.205.137", hot)
@@ -508,7 +330,7 @@ class TestCatchAllFrequency(unittest.TestCase):
 
     def test_ratio_fires_when_absolute_does_not(self) -> None:
         """集中度过半但没到 100 时，靠比率那条兜底。"""
-        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+        from core.domains.subdomain._lib.sweep import find_catch_all
 
         rows = self._rows(80) + [(f"x{i}.example.com", [f"9.9.9.{i}"], [])
                                 for i in range(20)]
@@ -518,7 +340,7 @@ class TestCatchAllFrequency(unittest.TestCase):
 
     def test_dayinmao_shape_is_caught_by_cname(self) -> None:
         """CNAME 侧同样要能判（腾讯云 EO 的尾巴是固定父域）。"""
-        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+        from core.domains.subdomain._lib.sweep import find_catch_all
 
         rows = [(f"h{i}.example.com", [f"1.2.3.{i % 5}"],
                  ["xyz.dayinmao.com.eo.dnse2.com"]) for i in range(400)]
@@ -535,7 +357,7 @@ class TestCatchAllFrequency(unittest.TestCase):
 
         现在用 120/320：比率 0.375 接不住，但 120 > 100 —— 只有绝对数能判。
         """
-        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+        from core.domains.subdomain._lib.sweep import find_catch_all
 
         rows = self._rows(120) + [(f"x{i}.example.com", [f"9.9.9.{i}"], [])
                                   for i in range(200)]
@@ -545,13 +367,14 @@ class TestCatchAllFrequency(unittest.TestCase):
         self.assertIn("120", why)
         self.assertNotIn("/", why, "命中的是比率那条 —— 绝对数判据没被钉住")
 
+
     def test_cname_absolute_rule_fires_independently(self) -> None:
         """CNAME 侧的绝对数（>50）同样得能独立判掉。
 
         ``test_dayinmao_shape_is_caught_by_cname`` 是 400/400，比率也够，
         删掉 ``cname_appear_maximum`` 一样不会红。这里用 60/260。
         """
-        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+        from core.domains.subdomain._lib.sweep import find_catch_all
 
         tail = "xyz.dayinmao.com.eo.dnse2.com"
         rows = [(f"h{i}.example.com", [f"1.2.3.{i}"], [tail]) for i in range(60)]
@@ -566,7 +389,7 @@ class TestCatchAllFrequency(unittest.TestCase):
     # ------------------------------------------------------------ 反例
     def test_small_cluster_is_not_misjudged(self) -> None:
         """**12 个子域共用一台机器**是小站点的常态，不能当 catch-all。"""
-        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+        from core.domains.subdomain._lib.sweep import find_catch_all
 
         self.assertEqual(find_catch_all(self._rows(12)), {})
 
@@ -576,14 +399,14 @@ class TestCatchAllFrequency(unittest.TestCase):
         ⚠️ 第一版实现没配下限，把测试里「1 个候选」和「4 个候选」的批次
         全判成了 catch-all，5 条老测试直接红。这是实测打脸的典型。
         """
-        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+        from core.domains.subdomain._lib.sweep import find_catch_all
 
         self.assertEqual(find_catch_all(self._rows(1)), {})
         self.assertEqual(find_catch_all(self._rows(4)), {})
 
     def test_spread_out_batch_is_not_misjudged(self) -> None:
         """候选分散在很多 IP 上 —— 真集群，什么都不该判。"""
-        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+        from core.domains.subdomain._lib.sweep import find_catch_all
 
         rows = [(f"h{i}.example.com", [f"10.0.{i // 250}.{i % 250}"], [])
                 for i in range(500)]
@@ -591,7 +414,7 @@ class TestCatchAllFrequency(unittest.TestCase):
 
     def test_comma_separated_records_are_split(self) -> None:
         """一条记录里多个 IP（``a,b``）也要各算一次，否则计数会被低估。"""
-        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+        from core.domains.subdomain._lib.sweep import find_catch_all
 
         rows = [(f"h{i}.example.com", ["1.2.3.4,5.6.7.8"], []) for i in range(150)]
         hot = find_catch_all(rows)
@@ -681,10 +504,10 @@ class TestCatchAllConfigWiring(unittest.TestCase):
     def test_code_default_alone_still_keeps_the_layer_on(self) -> None:
         """**不吃 yml** 时，代码默认值也得能判掉实测那 590 个。
 
-        对应 dnsx_idle_timeout 那边 ``test_the_code_default_alone_is_big_enough``：
-        yml 是给人调的，代码默认是给「预设写漏了」兜底的，两边都得站得住。
+        同一类的另一条：``active.yml`` 是给人调的，代码默认是给「预设写漏了」
+        兜底的，两边都得站得住。
         """
-        from core.domains.subdomain._lib.dnsx_scan import find_catch_all
+        from core.domains.subdomain._lib.sweep import find_catch_all
 
         rows = [(f"h{i}.example.com", ["39.106.205.137"], []) for i in range(590)]
         self.assertIn("39.106.205.137", find_catch_all(rows))
@@ -716,7 +539,8 @@ class TestWildcardCnameSignature(unittest.TestCase):
       IP 池无界、5 个样本只代表其中极小一部分 → 702 个假子域进了资产表。
 
     两处根因：``matches_cname`` 只比完整名（首标签一变就失效），
-    以及 CNAME 虽然一直在 ``DnsxResult`` 上却**从头到尾没人用**。
+    以及 CNAME 虽然解析层一直查得到、却**从头到尾没人用**（2026-10-04 之前
+    它挂在 ``DnsxResult`` 上，那个字段连生产消费方都没有）。
     """
 
     def setUp(self) -> None:
@@ -768,64 +592,6 @@ class TestWildcardCnameSignature(unittest.TestCase):
         self.assertTrue(self.p.is_artifact(
             ips=["112.13.210.66", "43.174.246.33"], cnames=[]))
         self.assertFalse(self.p.is_artifact(ips=["1.2.3.4"], cnames=[]))
-
-
-
-class TestDnsxWordlistTempFile(unittest.TestCase):
-    """``dnsx -w`` 的临时字典文件必须以 **UTF-8** 写。
-
-    2026-10-04 实测踩到（一次真实扫描 ``dayinmao.com`` 时日志里出现的）：
-
-    ``os.fdopen(fd, "w")`` 省略 ``encoding`` → 用 ``locale.getpreferredencoding()``，
-    中文 Windows 上是 **cp936(GBK)**。字典 ``domain_2w.txt`` 是 UTF-8，19706 条里
-    恰好有一条 ``oˈclock``（U+02C8，英语 o'clock），于是 ``f.write`` 抛
-    ``UnicodeEncodeError`` —— **整个 ``dns_brute`` 每次都在这里崩掉，一条子域都
-    出不来**，而 dnsx 明明是装好的。
-
-    ⚠️ **之前没被发现，是因为所有测试都把 ``resolve()`` 整个 mock 掉了** ——
-    崩在 ``_spawn()`` 里的东西从来没被执行过。mock 打在 ``resolve()`` 这一层太高，
-    把真正会炸的接缝整个盖住了。所以这里直接测接缝本身。
-    """
-
-    def test_the_real_wordlist_can_be_written(self) -> None:
-        """别用编造的最小样本 —— 直接写生产字典，那条 ``oˈclock`` 就在里面。"""
-        from core.domains.resolve._lib.dnsx_runner import DnsxBruteRunner
-        from core.util.words import load_words
-
-        words = load_words("domain_2w")
-        self.assertGreater(len(words), 1000, "生产字典读不到")
-        self.assertTrue(
-            [w for w in words if any(ord(c) > 127 for c in w)],
-            "字典里已无非 ASCII 条目 —— 这条用例失去意义，可以删了",
-        )
-
-        path = DnsxBruteRunner._write_wordlist(words)
-        try:
-            raw = Path(path).read_bytes()
-            self.assertNotIn(b"\r\n", raw, "临时文件不该带 CRLF")
-            back = raw.decode("utf-8").split("\n")
-            self.assertEqual(back, words, "写出去再读回来对不上")
-        finally:
-            Path(path).unlink(missing_ok=True)
-
-    def test_it_does_not_depend_on_the_locale(self) -> None:
-        """即使把 locale 换成别的，也必须照写不误。"""
-        import locale
-        from unittest import mock
-
-        from core.domains.resolve._lib.dnsx_runner import DnsxBruteRunner
-
-        path = None
-        for enc in ("ascii", "cp1252"):
-            with mock.patch.object(locale, "getpreferredencoding", return_value=enc):
-                path = DnsxBruteRunner._write_wordlist(["o\u02c8clock", "www"])
-        try:
-            self.assertEqual(
-                Path(path).read_bytes().decode("utf-8").split("\n"),
-                ["o\u02c8clock", "www"],
-            )
-        finally:
-            Path(path).unlink(missing_ok=True)
 
 
 
@@ -886,72 +652,46 @@ def make_fake_query(
     return fake_query
 
 
-def make_fake_dnsx(
+def make_fake_records(
     answers: dict[str, list[str]],
     wildcard_ip: str | None = None,
     calls: list[tuple[str, str]] | None = None,
+    failures: set[str] | None = None,
+    cnames: dict[str, list[str]] | None = None,
 ):
-    """``DnsxRunner.resolve`` 的替身，**同时**盖住两种 runner。
-
-    ## 为什么需要它
-
-    ``dns_brute`` / ``dns_permute`` 已经从 Python 解析器迁到 **dnsx 子进程**。
-    迁移之后，这两个模块的答案由 dnsx 产出，不再经过
-    ``AsyncResolverPool._query`` —— 所以给 ``_query`` 打桩等于**打在被替换掉的
-    实现上**：桩拦不到任何东西，真 dnsx 却在离线环境里既慢又拿不到结果
-    （实测单条测试 17 秒、0 命中，还完全测不到泛解析过滤）。
+    """``AsyncResolverPool.records`` 的替身 —— 一次调用同时返回 ``(ips, cnames)``。
 
     ## 打在哪个缝隙上
 
-    打在 ``resolve()`` —— 模块与 dnsx 之间的**唯一**边界。候选名由 runner 自己算：
+    打在 ``records()``：``dns_brute`` / ``dns_permute`` 与解析层之间的**唯一**
+    边界。不起子进程、不发真实 DNS，``answers`` 查表返回。
 
-    * ``DnsxBruteRunner``（``dns_brute``）：入参被忽略（它用 ``-w`` 传词表），
-      名字是 ``f"{word}.{root_domain}"``
-    * ``DnsxStdinRunner``（``dns_permute``）：名字就是入参候选表
+    泛解析画像仍走 ``AsyncResolverPool`` 的 ``a_records`` / ``cnames``（那是
+    ``wildcard_detect`` 用的，仍经由 ``_query``），所以这两道桩要一起打：
+    **画像**用 ``_query``，**爆破/置换**用本函数。
 
-    于是不起子进程、不发真实 DNS，``answers`` 查表返回。``calls`` 记 ``(name, "A")``
-    以保持与旧桩一致的记录格式 —— 断言里直接拿它当"确实解析过"的证据。
-
-    泛解析画像仍走 ``AsyncResolverPool``（``wildcard_detect`` 那侧），所以这两道桩
-    要一起打：**画像**用 ``_query``，**爆破/置换**用本函数。
+    ``failures`` 里的名字返回 ``None`` —— 模拟"查询故障"，与"域名不存在"
+    （返回 ``([], [])``）分开。爆破模块必须能把这两者分开记账。
     """
+    cname_map = cnames or {}
 
-    async def fake_resolve(self, names=None, _names=None):  # noqa: ANN001
-        from core.domains.resolve._lib.dnsx_runner import DnsxResult
+    async def fake_records(self, name: str):
+        if calls is not None:
+            calls.append((name, "A"))
+        if failures and name in failures:
+            return None                      # 查询失败
+        ips = list(answers.get(name) or ())
+        if not ips and wildcard_ip and name.endswith(".example.com"):
+            ips = [wildcard_ip]
+        return ips, list(cname_map.get(name) or ())
 
-        wanted = names if names is not None else _names
-        if wanted is None:
-            # brute runner：入参被忽略，名字由构造时的词表 + 根域名决定
-            wanted = [f"{w}.{self._root_domain}" for w in self._wordlist]
-
-        for name in wanted:
-            if calls is not None:
-                calls.append((name, "A"))
-            ips = list(answers.get(name) or ())
-            if not ips and wildcard_ip and name.endswith(".example.com"):
-                ips = [wildcard_ip]
-            yield name, DnsxResult(
-                host=name, ips=ips, a_records=ips, status="NOERROR",
-            )
-
-    return fake_resolve
+    return fake_records
 
 
 @contextlib.contextmanager
-def patch_dnsx(**kw):
-    """把两种 runner 的 ``resolve`` 一起换成同一个替身。
-
-    必须两个都打：``DnsxStdinRunner`` 没有覆盖 ``resolve``（继承基类那个），
-    ``DnsxBruteRunner`` 覆盖了它。只打一个，另一半模块照样真的起 dnsx。
-    """
-    from core.domains.resolve._lib.dnsx_runner import (
-        DnsxBruteRunner,
-        DnsxStdinRunner,
-    )
-
-    fake = make_fake_dnsx(**kw)
-    with mock.patch.object(DnsxStdinRunner, "resolve", fake), \
-            mock.patch.object(DnsxBruteRunner, "resolve", fake):
+def patch_sweep(**kw):
+    """把 ``records()`` 换成假实现（``dns_brute`` / ``dns_permute`` 的唯一入口）。"""
+    with mock.patch.object(AsyncResolverPool, "records", make_fake_records(**kw)):
         yield
 
 
@@ -974,7 +714,7 @@ class TestWildcardAndBrute(EngineTestCase):
 
         with mock.patch.object(
             AsyncResolverPool, "_query", make_fake_query(answers, WILDCARD_IP)
-        ), patch_dnsx(
+        ), patch_sweep(
             answers={name: ips for (name, _t), ips in answers.items()},
             wildcard_ip=WILDCARD_IP,
         ):
@@ -1028,7 +768,7 @@ class TestWildcardAndBrute(EngineTestCase):
 
         with mock.patch.object(
             AsyncResolverPool, "_query", make_fake_query(answers, None)
-        ), patch_dnsx(
+        ), patch_sweep(
             answers={name: ips for (name, _t), ips in answers.items()},
         ):
             scanner, _ = await self.run_scan(
@@ -1050,6 +790,78 @@ class TestWildcardAndBrute(EngineTestCase):
         # 没有泛解析就不该有 wildcard_filtered 汇报
         findings = await self.storage.findings(scanner.scan_id)
         self.assertNotIn("wildcard_filtered", {f["kind"] for f in findings})
+
+    async def test_all_queries_failing_is_not_reported_as_no_subdomains(self) -> None:
+        """**查询全挂 ≠ 没有子域** —— 两者必须分开，而且要留痕。
+
+        钉的是 2026-10-04 换掉 dnsx 之后新增的能力。以前 ``DnsxResult.error``
+        字段从来没被赋值（恒为空串），SERVFAIL / 超时 / NXDOMAIN 三种情况
+        全掉进"没有 IP"同一个分支被静默丢弃 —— 表现是"爆破一条都没跑出来"，
+        而扫描结果里没有任何东西能告诉你"这是网络故障"还是"这站真没子域"。
+
+        现在 ``records()`` 用 ``None`` 表示查询故障，``([], [])`` 表示域名不存在，
+        两者分别记进 ``outcome.failed`` 与 ``outcome.no_records``，并且全挂时
+        额外发一条 ``dns_query_all_failed`` finding。
+        """
+        wordlist = self.root / "words.txt"
+        wordlist.write_text(BRUTE_WORDS, encoding="utf-8")
+        all_names = {f"{w}.example.com" for w in BRUTE_WORDS.split()}
+
+        with mock.patch.object(
+            AsyncResolverPool, "_query", make_fake_query({}, None)
+        ), patch_sweep(answers={}, failures=all_names):
+            scanner, _ = await self.run_scan(
+                targets=["example.com"],
+                include=["wildcard_detect", "dns_brute"],
+                module_config={
+                    "dns_brute": {"wordlist": str(wordlist), "concurrency": 8}
+                },
+            )
+
+        # 确实一条子域都没产出
+        domains = {d["name"] for d in await self.storage.domains(scanner.scan_id)}
+        self.assertNotIn("api.example.com", domains)
+
+        # 但必须留下一条"这是故障"的结论
+        findings = await self.storage.findings(scanner.scan_id)
+        kinds = {f["kind"] for f in findings}
+        self.assertIn("dns_query_all_failed", kinds)
+        self.assertNotIn("wildcard_filtered", kinds,
+                         "一条都没解析成功，不该报泛解析过滤")
+
+        detail = next(f for f in findings if f["kind"] == "dns_query_all_failed")["detail"]
+        self.assertIn("不是「没有子域」", detail)
+
+    async def test_nonexistent_names_are_counted_separately_from_failures(self) -> None:
+        """NXDOMAIN 是**有效答案**，不是故障 —— 不能混进 failed。
+
+        这两种情况在结果里必须可区分：一个"这站真没子域"，一个"网络炸了"。
+        """
+        wordlist = self.root / "words.txt"
+        wordlist.write_text(BRUTE_WORDS, encoding="utf-8")
+        only_failures = {"www.example.com"}
+
+        with mock.patch.object(
+            AsyncResolverPool, "_query", make_fake_query({}, None)
+        ), patch_sweep(
+            answers={"api.example.com": [REAL_IP]},
+            failures=only_failures,
+        ):
+            scanner, _ = await self.run_scan(
+                targets=["example.com"],
+                include=["wildcard_detect", "dns_brute"],
+                module_config={
+                    "dns_brute": {"wordlist": str(wordlist), "concurrency": 8}
+                },
+            )
+
+        # 部分成功 → 不该发"全挂"那条 finding
+        findings = await self.storage.findings(scanner.scan_id)
+        self.assertNotIn("dns_query_all_failed", {f["kind"] for f in findings})
+
+        # 真资产还是出来了
+        domains = {d["name"] for d in await self.storage.domains(scanner.scan_id)}
+        self.assertIn("api.example.com", domains)
 
 
 # --------------------------------------------------------------------- 置换
@@ -1459,7 +1271,7 @@ class TestPermute(EngineTestCase):
         calls: list[tuple[str, str]] = []
         with mock.patch.object(
             AsyncResolverPool, "_query", make_fake_query(answers, None, calls)
-        ), patch_dnsx(
+        ), patch_sweep(
             answers={"dev.www.example.com": [REAL_IP]},
             calls=calls,
         ):
@@ -1502,7 +1314,7 @@ class TestPermute(EngineTestCase):
         self.add_module_file("mine_three", MINE_THREE)
 
         calls: list[tuple[str, str]] = []
-        with patch_dnsx(answers={"jwc.www.example.com": [REAL_IP]}, calls=calls):
+        with patch_sweep(answers={"jwc.www.example.com": [REAL_IP]}, calls=calls):
             await self.run_scan(
                 targets=["example.com"],
                 include=["mine_three", "dns_permute"],
@@ -1520,22 +1332,20 @@ class TestPermute(EngineTestCase):
             "另一个种子里的标签没被抽进词表 —— 词表增强白做了",
         )
 
-    async def test_evidence_hosts_bypass_the_distance_gate(self) -> None:
-        """JS 里写着的后端地址**不能**被距离门挡掉。
+    async def test_evidence_hosts_are_permuted(self) -> None:
+        """JS 里写着的后端地址**要**能拿到邻域扩展。
 
         ``js_assets`` 发的 ``DNS_NAME`` 挂在 URL 事件上，而子事件类型是
         ``DNS_NAME`` 就计一次递归（``BaseModule.emit_event`` 的规矩），
-        于是 ``scope_distance == 2``；而 ``max_input_distance`` 默认 1。
-
-        结果是：站点自己把后端地址写在 JS 里发到公网，我们看到了，却因为
-        「距离太远」不给它做邻域扩展 —— 而它的证据等级远高于任何词表。
+        于是 ``scope_distance == 2``。它曾经被 ``max_input_distance``（默认 1）
+        挡掉 —— 那道闸 2026-10-04 已删除。
         """
         wordlist = self.root / "words.txt"
         wordlist.write_text("dev\n", encoding="utf-8")
         self.add_module_file("js_seed", JS_SEED)
 
         calls: list[tuple[str, str]] = []
-        with patch_dnsx(answers={"dev.jwc.example.com": [REAL_IP]}, calls=calls):
+        with patch_sweep(answers={"dev.jwc.example.com": [REAL_IP]}, calls=calls):
             await self.run_scan(
                 targets=["example.com"],
                 include=["js_seed", "dns_permute"],
@@ -1549,21 +1359,27 @@ class TestPermute(EngineTestCase):
 
         self.assertIn(
             ("dev.jwc.example.com", "A"), calls,
-            "证据级主机名被距离门挡住了 —— JS 里写着的后端地址得不到扩展",
+            "证据级主机名没被扩展 —— JS 里写着的后端地址白看到了",
         )
 
-    async def test_ordinary_nested_names_are_still_gated(self) -> None:
-        """对照组：普通（非证据级）的二级事件**仍要**被距离门拦住。
+    async def test_nested_names_are_permuted_too(self) -> None:
+        """距离门删掉后，**任何**非置换来源的二级域名都会拿到扩展。
 
-        那道门防的是 ``DNS_NAME -> DNS_NAME`` 自我喂养，不能因为给证据级
-        开了口子就把它整个拆掉。
+        这条原来是反的（``test_ordinary_nested_names_are_still_gated``
+        断言它们要被拦住）。删闸是有意的取舍：真实数据显示那道闸一条都没挡，
+        却把 ``tls_cert`` 的证书 SAN 和 ``ip_ptr`` 的 PTR 全丢了 —— 库里
+        ``source=tls_san`` 事件是 0 条，而 tls_cert 同时成功产出了 32 条
+        ``SSL_CERTIFICATE``。证书拿到了，SAN 里的兄弟站全被下游丢掉。
+
+        防爆改由**可数的预算**兜（``max_permutations_per_name`` /
+        ``max_total_candidates``）和 ``permuted`` 标记，而不是距离这个代理指标。
         """
         wordlist = self.root / "words.txt"
         wordlist.write_text("dev\n", encoding="utf-8")
         self.add_module_file("nested_seed", NESTED_SEED)
 
         calls: list[tuple[str, str]] = []
-        with patch_dnsx(answers={"dev.www.example.com": [REAL_IP]}, calls=calls):
+        with patch_sweep(answers={"dev.www.example.com": [REAL_IP]}, calls=calls):
             await self.run_scan(
                 targets=["example.com"],
                 include=["nested_seed", "dns_permute"],
@@ -1575,7 +1391,40 @@ class TestPermute(EngineTestCase):
                 },
             )
 
-        self.assertEqual(calls, [], "普通二级事件绕过了距离门 —— 会指数爆炸")
+        self.assertIn(
+            ("dev.www.example.com", "A"), calls,
+            "普通二级事件没被扩展 —— 距离门可能没删干净",
+        )
+
+    async def test_the_gate_it_survives_on_is_the_permuted_tag(self) -> None:
+        """对照组：证明夹具**真的被加载了**。
+
+        同类里 ``test_does_not_permute_already_permuted_names`` 断言的是
+        「一条查询都没发出去」，而模块没被加载时它也会这么过 —— 实测踩过：
+        另一个改动定义了同名夹具把它覆盖掉，那条测试立刻变成假绿
+        （``assertEqual(calls, [])`` 对「什么都没发生」和「正确地被拦下」
+        同样成立）。所以先用一条**确实会发查询**的对照组把前提钉住。
+        """
+        wordlist = self.root / "words.txt"
+        wordlist.write_text("dev\n", encoding="utf-8")
+        self.add_module_file("nested_seed", NESTED_SEED)
+
+        calls: list[tuple[str, str]] = []
+        with patch_sweep(answers={"dev.www.example.com": [REAL_IP]}, calls=calls):
+            await self.run_scan(
+                targets=["example.com"],
+                include=["nested_seed", "dns_permute"],
+                module_config={
+                    "dns_permute": {
+                        "wordlist": str(wordlist),
+                        "max_total_candidates": 50,
+                    }
+                },
+            )
+
+        self.assertTrue(
+            calls, "对照组一条查询都没发 —— 夹具没被加载，后面的断言都是空转",
+        )
 
 
 
@@ -1647,7 +1496,6 @@ class nested_seed(BaseModule):
             scope_distance=2, tags={"source": "nested"},
         ))
 """
-
 
 
 # --------------------------------------------------------------------- CDN + 富化
