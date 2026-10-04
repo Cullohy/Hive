@@ -45,15 +45,11 @@ export const getTrace = (id, eventId) => http.get(`/api/scans/${id}/trace/${even
 export const getDiff = (id, against) =>
   http.get(`/api/scans/${id}/diff`, { params: against ? { against } : {} })
 
-// 导出要带 Authorization 头，所以不用 <a href>，先取成 blob 再触发下载
+// 导出走 blob 下载（<a href> 拿不到文件名），再触发一次保存
 export async function downloadExport(id, format, type = 'domains', filename) {
-  const { getToken } = await import('./http')
   const params = new URLSearchParams({ format })
   if (format === 'csv') params.set('type', type)
-  const token = getToken()
-  const response = await fetch(`/api/scans/${id}/export?${params}`, {
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-  })
+  const response = await fetch(`/api/scans/${id}/export?${params}`)
   if (!response.ok) {
     let detail = `HTTP ${response.status}`
     try {

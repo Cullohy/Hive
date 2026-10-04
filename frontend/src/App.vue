@@ -61,7 +61,6 @@
     </a-layout>
 
     <SettingsDrawer v-model:open="showSettings" @saved="loadHealth" />
-    <TokenGate v-if="needToken" @ok="onTokenOk" />
   </a-config-provider>
 </template>
 
@@ -80,9 +79,7 @@ import {
 } from '@ant-design/icons-vue'
 
 import { getHealth } from '@/api'
-import { getToken, setToken } from '@/api/http'
 import SettingsDrawer from '@/components/SettingsDrawer.vue'
-import TokenGate from '@/components/TokenGate.vue'
 
 const theme = {
   token: {
@@ -97,7 +94,6 @@ const theme = {
 
 const collapsed = ref(false)
 const showSettings = ref(false)
-const needToken = ref(false)
 const health = ref({ ok: false, running: 0, max_concurrent: 0 })
 const version = ref('')
 
@@ -133,33 +129,18 @@ async function loadHealth() {
     const data = await getHealth()
     health.value = data
     version.value = data.version || ''
-    // 后端要求令牌但本地没有 → 直接亮出令牌门
-    if (data.auth_required && !getToken()) needToken.value = true
   } catch {
     health.value = { ok: false, running: 0, max_concurrent: 0 }
   }
-}
-
-function onTokenOk() {
-  needToken.value = false
-  loadHealth()
-}
-
-// 任何请求拿到 401 都会派发这个事件（见 api/http.js）
-function onNeedToken() {
-  setToken('')
-  needToken.value = true
 }
 
 let timer = null
 onMounted(() => {
   loadHealth()
   timer = setInterval(loadHealth, 15000)
-  window.addEventListener('recon:need-token', onNeedToken)
 })
 onUnmounted(() => {
   if (timer) clearInterval(timer)
-  window.removeEventListener('recon:need-token', onNeedToken)
 })
 </script>
 

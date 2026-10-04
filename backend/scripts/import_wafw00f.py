@@ -20,7 +20,7 @@
 Windows schannel）。所以 ``--src`` 要指向一个已经 clone 下来的目录。
 
 许可证：wafw00f 是 **BSD-3-Clause**。导入的条目在 ``waf.json`` 里带
-``source: "wafw00f"``，来源与许可记在 ``core/resources/ATTRIBUTION.md``。
+``source: "wafw00f"``。
 """
 
 from __future__ import annotations

@@ -716,6 +716,11 @@ class TestModuleDiscovery(unittest.TestCase):
             认证墙是「爆破时顺带观察到的东西」，跟着爆破走视野更准，
             所以结论改由 ``dir_brute`` 顺带写进 ``auth_wall``/``auth_hits``。
             判据仍在 ``fuzz/_lib/soft404.py``，识别能力不受影响。
+          * 31 → 32：新增 ``zone_transfer``（2026-10-04）。域传送（AXFR）探测 ——
+            成功一次就把整份区域名单白拿，19706 条字典爆破根本不用跑；而
+            「允许任意客户端拉全区域」本身就是一条该写进报告的发现。此前全仓
+            没有做过 AXFR（``grep axfr|dns.zone`` 零命中），它只需要 dnspython
+            现成的 ``dns.query.xfr``，**不引任何新依赖**。
         """
         import asyncio
 
@@ -731,10 +736,10 @@ class TestModuleDiscovery(unittest.TestCase):
             return sorted(scanner.modules)
 
         names = asyncio.run(go())
-        self.assertEqual(len(names), 31, f"模块数变了: {names}")
+        self.assertEqual(len(names), 32, f"模块数变了: {names}")
         # 库文件绝不能被当成模块
         for lib in ("resolver", "resolver_pool", "dnsgen", "dns_query",
-                    "ports", "tls", "extract"):
+                    "ports", "tls", "extract", "sweep"):
             self.assertNotIn(lib, names, f"{lib} 是库, 不该被注册成模块")
         # 抽象基类不能出现
         self.assertNotIn("passivesourcemodule", names)
@@ -814,13 +819,15 @@ class TestModuleDiscovery(unittest.TestCase):
                     "passive_hunter", "passive_quake", "passive_rapiddns",
                     "passive_subdomaincenter", "passive_urlscan", "passive_wayback",
                 ]),
-                "resolve": ["asn_enrich", "dns_resolve", "ip_ptr"],
-                "probe": ["http_probe", "screenshot",
-                          "soft404_probe", "tls_cert"],
+                "resolve": ["asn_enrich", "dns_resolve", "ip_ptr", "zone_transfer"],
                 "port": ["port_scan"],
                 "fingerprint": ["fingerprint"],
-                "urls": ["js_assets", "url_extract"],
-                "fuzz": ["dir_brute"],
+                # 2026-10-04：原 probe/ + urls/ + fuzz/ 三个域合并成 web_search/。
+                # 模块名与 flags 一个没动，只是同域了。
+                "web_search": sorted([
+                    "http_probe", "screenshot", "soft404_probe", "tls_cert",
+                    "js_assets", "url_extract", "dir_brute",
+                ]),
             },
         )
 

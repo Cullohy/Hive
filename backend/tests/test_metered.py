@@ -113,7 +113,7 @@ class TestMeteredNotRunByDefault(WebTestCase):
     def _scan(self, body: dict) -> dict:
         # 名称是必填的（见 ScanRequest）；这组用例只关心 metered 勾选，统一补一个
         body.setdefault("name", "计量源测试")
-        resp = self.client.post("/api/scans", json=body, headers=self.h())
+        resp = self.client.post("/api/scans", json=body)
         self.assertIn(resp.status_code, (200, 201), resp.text)
         return resp.json()
 
@@ -122,8 +122,7 @@ class TestMeteredNotRunByDefault(WebTestCase):
 
         它们不在 ``modules``（那是已启用的列表）里，所以必须单列一份。
         """
-        data = self.client.get("/api/modules", params={"preset": "passive"},
-                               headers=self.h()).json()
+        data = self.client.get("/api/modules", params={"preset": "passive"}).json()
         enabled = [m["name"] for m in data["modules"]]
         metered = [m["name"] for m in data.get("metered", [])]
         self.assertNotIn("passive_fofa", enabled, "FOFA 默认不该在启用清单里")
@@ -154,8 +153,7 @@ class TestTestConnectionStillWorks(WebTestCase):
     """
 
     def test_metered_source_can_be_tested(self) -> None:
-        resp = self.client.post("/api/sources/passive_fofa/test", json={},
-                                headers=self.h())
+        resp = self.client.post("/api/sources/passive_fofa/test", json={})
         # 没配 key 时应当是"还没填 API Key"，**不能**是 404
         self.assertNotEqual(resp.status_code, 404,
                             f"测试连接又找不到 metered 模块了: {resp.text[:200]}")

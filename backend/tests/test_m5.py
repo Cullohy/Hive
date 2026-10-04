@@ -42,9 +42,6 @@ settings:
 # --------------------------------------------------------------------- API
 
 class WebTestCase(unittest.TestCase):
-    #: 子类可以指定访问令牌，测试认证分支
-    AUTH_TOKEN: str | None = None
-
     def setUp(self) -> None:
         TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
         self.root = TEST_TMP_ROOT / f"w{uuid.uuid4().hex[:10]}"
@@ -61,7 +58,6 @@ class WebTestCase(unittest.TestCase):
             dsn=DSN,
             schema=self.schema,
             settings_path=self.settings_path,
-            auth_token=self.AUTH_TOKEN,
         )
         self.client = TestClient(app)
         self.client.__enter__()
@@ -72,12 +68,6 @@ class WebTestCase(unittest.TestCase):
         shutil.rmtree(self.root, ignore_errors=True)
 
     # ------------------------------------------------------------------ 辅助
-    def h(self) -> dict[str, str]:
-        """请求头。子类设了令牌时自动带上。"""
-        if self.AUTH_TOKEN:
-            return {"Authorization": f"Bearer {self.AUTH_TOKEN}"}
-        return {}
-
     def start(
         self,
         targets: list[str],
@@ -97,14 +87,14 @@ class WebTestCase(unittest.TestCase):
         # ``name=None`` 是**故意不发这个字段**，用来测"缺名称应当被拒"
         if name is not None:
             body["name"] = name
-        resp = self.client.post("/api/scans", json=body, headers=self.h())
+        resp = self.client.post("/api/scans", json=body)
         self.assertEqual(resp.status_code, 201, resp.text)
         return resp.json()
 
     def wait_done(self, scan_id: int, timeout: float = 30.0) -> dict:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            data = self.client.get(f"/api/scans/{scan_id}", headers=self.h()).json()
+            data = self.client.get(f"/api/scans/{scan_id}").json()
             if data.get("status") not in ("running", "finalizing"):
                 return data
             time.sleep(0.2)
@@ -132,7 +122,7 @@ class TestScanName(WebTestCase):
 
         listed = {
             s["scan_id"]: s
-            for s in self.client.get("/api/scans", headers=self.h()).json()
+            for s in self.client.get("/api/scans").json()
         }
         self.assertEqual(listed[scan_id]["name"], "每月巡检 · 主站", "列表里没名字")
 
@@ -141,7 +131,6 @@ class TestScanName(WebTestCase):
         resp = self.client.post(
             "/api/scans",
             json={"targets": ["example.com"], "preset": str(self.preset_path)},
-            headers=self.h(),
         )
         self.assertEqual(resp.status_code, 422, resp.text)
 
@@ -156,7 +145,6 @@ class TestScanName(WebTestCase):
                         "targets": ["example.com"],
                         "preset": str(self.preset_path),
                     },
-                    headers=self.h(),
                 )
                 self.assertEqual(resp.status_code, 422, resp.text)
 
@@ -169,7 +157,6 @@ class TestScanName(WebTestCase):
                 "targets": ["example.com"],
                 "preset": str(self.preset_path),
             },
-            headers=self.h(),
         )
         self.assertEqual(resp.status_code, 422, resp.text)
 
@@ -196,7 +183,7 @@ class TestScanName(WebTestCase):
         # ``forget`` 是同步的，所以不会踩 pgutil 里那个"跨事件循环用连接"的坑。
         self.client.app.state.manager.forget(record["scan_id"])
         detail = self.client.get(
-            f"/api/scans/{record['scan_id']}", headers=self.h()
+            f"/api/scans/{record['scan_id']}"
         ).json()
         self.assertTrue(detail.get("historical"), "没走到历史扫描分支")
         self.assertEqual(detail["name"], "hist")
@@ -286,7 +273,7 @@ class TestNoAuthGate(WebTestCase):
         下次读到的人还得去查它到底管不管用。
         """
         resp = self.client.put(
-            "/api/settings", json={"max_concurrent_scans": 3}, headers=self.h()
+            "/api/settings", json={"max_concurrent_scans": 3}
         )
         self.assertEqual(resp.status_code, 200, resp.text)
         saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
@@ -309,7 +296,7 @@ class TestNoAuthGate(WebTestCase):
             ),
             encoding="utf-8",
         )
-        resp = self.client.get("/api/settings", headers=self.h())
+        resp = self.client.get("/api/settings")
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertNotIn("authorized_targets", resp.json())
 
@@ -374,7 +361,7 @@ class TestScreenshotRoute(WebTestCase):
 
         scan_id, png = asyncio.run(self._seed())
         resp = self.client.get(
-            f"/api/screenshots/{scan_id}/{quote(self.URL, safe='')}", headers=self.h()
+            f"/api/screenshots/{scan_id}/{quote(self.URL, safe='')}"
         )
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertEqual(resp.content, png)
@@ -391,7 +378,6 @@ class TestScreenshotRoute(WebTestCase):
         scan_id, _ = asyncio.run(self._seed())
         resp = self.client.get(
             f"/api/screenshots/{scan_id}/{quote('http://nope.invalid/', safe='')}",
-            headers=self.h(),
         )
         self.assertEqual(resp.status_code, 404, resp.text)
 
@@ -399,7 +385,7 @@ class TestScreenshotRoute(WebTestCase):
         from urllib.parse import quote
 
         resp = self.client.get(
-            f"/api/screenshots/999999/{quote(self.URL, safe='')}", headers=self.h()
+            f"/api/screenshots/999999/{quote(self.URL, safe='')}"
         )
         self.assertEqual(resp.status_code, 404, resp.text)
 
@@ -422,8 +408,7 @@ class TestSourceKeySettings(WebTestCase):
         因而默认被预设挡下、不在 ``modules``（已启用）里，而是出现在
         ``metered``（可勾选）里。只查 ``modules`` 会误判成"一个都没有"。
         """
-        data = self.client.get("/api/modules", params={"preset": "passive"},
-                               headers=self.h()).json()
+        data = self.client.get("/api/modules", params={"preset": "passive"}).json()
         everything = list(data["modules"]) + list(data.get("metered") or [])
         needing = [m["name"] for m in everything if m.get("requires_key")]
         self.assertIn("passive_fofa", needing, "要 Key 的源没被标出来")
@@ -433,7 +418,7 @@ class TestSourceKeySettings(WebTestCase):
     def test_key_is_echoed_back_for_editing(self) -> None:
         """源 API Key **明文回显**，好让设置页能显示、复制、在原值上改。
 
-        与 ``auth_token`` 的纪律不同（那个永不回传，只给 ``auth_token_set``）：
+        与告警那几个密钥的纪律不同（它们永不回传，只给 ``*_set``）：
         Key 只回传"已设置"的话，用户看不出自己配的是哪个账号的 Key，
         也没法在原值上改一个字符 —— 只能整条重填。
         """
@@ -441,7 +426,6 @@ class TestSourceKeySettings(WebTestCase):
             "/api/settings",
             json={"max_concurrent_scans": 2,
                   "source_keys": {"passive_fofa": "SECRET-XYZ"}},
-            headers=self.h(),
         )
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertEqual(
@@ -451,7 +435,7 @@ class TestSourceKeySettings(WebTestCase):
         # "已设置"列表继续保留：前端用它判断哪些源配过（回显值缺失时的兜底）
         self.assertEqual(resp.json()["source_keys_set"], ["passive_fofa"])
 
-        got = self.client.get("/api/settings", headers=self.h())
+        got = self.client.get("/api/settings")
         self.assertEqual(got.json()["source_keys"], {"passive_fofa": "SECRET-XYZ"})
         self.assertEqual(got.json()["source_keys_set"], ["passive_fofa"])
 
@@ -461,7 +445,6 @@ class TestSourceKeySettings(WebTestCase):
             "/api/settings",
             json={"max_concurrent_scans": 2,
                   "source_keys": {"passive_fofa": "SECRET-XYZ"}},
-            headers=self.h(),
         )
         self.assertIn(
             "SECRET-XYZ", self.settings_path.read_text(encoding="utf-8"),
@@ -477,12 +460,12 @@ class TestSourceKeySettings(WebTestCase):
         self.client.put("/api/settings", json={
             "max_concurrent_scans": 2,
             "source_keys": {"passive_fofa": "A", "passive_other": "B"},
-        }, headers=self.h())
+        })
         self.client.put("/api/settings", json={
             "max_concurrent_scans": 2,
             "source_keys": {"passive_fofa": "A2"},
-        }, headers=self.h())
-        names = self.client.get("/api/settings", headers=self.h()).json()["source_keys_set"]
+        })
+        names = self.client.get("/api/settings").json()["source_keys_set"]
         self.assertEqual(names, ["passive_fofa", "passive_other"])
 
     def test_empty_string_clears_a_key(self) -> None:
@@ -493,11 +476,11 @@ class TestSourceKeySettings(WebTestCase):
         self.client.put("/api/settings", json={
             "max_concurrent_scans": 2,
             "source_keys": {"passive_fofa": "A"},
-        }, headers=self.h())
+        })
         resp = self.client.put("/api/settings", json={
             "max_concurrent_scans": 2,
             "source_keys": {"passive_fofa": ""},
-        }, headers=self.h())
+        })
         self.assertEqual(resp.json()["source_keys_set"], [])
 
     def test_omitting_source_keys_keeps_them(self) -> None:
@@ -505,9 +488,10 @@ class TestSourceKeySettings(WebTestCase):
         self.client.put("/api/settings", json={
             "max_concurrent_scans": 2,
             "source_keys": {"passive_fofa": "A"},
-        }, headers=self.h())
+        })
         resp = self.client.put("/api/settings", json={"max_concurrent_scans": 3},
-                               headers=self.h())
+                               
+        )
         self.assertEqual(resp.json()["source_keys_set"], ["passive_fofa"])
 
 
@@ -525,7 +509,8 @@ class TestSourceConnectionTest(WebTestCase):
     def test_source_without_check_reports_unsupported(self) -> None:
         """免 key 的源没实现 ``check_key`` → ``ok=null``、``supported=False``。"""
         resp = self.client.post("/api/sources/passive_crtsh/test", json={},
-                                headers=self.h())
+                                
+        )
         self.assertEqual(resp.status_code, 200, resp.text)
         data = resp.json()
         self.assertIsNone(data["ok"], "没实现检测却报了成功/失败")
@@ -535,20 +520,22 @@ class TestSourceConnectionTest(WebTestCase):
     def test_missing_key_is_reported_before_any_request(self) -> None:
         """没填 key 就直接说，不浪费一次请求。"""
         resp = self.client.post("/api/sources/passive_fofa/test", json={},
-                                headers=self.h())
+                                
+        )
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertFalse(resp.json()["ok"])
         self.assertIn("API Key", resp.json()["detail"])
 
     def test_unknown_module_is_404(self) -> None:
         resp = self.client.post("/api/sources/definitely_not_a_module/test",
-                                json={}, headers=self.h())
+                                json={})
         self.assertEqual(resp.status_code, 404)
 
     def test_non_source_module_is_rejected(self) -> None:
         """非被动源（没有 query 插件）不能拿去测。"""
         resp = self.client.post("/api/sources/dns_resolve/test", json={},
-                                headers=self.h())
+                                
+        )
         self.assertEqual(resp.status_code, 400, resp.text)
 
     def test_form_values_are_used_not_saved_ones(self) -> None:
@@ -561,7 +548,6 @@ class TestSourceConnectionTest(WebTestCase):
         resp = self.client.post(
             "/api/sources/passive_fofa/test",
             json={"api_key": "k", "options": {"api_url": "http://127.0.0.1:9/nope"}},
-            headers=self.h(),
         )
         self.assertEqual(resp.status_code, 200, resp.text)
         detail = resp.json()["detail"]
@@ -687,48 +673,36 @@ class TestAuditLevels(WebTestCase):
         之前只断言"有这么条记录"，改坏了内容也发现不了。）
         """
         resp = self.client.put(
-            "/api/settings", json={"max_concurrent_scans": 3}, headers=self.h()
+            "/api/settings", json={"max_concurrent_scans": 3}
         )
         self.assertEqual(resp.status_code, 200, resp.text)
 
-        rows = self.client.get("/api/audits", headers=self.h()).json()
+        rows = self.client.get("/api/audits").json()
         upd = next((a for a in rows if a["action"] == "settings_update"), None)
         self.assertIsNotNone(upd, "改设置没写审计")
         self.assertEqual(upd["actor"], "local")
         self.assertIn("max_concurrent=3", upd["detail"])
 
 
-class TestTokenAuth(WebTestCase):
-    """访问令牌。ARL 的 AUTH 默认是 False，我们不想犯同样的错。"""
+class TestStaticFrontend(WebTestCase):
+    """构建产物必须能在没有任何认证头的情况下取到。
 
-    AUTH_TOKEN = "sekret-token"
-
-    def test_api_requires_token(self) -> None:
-        self.assertEqual(self.client.get("/api/scans").status_code, 401)
-        self.assertEqual(
-            self.client.get(
-                "/api/scans", headers={"Authorization": "Bearer wrong"}
-            ).status_code,
-            401,
-        )
-        self.assertEqual(self.client.get("/api/scans", headers=self.h()).status_code, 200)
+    访问令牌与授权白名单都已移除，``/api/*`` 对本机任何进程开放，页面自然
+    也不需要带任何头 —— 但**这条断言还得留着**：它守的是"静态资源路径没被
+    改坏"（挂到子路径、拼错 ``/assets/*`` 之类），跟认证无关。
+    """
 
     def test_health_and_static_stay_open(self) -> None:
-        """健康检查与静态前端不能锁 —— 否则浏览器连页面都加载不出来。
-
-        浏览器加载 ``<script src>`` / ``<link href>`` 时带不了 Authorization 头，
-        把 HTML/JS/CSS 一起锁上，页面根本打不开。
-        """
         health = self.client.get("/api/health")
         self.assertEqual(health.status_code, 200)
-        self.assertTrue(health.json()["auth_required"])
+        # 令牌没了，health 里也就不该再有 auth_required 这个键
+        self.assertNotIn("auth_required", health.json())
 
         root = self.client.get("/")
         if root.status_code != 200:
             self.skipTest("前端未构建（cd frontend && npm run build）")
         self.assertIn('id="app"', root.text)
 
-        # 构建产物也必须免认证可取，否则页面加载不出来
         import re
 
         assets = re.findall(r'(?:src|href)="(/assets/[^"]+)"', root.text)
@@ -736,17 +710,21 @@ class TestTokenAuth(WebTestCase):
         for path in assets:
             self.assertEqual(self.client.get(path).status_code, 200, path)
 
-    def test_query_param_token_also_accepted(self) -> None:
+    def test_api_needs_no_credentials(self) -> None:
+        """接口不再要求任何凭据。"""
+        self.assertEqual(self.client.get("/api/scans").status_code, 200)
         self.assertEqual(
-            self.client.get("/api/scans?token=sekret-token").status_code, 200
+            self.client.get("/api/scans", headers={"Authorization": "Bearer x"}).status_code,
+            200,
+            "残留的鉴权中间件没删干净",
         )
 
-    def test_settings_never_echoes_the_token(self) -> None:
-        data = self.client.get("/api/settings", headers=self.h()).json()
-        self.assertTrue(data["auth_token_set"])
+    def test_settings_never_mentions_a_token(self) -> None:
+        data = self.client.get("/api/settings").json()
         self.assertNotIn("auth_token", data)
+        self.assertNotIn("auth_token_set", data)
 
-    def test_full_flow_with_token(self) -> None:
+    def test_full_flow_still_works(self) -> None:
         scan_id = self.start(["example.com"])["scan_id"]
         final = self.wait_done(scan_id)
         self.assertEqual(final["status"], "finished")
@@ -769,13 +747,13 @@ class TestDeleteForgetsInMemoryScan(WebTestCase):
         self.wait_done(scan_id)
         self.assertIn(scan_id, [s["scan_id"] for s in self.client.get("/api/scans").json()])
 
-        resp = self.client.delete(f"/api/scans/{scan_id}", headers=self.h())
+        resp = self.client.delete(f"/api/scans/{scan_id}")
         self.assertEqual(resp.status_code, 200, resp.text)
 
         ids = [s["scan_id"] for s in self.client.get("/api/scans").json()]
         self.assertNotIn(scan_id, ids, "删掉的扫描又出现在列表里（内存记录没清）")
         self.assertEqual(
-            self.client.get(f"/api/scans/{scan_id}", headers=self.h()).status_code,
+            self.client.get(f"/api/scans/{scan_id}").status_code,
             404,
             "删掉的扫描还能打开详情（内存记录没清）",
         )

@@ -96,9 +96,8 @@ def main() -> int:
 
     st, settings = js("/api/settings")
     if settings is not None:
-        print(f"  白名单: {settings['authorized_targets'] or '(空 —— 会拒绝所有下发)'}")
-        print(f"  强制授权校验: {settings['require_authorization']}   "
-              f"令牌: {'已设置' if settings['auth_token_set'] else '未设置'}   "
+        print(f"  绑定: {settings.get('host')}:{settings.get('port')}   "
+              f"并发上限: {settings.get('max_concurrent_scans')}   "
               f"告警渠道: {', '.join(k[:-4] for k, v in (settings['notify'] or {}).items() if k.endswith('_set') and v) or '无'}")
 
     if scans:

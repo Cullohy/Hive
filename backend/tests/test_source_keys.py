@@ -13,8 +13,8 @@
 * ``source_keys``（源 API Key）**要回显**：设置页得让用户看见自己配的是哪一个，
   也能在原值上改一个字符，而不是只能整条重填。所以 ``to_dict()`` 带明文，
   见 ``TestSettingsModel::test_to_dict_echoes_the_key_for_editing``。
-* ``auth_token`` **永不回传**，只给 ``auth_token_set``
-  （见 ``test_to_dict_never_contains_the_token``）。
+* 告警渠道里那几个密钥（webhook_token / *_secret / email_password）**永不回传**，
+  只给 ``*_set`` 布尔值。
 * "没生效"那条靠端到端跑一次 ``manager.start`` 守住 —— 只测
   ``inject_source_keys`` 是不够的，那条路径上还有三个调用方可能漏。
 """
@@ -140,14 +140,6 @@ class TestSettingsModel(unittest.TestCase):
         self.assertEqual(dumped["source_keys"], {"passive_fofa": "SECRET-KEY-VALUE"})
         # 两种表示并存：回显值用于填输入框，"已设置"列表用于兜底判断
         self.assertEqual(dumped["source_keys_set"], ["passive_fofa"])
-
-    def test_to_dict_never_contains_the_token(self) -> None:
-        """令牌与 Key 的纪律**不同**：令牌永不回传，只给 ``auth_token_set``。"""
-        s = self._settings()
-        s.auth_token = "TOKEN-VALUE"
-        dumped = json.dumps(s.to_dict(), ensure_ascii=False)
-        self.assertNotIn("TOKEN-VALUE", dumped)
-        self.assertTrue(s.to_dict()["auth_token_set"])
 
     def test_empty_values_are_not_reported_as_set(self) -> None:
         s = self._settings()

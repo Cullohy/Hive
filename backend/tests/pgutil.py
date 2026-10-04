@@ -48,6 +48,15 @@ _ADMIN_DSN = f"postgresql://{USER}@{HOST}:{PORT}/postgres"
 
 _db_ready = False
 
+#: 整套件共用的 advisory lock 键。**session 级**，所以进程退出、连接断开时
+#: 由 PostgreSQL 自动释放，不需要显式解锁。
+_RUN_LOCK_KEY = 0x0ACE5EED
+
+#: 持锁的那条连接。必须**一直开着** —— advisory lock 是绑在会话上的，
+#: 连接一断锁就没了，那就等于没锁。
+_lock_conn: "asyncpg.Connection | None" = None
+
+
 _HINT = (
     "连不上 PostgreSQL。测试需要它（存储层已从 SQLite 换成 PostgreSQL）。\n"
     "  检查服务: sc query postgresql-x64-16\n"
@@ -55,11 +64,50 @@ _HINT = (
 )
 
 
+async def _acquire_run_lock() -> None:
+    """占一把进程生命周期的锁，保证**同一时间只有一个 pytest 进程**在用测试库。
+
+    ## 为什么必须
+
+    :func:`ensure_database` 会把上一次跑剩下的 schema 全部 ``DROP ... CASCADE``。
+    同一进程内的测试互不干扰（各有各的 schema），但**跨进程就不然**了：
+    第二个进程启动时会掀掉第一个进程**正在用**的活 schema，于是第一个进程的
+    每一条 INSERT 都撞外键，错误签名是::
+
+        ForeignKeyViolationError: 键值对 "(scan_id)=(1)" 不存在于表 "scan"
+
+    这条错误**完全看不出跟 schema 被删有关**，排障方向会被直接带偏
+    （实测误判成"代码的并发问题"、"跨 scan 去重的回归"）。
+
+    所以这里不检测、不跳过，而是**直接拒绝启动**并说明原因 —— 宁可吵闹，
+    也不要静默地互相破坏。
+    """
+    global _lock_conn
+    if _lock_conn is not None:
+        return
+    try:
+        conn = await asyncpg.connect(DSN)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"{_HINT}\n  原始错误: {e}") from e
+    got = await conn.fetchval("SELECT pg_try_advisory_lock($1)", _RUN_LOCK_KEY)
+    if not got:
+        await conn.close()
+        raise RuntimeError(
+            "**已经有另一个 pytest 进程在用这个测试库。**\n"
+            "两个进程会互删对方的 schema，把对方打成一片外键违规，\n"
+            "而且报错完全看不出真实原因。\n"
+            "  处理: 等那个进程跑完；或给它换一个库:\n"
+            "    $env:RECON_TEST_DB = 'recon_test2'"
+        )
+    _lock_conn = conn
+
+
 async def ensure_database() -> None:
     """保证测试库存在，并清掉上一次跑剩下的 schema。进程内只做一次。"""
     global _db_ready
     if _db_ready:
         return
+    await _acquire_run_lock()
     try:
         admin = await asyncpg.connect(_ADMIN_DSN)
     except Exception as e:  # noqa: BLE001

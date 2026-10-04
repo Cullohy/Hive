@@ -32,7 +32,7 @@ OUTPUT = RESOURCES / "fingerprints.json"
 UA = {"User-Agent": "recon-fingerprint-import/1.0"}
 _RANGE_TOTAL = re.compile(r"/(\d+)\s*$")
 
-#: 来源。都是 MIT（详见 core/resources/ATTRIBUTION.md）
+#: 来源。都是 MIT
 #:
 #: **为什么走 jsDelivr 而不是 raw.githubusercontent.com**：实测这台机器上
 #: raw.githubusercontent.com **不可达**（TLS 连接被重置），而 ``download()``

@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import urlsplit
 
-from core.domains.fuzz._lib.soft404 import (
+from core.domains.web_search._lib.soft404 import (
     PROBE_LENGTHS,
     SIMHASH_MAX_DISTANCE,
     SIMHASH_MIN_TOKENS,
@@ -720,7 +720,7 @@ class TestPathWordlist(unittest.TestCase):
 class TestDirmapWordlists(unittest.TestCase):
     """dirmap 的四档字典 + 逗号多档串联。
 
-    这批字典来自 dirmap（GPL-3.0，仅取数据文件，来源见 ATTRIBUTION.md）。
+    这批字典来自 dirmap（GPL-3.0，仅取数据文件
     引入它们是为了补上自研 200 条覆盖不到的面，所以这里钉住的是
     **"接进来之后仍然成立的性质"**，而不是具体条目 —— 具体条目随上游更新。
     """
@@ -919,9 +919,7 @@ class TestDirmapDictHygiene(unittest.TestCase):
       这一层只铺暴露面，不做注入测试），所以整段剔掉而不是原样引入。
     * 裸 ``#`` —— 它是 URL 的**片段分隔符**，客户端只把 ``#`` 之后的部分留在
       本地、永远不会发给服务器。留着等于每次跑都白请求一条。
-    * 裸 ``%`` —— 不是合法 ``%XX``，``httpx`` 会拒绝或误解义。
-
-    判据与实现见 ``core/resources/ATTRIBUTION.md`` 的「导入时做了什么改动」。
+    * 裸 ``%`` —— 不是合法 ``%XX``，``httpx`` 会拒绝或误解义。`` 的「导入时做了什么改动」。
     """
 
     _INJECTION = ("<", ">", "|", "{", "}", "`")
@@ -1859,7 +1857,7 @@ class TestDictionaryBoundary(unittest.TestCase):
 def _tech_rules():
     """映射表用到的那几十条规则（整库匹配 80ms，裁完 2ms）。"""
     from core.domains.fingerprint._lib.library import load_library
-    from core.domains.fuzz._lib.techdicts import relevant_technologies
+    from core.domains.web_search._lib.techdicts import relevant_technologies
 
     return relevant_technologies(load_library()[0])
 
@@ -1877,7 +1875,7 @@ class TestTechDictMapping(unittest.TestCase):
 
     def test_every_tech_id_exists_in_the_fingerprint_library(self) -> None:
         from core.domains.fingerprint._lib.library import load_library
-        from core.domains.fuzz._lib.techdicts import TECH_DICTS
+        from core.domains.web_search._lib.techdicts import TECH_DICTS
 
         technologies, _labels, _loaded, errors = load_library()
         self.assertEqual(errors, [], "指纹库本身加载就有错，先修库")
@@ -1890,7 +1888,7 @@ class TestTechDictMapping(unittest.TestCase):
         )
 
     def test_every_alias_loads_a_non_empty_unique_wordlist(self) -> None:
-        from core.domains.fuzz._lib.techdicts import TECH_DICTS
+        from core.domains.web_search._lib.techdicts import TECH_DICTS
         from core.util.words import PATH_WORDLISTS, load_path_words
 
         for alias in sorted(set(TECH_DICTS.values())):
@@ -1904,7 +1902,7 @@ class TestTechDictMapping(unittest.TestCase):
 
     def test_all_aliases_are_declared_in_the_tech_table(self) -> None:
         """登记了别名却没被任何技术映射到 = 写了没人用的字典。"""
-        from core.domains.fuzz._lib.techdicts import TECH_DICTS
+        from core.domains.web_search._lib.techdicts import TECH_DICTS
         from core.util.words import TECH_PATH_WORDLISTS
 
         self.assertEqual(sorted(TECH_PATH_WORDLISTS), sorted(set(TECH_DICTS.values())))
@@ -1927,7 +1925,7 @@ class TestTechDictMapping(unittest.TestCase):
         import re
 
         from core.domains.fingerprint._lib.library import load_library
-        from core.domains.fuzz._lib.techdicts import TECH_DICTS
+        from core.domains.web_search._lib.techdicts import TECH_DICTS
 
         by_id = {t.id: t for t in load_library()[0]}
         specific = re.compile(r"""[./<>"'_\\\[\]()= :{}^$?+*#@~;,]""")
@@ -1952,7 +1950,7 @@ class TestTechDictMapping(unittest.TestCase):
 
         ``dir_brute`` 的 ``max_paths`` 是从头截断的，顺序 = 预算耗尽时谁先被砍。
         """
-        from core.domains.fuzz._lib.techdicts import TECH_DICTS, relevant_technologies
+        from core.domains.web_search._lib.techdicts import TECH_DICTS, relevant_technologies
 
         rel = relevant_technologies(
             [_FakeTech(tid) for tid in ("apache-tomcat", "jboss")]
@@ -1975,7 +1973,7 @@ class TestTechDictSelection(unittest.TestCase):
     PLAIN = _obs(headers={"server": "nginx/1.24.0"})
 
     def _select(self, obs, **kw):
-        from core.domains.fuzz._lib.techdicts import select
+        from core.domains.web_search._lib.techdicts import select
 
         return [alias for _t, alias in select(obs, _tech_rules(), **kw)]
 
@@ -2022,14 +2020,14 @@ class TestTechDictMerge(unittest.TestCase):
     BASE = ["p000", "p001", "admin"]
 
     def _picks(self):
-        from core.domains.fuzz._lib.techdicts import select
+        from core.domains.web_search._lib.techdicts import select
 
         return select(
             _obs(headers={"server": "Apache-Coyote/1.1"}), _tech_rules()
         )
 
     def test_prepend_keeps_every_base_word_and_puts_tech_first(self) -> None:
-        from core.domains.fuzz._lib.techdicts import merge_paths
+        from core.domains.web_search._lib.techdicts import merge_paths
 
         merged, added = merge_paths(self.BASE, self._picks())
         tomcat = [w for w in merged if w in load_alias("dir_tomcat")]
@@ -2041,7 +2039,7 @@ class TestTechDictMerge(unittest.TestCase):
         self.assertEqual(len(merged), len(set(merged)), "合并后有重复")
 
     def test_only_mode_drops_the_base_wordlist(self) -> None:
-        from core.domains.fuzz._lib.techdicts import merge_paths
+        from core.domains.web_search._lib.techdicts import merge_paths
 
         merged, _added = merge_paths(self.BASE, self._picks(), mode="only")
         self.assertIn("manager/html", merged)
@@ -2054,7 +2052,7 @@ class TestTechDictMerge(unittest.TestCase):
         "只跑专属档"的字面语义会让这个主机一条请求都不发，
         那比跑通用字典差得多（白排一次队、白花一次软 404 校准）。
         """
-        from core.domains.fuzz._lib.techdicts import merge_paths
+        from core.domains.web_search._lib.techdicts import merge_paths
 
         covered = load_alias("dir_tomcat")
         merged, added = merge_paths(covered + ["p000"], self._picks(), mode="only")
@@ -2062,7 +2060,7 @@ class TestTechDictMerge(unittest.TestCase):
         self.assertEqual(merged, covered + ["p000"], "应该回落到基础字典")
 
     def test_no_picks_means_the_base_wordlist_is_returned_untouched(self) -> None:
-        from core.domains.fuzz._lib.techdicts import merge_paths
+        from core.domains.web_search._lib.techdicts import merge_paths
 
         merged, added = merge_paths(self.BASE, [], mode="only")
         self.assertEqual(merged, self.BASE)
@@ -2857,7 +2855,7 @@ class TestSoft404ThreeLayer(unittest.TestCase):
         out = subprocess.run(
             [sys.executable, "-c",
              "import sys;sys.path.insert(0,'.');"
-             "from core.domains.fuzz._lib.soft404 import simhash64,extract_text;"
+             "from core.domains.web_search._lib.soft404 import simhash64,extract_text;"
              f"print(simhash64(extract_text({self.NOTFOUND_ZH!r})))"],
             capture_output=True, text=True, cwd=str(Path(__file__).resolve().parents[1]),
         )
@@ -3544,8 +3542,8 @@ class TestAuthStatusAndBypass(EngineTestCase):
 
         ``only_for`` 模拟"只有某台主机有 WAF"；留空则对所有 origin 生效。
         """
-        from core.domains.fuzz._lib.soft404 import Probe, SoftProfile
-        from core.domains.probe.soft404_probe import origin_of
+        from core.domains.web_search._lib.soft404 import Probe, SoftProfile
+        from core.domains.web_search.soft404_probe import origin_of
         from core.engine.state import ScannerState
 
         real = ScannerState.web_profile_for
@@ -3570,7 +3568,7 @@ class TestBypassHelpers(unittest.TestCase):
     """``_lib/bypass.py`` 的纯函数。"""
 
     def test_path_variants_are_unique_and_bounded(self) -> None:
-        from core.domains.fuzz._lib.bypass import path_variants
+        from core.domains.web_search._lib.bypass import path_variants
 
         vs = path_variants("admin", 5)
         self.assertEqual(len(vs), 5)
@@ -3579,13 +3577,13 @@ class TestBypassHelpers(unittest.TestCase):
 
     def test_path_variants_keep_the_original_path(self) -> None:
         """变体必须都还是**同一个资源**的不同写法。"""
-        from core.domains.fuzz._lib.bypass import path_variants
+        from core.domains.web_search._lib.bypass import path_variants
 
         for v in path_variants("admin/config.php", 20):
             self.assertIn("config.php", v, v)
 
     def test_is_bypass_on_status_change(self) -> None:
-        from core.domains.fuzz._lib.bypass import is_bypass
+        from core.domains.web_search._lib.bypass import is_bypass
 
         self.assertTrue(is_bypass((403, 552), (200, 552)),
                         "403 → 200 就算拿到了内容，长度一样也算数")
@@ -3597,14 +3595,14 @@ class TestBypassHelpers(unittest.TestCase):
         换个写法变成「不存在」，什么都没拿到。判据只按「状态码变了」算的话，
         每个变体都会报一条假绕过。
         """
-        from core.domains.fuzz._lib.bypass import is_bypass
+        from core.domains.web_search._lib.bypass import is_bypass
 
         self.assertFalse(is_bypass((403, 552), (404, 111)))
         self.assertFalse(is_bypass((403, 552), (500, 0)), "5xx 更不是放行")
         self.assertTrue(is_bypass((403, 552), (301, 0)), "3xx 跳转也是拿到东西了")
 
     def test_is_bypass_needs_a_real_delta(self) -> None:
-        from core.domains.fuzz._lib.bypass import is_bypass
+        from core.domains.web_search._lib.bypass import is_bypass
 
         self.assertFalse(is_bypass((403, 552), (403, 560)),
                          "长度差 1.5% 不算信号")

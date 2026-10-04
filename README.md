@@ -127,7 +127,7 @@ sudo -u postgres python -m core.storage.bootstrap --password '你的密码'
 
 # 3. 应用侧只需要一个环境变量
 export RECON_DB_PASSWORD='你的密码'
-python -m core --host 0.0.0.0 --token 你的访问令牌
+python -m core --host 0.0.0.0          # ⚠️ 对外监听，接口无任何认证
 ```
 
 **关于密码**：asyncpg **不读** `PGPASSWORD`，也不读 `~/.pgpass`（那是 libpq 的行为）。
@@ -178,7 +178,7 @@ python -m core
 
 ```bash
 python -m core --port 8080                    # 换端口
-python -m core --host 0.0.0.0 --token 你的令牌   # 对外监听（**务必加 token**）
+python -m core --host 0.0.0.0                   # 对外监听（**接口无认证，见 §13**）
 python -m core --dsn postgresql://user@host:5432/recon   # 换库
 # 也可用环境变量: set RECON_DSN=postgresql://...
 # 首次需要先建库:  createdb recon   (或 psql -c 'CREATE DATABASE recon')
@@ -273,8 +273,8 @@ SEED ────────────────┤                        
 
 `passive` 刻意**不用** `require_flags: [passive]`：`dns_resolve` 的 flags 是
 `("active", "safe")`，按 require 写会被连带砍掉，连带 `ip_ptr` / `tls_cert` /
-`admin_plane` / `wildcard_detect` 一起消失。判据是「有没有探测流量」，
-不是「模块自称 passive」—— DNS 解析会向权威 DNS 发查询，但那不是探测流量。
+`admin_plane` / `wildcard_detect` / `zone_transfer` 一起消失。判据是「有没有探测流量」，
+不是「模块自称 passive」—— DNS 解析和域传送会向权威 DNS 发查询，但那不是探测流量。
 
 > `brute`（只补主动面、不做被动源）已随合并删除。它需要「主动但不跑被动源」
 > 这个组合，两个模式表达不了。历史上从未被用过。
@@ -339,7 +339,7 @@ port_scan（asyncio connect 扫描，进程内，无外部二进制）
   按 ``implies`` **推断依赖**（命中 WordPress 会一并报出 PHP）、
   给出**分类**与 **CPE**（厂商+产品，用于关联 CVE）。
   刻意**不用** ARL 的 `dicts/webapp.json`，因为那批数据来源疑似 GPL-3.0 的 wappalyzer
-  （详见 `backend/core/resources/ATTRIBUTION.md`）。
+  （与 ARL 自身的 MIT 无关，抄进来会污染授权）。
 * **内网段闸门**（唯一会向任意 IP 发包的模块）—— 默认拒绝内网与保留地址，
   且**每种拒绝原因留痕一次**；需要扫内网时显式 `port_scan.allow_private = true`。
 
@@ -494,7 +494,7 @@ domains/
 | `domains/subdomain/passive/` | 8 | 只查第三方公开数据，`flags` 全是 `passive, safe` |
 | `domains/subdomain/active/` | 3 | `dns_brute` / `dns_permute` / `wildcard_detect` |
 | `domains/subdomain/standalone/` | 2 | `demo_expand`（离线演示源）· `seed_asset`（把种子本身产出为资产） |
-| `domains/resolve/` | 2 | `dns_resolve` + `asn_enrich` |
+| `domains/resolve/` | 4 | `dns_resolve` + `zone_transfer` + `ip_ptr` + `asn_enrich` |
 | `domains/probe/` | 3 | `http_probe` + `tls_cert` + `screenshot` |
 | `domains/port/` | 1 | `port_scan` |
 | `domains/fingerprint/` | 2 | `fingerprint` + `waf_detect` |
@@ -567,8 +567,7 @@ domains/
 | [dirsearch](https://github.com/maurosoria/dirsearch) | **未声明** | 同上 |
 | [WhatWaf](https://github.com/Ekultek/WhatWaf) | NOASSERTION | 自定义 |
 
-> GitHub 上"没写许可证"**不等于**可以随便用。完整清单与理由见
-> `core/resources/ATTRIBUTION.md`。
+> GitHub 上"没写许可证"**不等于**可以随便用。
 
 **`fuzz/dir_brute` 实测**（本地 catch-all 服务器：未知路径全部返回 200 + 同一页面）：
 
@@ -632,6 +631,7 @@ SEED(example.com) → ??? → DNS_NAME(example.com) → dns_resolve → IP_ADDRE
 | `url_extract` | passive, safe | 从已抓到的正文里抽 URL（**不发额外请求**） |
 | `demo_expand` | passive, safe | 离线演示源，测试与自检用 |
 | `dns_resolve` | active, safe | DNS 解析 + CNAME 链 + CDN 判定 |
+| `zone_transfer` | active, safe | 域传送（AXFR）探测 —— 成功就白拿整份区域名单 |
 | `wildcard_detect` | active, safe | 泛解析探测与过滤 |
 | `tls_cert` | active, safe | 证书抓取 + SAN 递归 |
 | `dns_brute` | active, loud | 字典爆破（默认复用 ARL 的 2 万字典） |
@@ -661,8 +661,8 @@ SEED(example.com) → ??? → DNS_NAME(example.com) → dns_resolve → IP_ADDRE
 > 监控有。
 >
 > ⚠️ 因为 Key 是明文回传的，`/api/settings` 相当于一份密钥清单：**默认只绑
-> `127.0.0.1`，对外监听必须配 `--token`**（`auth_token` 本身仍然永不回传，
-> 只给 `auth_token_set`；告警里的 webhook/邮箱密钥同样不回传）。
+> `127.0.0.1`**，且别把该接口的响应转发给第三方（告警里的 webhook/邮箱密钥
+> 不回传，只给 `*_set`）。
 > （缺 Key 时软失败、扫描继续），需要时按 `passive_hackertarget.py` 的写法加回来。
 
 `passive_otx` **已删除**：两次实测都是 HTTP 429，基本不可用。
@@ -833,7 +833,6 @@ D:\Search\recon\                 ← 仓库根（项目名 recon）
 │   │   │   ├── net.py          #   内网段闸门 + 端口集解析
 │   │   │   ├── cdn.py          #   CDN 判定（移植自 ARL，改用 ipaddress）
 │   │   │   ├── words.py        #   字典加载（内置 or 路径）
-│   │   │   ├── authz.py        #   授权白名单
 │   │   │   └── mime.py         #   纠正被 Windows 注册表污染的 MIME 映射
 │   │   ├── resources/          # ★ 随包分发的静态资源（不是运行时数据！）
 │   │   │   ├── domain_2w.txt   #   19,706 条爆破字典（ARL）
@@ -844,7 +843,6 @@ D:\Search\recon\                 ← 仓库根（项目名 recon）
 │   │   │   ├── waf.json       #   44 条自研 WAF 指纹 / 125 条规则
 │   │   │   ├── dir_common.txt #   241 条目录/敏感文件路径（自研精简版）
 │   │   │   ├── resolvers.txt   #   ★ 公共解析器池（22 个，见 §10.5）
-│   │   │   └── ATTRIBUTION.md  #   来源与许可（含"哪些项目因许可证不能借鉴"）
 │   │   ├── storage/            # PostgreSQL 存储
 │   │   │   ├── postgres.py     #   投影与查询（50 个方法）
 │   │   │   ├── pg.py           #   asyncpg 适配层（方言差异只在这里）
@@ -854,7 +852,7 @@ D:\Search\recon\                 ← 仓库根（项目名 recon）
 │   │   │   ├── app.py          #   路由 + 令牌中间件 + SPA 托管
 │   │   │   ├── manager.py      #   进程内扫描管理（不引入 Celery/Redis）
 │   │   │   ├── scheduler.py    #   周期监控调度（进程内 asyncio 任务）
-│   │   │   └── settings.py     #   授权白名单 / 令牌 / 告警配置
+│   │   │   └── settings.py     #   并发上限 / 告警配置 / 源密钥
 │   │   ├── presets/            # passive / active（外加 _template.yml 写模板用）
 │   │   └── server.py           # ★ 唯一入口：拉起 Web 管理台（原 cli.py 已删除）
 │   ├── tests/                  # 263 个测试
@@ -962,7 +960,7 @@ python -m core.domains.fingerprint._lib.importers \
 ```
 
 该文件存在就会被自动叠加，不需要改配置。前端「指纹库」页有完整说明。
-GeoLite2 mmdb 受 MaxMind 独立 EULA 约束，同样未包含。详见 `backend/core/resources/ATTRIBUTION.md`。
+GeoLite2 mmdb 受 MaxMind 独立 EULA 约束，同样未包含。
 
 **BBOT 只学架构，不抄代码** —— BBOT 是 **AGPL-3.0**，比 GPL 多一条网络服务条款，抄代码会传染。
 
@@ -1062,17 +1060,25 @@ python -m core                   # 后端自动托管 frontend/dist 并做 SPA �
   这是 connect 扫描的固有特性，nmap `-sT` 也一样；要减少它需要 `-sV` 那种服务握手，
   后续可选加一个"非标端口轻量握手"环节。
 - **未做服务/版本识别**（ARL 的 nmap `-sV`）。目前只区分"端口开着"和"它响应 HTTP/TLS"。
-- **未做截图**。
 - `port_scan` 对开放端口特别多（>600）的主机只打日志，不丢弃 —— 取舍留给用户。
 - favicon 哈希每个端点只取一次；`favicon.ico` 不存在时会拿到站点首页的哈希（会落库，但不影响指纹）。
 
 **通用**
 
+- **同一时间只能跑一个 pytest 进程**。`tests/pgutil.py` 每个进程启动时会
+  `DROP SCHEMA ... CASCADE` 清上一次剩下的 schema，而所有测试共用同一个
+  `recon_test` 库。两个进程同时跑，后启动的会把前一个**正在用**的活 schema
+  掀掉，于是前一个的每条 INSERT 都撞外键，错误签名是
+  `键值对 "(scan_id)=(N)" 不存在于表 "scan"` —— 完全看不出真实原因。
+  现在启动时会拿一把 advisory lock，第二个进程**直接报错退出**并提示换库
+  （`$env:RECON_TEST_DB = 'recon_test2'`）。另外这个 FK 失败在全量跑时
+  还有低概率的偶发（`test_urls` / `test_m6` 各出现过，隔离跑 10/10 全过），
+  根因未定位，与改动无关时会自行恢复。
 - `dns_resolve` 只取直接 CNAME，**不展开完整 CNAME 链** —— 这是**实测后的决定**，不是没做：
   200 个真正解析出 IP 的域名，CNAME 全是**一跳且指向域外**（`mail.panabit.com → mailhz.qiye.163.com`、
   `www.qq.com → ins-r23tsuuf.ias.tencent-cloud.net`），展开链只会多花 N 次查询换 0 个新资产。
   **一次查询里的多条 CNAME 是全留的**（多 CDN 场景漏第二条会静默漏判）。
-  记录类型只有 A/AAAA/CNAME。
+  记录类型只有 A/AAAA/CNAME/NS（NS 供 `zone_transfer` 用）。
 - **JS 深度分析（SPA 渲染 / webpack chunk 递归 / sourcemap）没做，也是实测后的决定**：
   4 个实际目标全量抓 JS，`webpack=0`、`srcmap=0`、**范围内新主机=0** —— 它们是 jQuery 时代的
   服务端渲染站，没有 chunk 可递归。测量表见 `core/domains/urls/__init__.py`。
@@ -1092,8 +1098,9 @@ python -m core                   # 后端自动托管 frontend/dist 并做 SPA �
 - **默认不声明 `br` 压缩**：本环境 aiohttp 3.14 + brotli 1.1.0 解不开 `br`
   （`HAS_BROTLI` 为 True 但流式解压抛错，aiohttp 还会吞掉真实异常只留一句通用消息）。
   需要时可开 `accept_brotli`，但要先确认你的环境能解。
-- **Web 端没有多用户/RBAC**，只有一个共享令牌；令牌经明文 HTTP 传输，
+- **Web 端没有任何准入控制**（授权白名单与访问令牌均已移除），只靠绑定地址兜底；
   远程使用必须放在 HTTPS 反代或 SSH 隧道之后。默认只绑 `127.0.0.1`。
+  也没有多用户/RBAC。
 - **前端主包 1.6MB（gzip 后 500KB）**：ant-design-vue 是全量引入的。内网
   localhost 加载无感，但真要压体积，需要引入 `unplugin-vue-components` 做按需导入。
 - **构建时要把 TEMP 指到工程内**（Windows 特有）：esbuild 在系统临时目录里
@@ -1137,7 +1144,7 @@ python -m core                   # 后端自动托管 frontend/dist 并做 SPA �
 | **M2** | 被动源：8 个免费无 Key 的源 + 插件框架 + 结果清洗 | ✅ 完成 |
 | **M3** | 泛解析探测 + `dns_brute` + `dns_permute` + CDN 判定 + ASN 富化 | ✅ 完成 |
 | **M4** | `port_scan` + `http_probe` + `tls_cert` + `fingerprint`（含内网段闸门） | ✅ 完成 |
-| **M5** | Web 管理台（任务下发、SSE 进度、资产列表、事件溯源树）+ 授权白名单 + 分级审计 | ✅ 完成 |
+| **M5** | Web 管理台（任务下发、SSE 进度、资产列表、事件溯源树）+ 分级审计 | ✅ 完成 |
 | **M6** | 变更监控（diff + 周期任务）、告警推送（webhook/钉钉/飞书/企微/邮件）、导出（JSON/CSV/XLSX）、截图 | ✅ 完成 |
 
 ---
@@ -1145,7 +1152,7 @@ python -m core                   # 后端自动托管 frontend/dist 并做 SPA �
 ## 13. Web 管理台（M5）
 
 ```bash
-python -m core --port 8791 --token 你的令牌
+python -m core --port 8791
 ```
 
 **没有 Docker、没有 Nginx、没有 Celery/Redis、没有额外 worker 进程。**
@@ -1214,7 +1221,7 @@ npm run build
 | GET | `/api/health` | 健康检查 + 是否需要令牌（**免认证**） |
 | GET | `/api/presets` | 内置预设列表 |
 | GET | `/api/modules?preset=` | 模块清单与 flags、以及被预设过滤掉的原因 |
-| GET/PUT | `/api/settings` | 授权白名单、令牌、并发上限 |
+| GET/PUT | `/api/settings` | 并发上限、告警配置、源密钥 |
 | GET | `/api/stats` | 首页概览（跨扫描去重的资产计数） |
 | GET | `/api/search` | **跨扫描全局资产搜索**（`q` / `type` / `scan_id`） |
 | POST | `/api/scans` | 下发扫描（**先过授权校验**） |
@@ -1235,24 +1242,25 @@ npm run build
 | POST | `/api/notify/test` | 给所有已配置渠道发测试消息 |
 | GET | `/api/audits` | 全量审计日志 |
 
-### 授权白名单（失败关闭）
+### 准入：两道闸门都已移除
 
-Web 是面向远程/多人的入口，所以默认强制校验；**白名单为空时一律拒绝**，
-而不是放行。它只约束扫描目标，不限制操作者 —— 所有放行与拒绝都写审计。
+Web 曾经有两道准入闸门 —— **授权目标白名单**（失败关闭，白名单为空则拒绝一切
+下发）与**访问令牌**（`/api/*` 强制 `Authorization: Bearer`）。**两道都已删除**
+（2026-10-04），理由是职责重叠、且都需要每次加目标时去设置里登记一遍，
+实际使用中只是摩擦。
 
-```
-example.com          # 匹配自身及所有子域
-*.example.com        # 只匹配子域, 不含 example.com 本身
-10.0.0.0/8           # 网段
-*                    # 放行一切 —— 等于关掉这层保护, 界面会提示
-```
+**现在的边界只有一个：绑定地址。** 默认只监听 `127.0.0.1`，改成
+`--host 0.0.0.0` 就等于把"能对任意目标发起扫描"的接口暴露到网络上，
+启动时会有一条 WARNING 提醒。**要对外暴露，请自己放在反向代理后面做认证。**
+
+仍然保留的是**分级审计**（见下）——它不管准入，但事后能查清哪次操作
+向哪个目标发过包。
 
 ### 分级审计
 
 每条审计都带 `mode` 字段，一眼看出这次操作**会不会向目标发包**：
 
 ```
-17:50:51 scan_denied     mode=unknown   allowed=0 evil.com
 17:50:51 settings_update mode=n/a       allowed=1 example.com
 17:50:51 scan_start      mode=active    allowed=1 example.com
 17:50:58 scan_finish     mode=active    allowed=1 example.com
@@ -1260,19 +1268,6 @@ example.com          # 匹配自身及所有子域
 
 `mode` 由启用模块的 flags 推导：只要有一个模块带 `active` 标签就是 `active`。
 `detail` 里还会写明具体是哪些主动模块、哪些高噪声模块。
-
-### 访问令牌
-
-ARL 的 `AUTH` 默认是 `False`（服务暴露即无鉴权），我们不想犯同样的错：
-
-* `--token` 设置令牌后，`/api/*` 需要 `Authorization: Bearer <token>`
-* **只保护数据面**：静态 HTML/JS/CSS 与 `/api/health` 保持开放 ——
-  否则浏览器加载 `<script src>` 时没法带头，页面根本打不开
-* 前端会把令牌存在 localStorage，遇到 401 会弹框询问并重试
-* 未设令牌时启动会打 WARNING；对外监听（非 127.0.0.1）且没令牌时再警告一次
-
-> ⚠️ **令牌是明文 HTTP 传输的**。要远程使用，请置于 HTTPS 反代之后，
-> 或只通过 SSH 隧道访问。当前也没有多用户/RBAC —— 只有一个共享令牌。
 
 ### 前端能力
 
@@ -1392,8 +1387,8 @@ URL 事件 → 截图落盘 → FINDING(kind=screenshot, data=URL, detail=相对
 > `forbidden_domains: []` 才能跑），而实际工作以高校/职院的授权测试为主。
 > 需要按目标收敛时用范围校验，不要指望后缀黑名单。
 
-**授权白名单**（Web 入口失败关闭，空白名单拒绝一切下发）与**分级审计**
-（每条审计带 `mode=passive/active`，事后可查清哪次操作向目标发过包）已完成，见 §13。
+**分级审计**（每条审计带 `mode=passive/active`，事后可查清哪次操作向目标发过包）
+已完成，见 §13。**准入控制（授权白名单 / 访问令牌）已全部移除** —— 只靠绑定地址兜底。
 
 ---
 

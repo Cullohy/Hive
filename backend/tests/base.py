@@ -42,13 +42,18 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
             textwrap.dedent(source), encoding="utf-8"
         )
 
-    async def run_scan(self, *, targets, include, **preset_kw):
+    async def run_scan(
+        self, *, targets, include, enforce_scope: bool = True, **preset_kw
+    ):
         preset = Preset(
             name="test",
             include=list(include),
             module_dirs=[str(self.module_dir)],
             **preset_kw,
         )
-        scanner = Scanner(targets=targets, preset=preset, storage=self.storage)
+        scanner = Scanner(
+            targets=targets, preset=preset, storage=self.storage,
+            enforce_scope=enforce_scope,
+        )
         summary = await scanner.scan()
         return scanner, summary

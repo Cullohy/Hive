@@ -1926,5 +1926,184 @@ class TestIpPtrModule(EngineTestCase):
         self.assertEqual(set(ip_ptr.flags), {"active", "safe"})
 
 
+# --------------------------------------------------------------------- 域传送
+
+#: 伪造一条 AXFR 应答。只用到 ``rcode()`` 与 ``answer[].name/.rdtype`` ——
+#: 本模块**只收名字**，所以不需要真的构造 dns.message。
+class _FakeName:
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def to_text(self) -> str:
+        return self._text
+
+
+class _FakeRRSet:
+    def __init__(self, name: str, rdtype: int) -> None:
+        self.name = _FakeName(name)
+        self.rdtype = rdtype
+
+
+class _FakeMsg:
+    def __init__(self, names, rcode: int) -> None:
+        self.answer = [_FakeRRSet(n, 1) for n in names]
+        self._rcode = rcode
+
+    def rcode(self) -> int:
+        return self._rcode
+
+
+@contextlib.contextmanager
+def patch_xfr(*, servers=None, addrs=None, zone=None, refused=()):
+    """把域传送那条链的三个接缝一起打上。
+
+    * ``servers`` —— NS 查询返回什么（注意：**不在目标之下的一律不算权威 NS**）
+    * ``addrs``   —— NS 主机名解析成什么地址（``dns.query.xfr`` 要的是地址）
+    * ``zone``    —— 传送成功时区域里有哪些名字
+    * ``refused`` —— 这些地址会拒绝传送
+    """
+    import dns.query
+    import dns.rcode
+
+    async def fake_ns(self, name):  # noqa: ANN001
+        return list(servers or ())
+
+    async def fake_a(self, name):  # noqa: ANN001
+        if addrs is not None:
+            return list(addrs)
+        return ["203.0.113.1"] if name in (servers or ()) else []
+
+    def fake_xfr(addr, zone_name, **kwargs):  # noqa: ANN001
+        if addr in refused:
+            return iter([_FakeMsg([], dns.rcode.REFUSED)])
+        return iter([_FakeMsg(zone or (), dns.rcode.NOERROR)])
+
+    with mock.patch.object(AsyncResolverPool, "ns_records", fake_ns), \
+            mock.patch.object(AsyncResolverPool, "a_records", fake_a), \
+            mock.patch.object(dns.query, "xfr", fake_xfr):
+        yield
+
+
+class TestZoneTransfer(EngineTestCase):
+    """域传送（AXFR）—— 成功就把整份区域名单白拿。"""
+
+    HOST = "example.com"
+
+    async def _scan(self, targets=None, enforce_scope: bool = True, **cfg):
+        return await self.run_scan(
+            targets=targets or [self.HOST],
+            include=["zone_transfer"],
+            enforce_scope=enforce_scope,
+            module_config={"zone_transfer": cfg},
+        )
+
+    async def _names(self, scan_id: int) -> set[str]:
+        rows = await self.storage.events(scan_id, limit=2000, event_type="DNS_NAME")
+        return {r["data"] for r in rows}
+
+    async def test_successful_transfer_yields_every_in_scope_name(self) -> None:
+        with patch_xfr(
+            servers=["ns1.example.com"],
+            zone=["a.example.com.", "b.example.com.", "example.com."],
+        ):
+            scanner, _ = await self._scan()
+
+        got = await self._names(scanner.scan_id)
+        # 根本身要排除掉（它已经是 SEED 了）
+        self.assertEqual(got, {"a.example.com", "b.example.com"})
+
+        findings = await self.storage.findings(scanner.scan_id)
+        kinds = [f["kind"] for f in findings]
+        self.assertIn("zone_transfer", kinds)
+        finding = next(f for f in findings if f["kind"] == "zone_transfer")
+        self.assertEqual(finding["severity"], "high")
+        self.assertIn("2 条记录", finding["detail"])
+
+    async def test_refused_transfer_is_silent_and_not_a_finding(self) -> None:
+        """被拒是**常态** —— 不允许传送不是发现，不该进 findings。"""
+        with patch_xfr(
+            servers=["ns1.example.com"],
+            refused=["203.0.113.1"],
+        ):
+            scanner, _ = await self._scan()
+
+        self.assertEqual(await self._names(scanner.scan_id), set())
+        findings = await self.storage.findings(scanner.scan_id)
+        self.assertEqual([f["kind"] for f in findings], [])
+
+    async def test_names_outside_the_target_are_dropped(self) -> None:
+        """区域里混进域外的名字（委派、CNAME 落域外）不能当成子域。
+
+        ⚠️ **必须关掉引擎的范围闸门**（``enforce_scope=False``）。开着的时候
+        域外的名字会被 ``Scanner.in_scope`` 挡掉，于是这条用例即使**模块自己
+        的过滤被整行删掉也照样是绿的** —— 它钉的是引擎那道闸，不是本模块的。
+        关掉之后，模块里那两行 ``is_subdomain_of`` 才是唯一防线。
+        """
+        with patch_xfr(
+            servers=["ns1.example.com"],
+            zone=["a.example.com.", "evil.other.org.", "x.com."],
+        ):
+            scanner, _ = await self._scan(enforce_scope=False)
+
+        self.assertEqual(await self._names(scanner.scan_id), {"a.example.com"})
+
+    async def test_ns_outside_the_target_is_not_an_authoritative_server(self) -> None:
+        """NS 落在目标之下才是它的权威 NS；域外的是委派，不能去撞。"""
+        with patch_xfr(
+            servers=["ns1.other.org."],
+            addrs=["203.0.113.9"],
+            zone=["a.example.com."],
+        ):
+            scanner, _ = await self._scan(enforce_scope=False)
+
+        # 域外 NS 被剔除 → 拿不到可用服务器 → 一条都不发，也没有 finding
+        self.assertEqual(await self._names(scanner.scan_id), set())
+        findings = await self.storage.findings(scanner.scan_id)
+        self.assertEqual([f["kind"] for f in findings], [])
+
+    async def test_max_names_truncates_and_is_counted(self) -> None:
+        """区域有几万条是常事，不设上限就是拿事件预算换一份名单。"""
+        zone = [f"h{i}.example.com." for i in range(50)]
+        with patch_xfr(servers=["ns1.example.com"], zone=zone):
+            scanner, _ = await self._scan(max_names=10)
+
+        self.assertEqual(len(await self._names(scanner.scan_id)), 10)
+
+    async def test_no_ns_is_quietly_skipped(self) -> None:
+        """拿不到 NS 是常态（有些域不给外网查 NS），不该报错。"""
+        with patch_xfr(servers=[]):
+            scanner, summary = await self._scan()
+
+        self.assertEqual(await self._names(scanner.scan_id), set())
+        self.assertIn("zone_transfer", summary["modules_enabled"])
+        self.assertEqual(
+            [f["kind"] for f in await self.storage.findings(scanner.scan_id)], []
+        )
+
+    async def test_module_is_active_and_safe(self) -> None:
+        """它是 ``active, safe``：会发真实 DNS 查询，但只有几次。"""
+        from core.domains.resolve.zone_transfer import zone_transfer as zt
+
+        self.assertEqual(set(zt.flags), {"active", "safe"})
+        self.assertTrue(zt.per_domain_only)
+
+    async def test_duplicate_targets_do_not_trigger_a_second_transfer(self) -> None:
+        """重复目标只探一次。
+
+        ⚠️ 注意去重发生在**引擎层**（`Event.key()` 按 ``(type, data)``），
+        比模块的 ``per_domain_only`` 门闩更早 —— 所以这里观察不到
+        ``module.*.skipped``，该看的是"传送只发生了一次"。
+        """
+        with patch_xfr(
+            servers=["ns1.example.com"], zone=["a.example.com."]
+        ):
+            scanner, summary = await self._scan(targets=[self.HOST, self.HOST])
+
+        self.assertGreaterEqual(summary["events_deduped"], 1, "重复目标没被去重")
+        findings = await self.storage.findings(scanner.scan_id)
+        transfer = [f for f in findings if f["kind"] == "zone_transfer"]
+        self.assertEqual(len(transfer), 1, f"传送发生了 {len(transfer)} 次")
+
+
 if __name__ == "__main__":
     unittest.main()

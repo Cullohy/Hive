@@ -569,7 +569,6 @@ import {
   getTrace,
   stopScan,
 } from '@/api'
-import { getToken } from '@/api/http'
 import { openProgressStream } from '@/api/stream'
 
 const route = useRoute()
@@ -976,13 +975,9 @@ async function showShot(screenshotPath, url) {
   shotSrc.value = ''
   shotLoading.value = true
   try {
-    // <img src> 带不了 Authorization 头，所以先取成 blob
-    const token = getToken()
     // screenshotPath 格式: scan_id/hash.png (旧路径)，从中提取 scan_id
     const scanId = screenshotPath.split('/')[0]
-    const response = await fetch(`/api/screenshots/${scanId}/${encodeURIComponent(url)}`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    })
+    const response = await fetch(`/api/screenshots/${scanId}/${encodeURIComponent(url)}`)
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     shotSrc.value = URL.createObjectURL(await response.blob())
   } catch (e) {

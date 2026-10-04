@@ -1,22 +1,17 @@
-import { getToken } from './http'
-
 /**
  * 用 fetch 读 SSE 流。
  *
- * 为什么不用 EventSource：它无法设置请求头，而我们的 /api/* 需要
- * `Authorization: Bearer`。退而求其次用 `?token=` 也能跑，但那会把令牌写进
- * 服务端访问日志 —— 不值得。fetch + ReadableStream 两全。
+ * 为什么不用 EventSource：它没法带 `AbortController` 之外的取消手段，
+ * 而这个页面要能随时断开一条跑了半小时的进度流。fetch + ReadableStream 两全。
  *
  * @returns {AbortController} 调 .abort() 可随时断开
  */
 export function openProgressStream(scanId, { onData, onDone, onError } = {}) {
   const controller = new AbortController()
-  const token = getToken()
 
   ;(async () => {
     try {
       const response = await fetch(`/api/scans/${scanId}/progress`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
         signal: controller.signal,
       })
       if (!response.ok || !response.body) {

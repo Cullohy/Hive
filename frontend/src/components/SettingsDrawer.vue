@@ -11,20 +11,6 @@
           <a-input-number v-model:value="form.max_concurrent_scans" :min="1" :max="16" />
         </a-form-item>
 
-        <a-form-item>
-          <template #label>
-            <span>访问令牌</span>
-          </template>
-          <a-input-password
-            v-model:value="form.auth_token"
-            :placeholder="settings.auth_token_set ? '已设置（留空表示不修改）' : '未设置（不认证）'"
-            autocomplete="off"
-          />
-          <div class="tk-muted hint">
-            设置后 <code>/api/*</code> 需要 <code>Authorization: Bearer &lt;token&gt;</code>
-          </div>
-        </a-form-item>
-
         <a-divider style="margin: 4px 0 16px" />
 
         <a-collapse ghost>
@@ -38,7 +24,7 @@
             <a-form-item v-for="m in keyModules" :key="m.name" :label="m.name">
               <!--
                 用 ``a-input-password`` —— 它自带那个「眼睛」按钮，而且抽屉里
-                所有密钥类字段（访问令牌 / Webhook Token / 钉钉加签 / 飞书签名 /
+                所有密钥类字段（Webhook Token / 钉钉加签 / 飞书签名 /
                 邮箱密码）都是这个形状，源 API Key 原先是唯一一个例外。
                 Key 仍然**回显**：值就填在框里，点眼睛即可明文查看，
                 不需要像以前那样"整条重填一遍"；默认显示成圆点，
@@ -213,7 +199,6 @@ const keyModules = ref([])
 // 表单里既放非密钥字段（每次都提交）也放密钥字段（只在填了东西时提交）
 const form = reactive({
   max_concurrent_scans: 2,
-  auth_token: '',
   //: {模块名: 已保存的 key}。**回显自服务端**，所以清空 = 删除，见 save()
   source_keys: {},
   //: {模块名: {附加配置}}。**非密钥**，会回显 —— 所以要带出当前值。
@@ -275,7 +260,6 @@ async function load() {
     ])
     settings.value = data
     form.max_concurrent_scans = data.max_concurrent_scans || 2
-    form.auth_token = ''
     form.source_keys = data.source_keys ? JSON.parse(JSON.stringify(data.source_keys)) : {}
     // ⚠️ **两个清单都要看。** 需要 Key 的源大多带 `metered` 标记，
     // 因而不在 `modules`（已启用）里，而是在 `metered`（可勾选）里 ——
@@ -325,8 +309,6 @@ async function save() {
         min_changes: Number(form.notify.min_changes) || 1,
       },
     }
-    // 密钥只在用户真的填了内容时才提交，否则会把服务端已有值抹掉
-    if (form.auth_token.trim()) body.auth_token = form.auth_token.trim()
     // 源 API Key：**整块提交**（含空值），与附加配置同一套语义。
     //
     // 旧语义是"留空 = 不修改"，但那是在 Key **回显不了**的前提下定的 ——
@@ -344,10 +326,10 @@ async function save() {
     // 附加配置：**整块提交**（含空值）。
     //
     // 和上面源 API Key 现在是同一个语义（清空 = 删除）。差别只在"为什么"：
-    // 附加配置一直能回显，Key 是后来才改成回显的；而 ``auth_token`` 与
-    // 告警里的那几个密钥（webhook_token / *_secret / email_password）**仍然
-    // 不回显**，所以它们保留"留空 = 不修改"：框里没有值可对照，留空只能
-    // 表示"没动"。服务端把空串解释为"清掉该项"。
+    // 附加配置一直能回显，Key 是后来才改成回显的；而告警里的那几个密钥
+    // （webhook_token / *_secret / email_password）**仍然不回显**，所以它们
+    // 保留"留空 = 不修改"：框里没有值可对照，留空只能表示"没动"。
+    // 服务端把空串解释为"清掉该项"。
     const options = {}
     for (const [name, opts] of Object.entries(form.source_options || {})) {
       if (opts && Object.keys(opts).length) options[name] = { ...opts }

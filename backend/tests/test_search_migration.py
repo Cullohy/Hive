@@ -270,13 +270,12 @@ class TestSearchApiKeepsAssetsOfDeletedScans(WebTestCase):
 
     def test_deleted_scan_assets_are_still_returned(self) -> None:
         scan_id = asyncio.run(self._seed())
-        resp = self.client.delete(f"/api/scans/{scan_id}", headers=self.h())
+        resp = self.client.delete(f"/api/scans/{scan_id}")
         self.assertEqual(resp.status_code, 200, resp.text)
 
         data = self.client.get(
             "/api/search",
-            params={"q": "gone", "type": "domains", "live": "false"},
-            headers=self.h(),
+            params={"q": "gone", "type": "domains", "live": "false"}
         ).json()
         rows = data["results"]["domains"]
         self.assertEqual(len(rows), 1, data)

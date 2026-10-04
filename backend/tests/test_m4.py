@@ -19,7 +19,7 @@ from core.engine.preset import Preset
 from core.services.http import FetchResult, HTTPClient
 from core.domains.port._lib.ports import ConnectScanner
 from core.domains.resolve._lib.resolver import AsyncResolverPool
-from core.domains.probe._lib.tls import CertInfo
+from core.domains.web_search._lib.tls import CertInfo
 from core.util.net import parse_ports, scan_allowed
 
 from .base import EngineTestCase
@@ -299,7 +299,7 @@ class TestTlsAndSanRecursion(EngineTestCase):
             return []
 
         with mock.patch.object(ConnectScanner, "scan", make_fake_scan({REAL_IP: [443]})), \
-             mock.patch("core.domains.probe.tls_cert.fetch_certificate", fake_fetch_cert), \
+             mock.patch("core.domains.web_search.tls_cert.fetch_certificate", fake_fetch_cert), \
              mock.patch.object(AsyncResolverPool, "_query", fake_query):
             scanner, _ = await self.run_scan(
                 targets=["example.com"],
@@ -332,7 +332,7 @@ class TestTlsAndSanRecursion(EngineTestCase):
             return cert
 
         with mock.patch.object(ConnectScanner, "scan", make_fake_scan({REAL_IP: [443]})), \
-             mock.patch("core.domains.probe.tls_cert.fetch_certificate", fake_fetch_cert):
+             mock.patch("core.domains.web_search.tls_cert.fetch_certificate", fake_fetch_cert):
             scanner, _ = await self.run_scan(
                 targets=["example.com"],
                 include=["emit_ips", "port_scan", "tls_cert"],
@@ -645,7 +645,7 @@ class TestFaviconHash(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        from core.domains.probe._lib import tls
+        from core.domains.web_search._lib import tls
 
         # 告警只打一次，测试之间要复位
         tls._WARNED_NO_MMH3 = False
@@ -802,7 +802,7 @@ class TestUpstreamErrorPorts(EngineTestCase):
         )
 
     def test_port_classification_covers_the_usual_suspects(self) -> None:
-        from core.domains.probe.http_probe import _port_should_serve_http
+        from core.domains.web_search.http_probe import _port_should_serve_http
 
         for port in (25, 110, 143, 3306, 6379, 22, 587, 465):
             self.assertFalse(
@@ -842,7 +842,7 @@ class TestUpstreamErrorPorts(EngineTestCase):
         各自写一份迟早会对不上，而对不上的后果是"前面放行、后面拦截"的
         半吊子状态 —— 资产库里留下污染行，字典又不跑。
         """
-        from core.domains.fuzz._lib import soft404
+        from core.domains.web_search._lib import soft404
         from core.util.net import UPSTREAM_ERROR_STATUS
 
         self.assertIs(soft404.UPSTREAM_ERROR_STATUS, UPSTREAM_ERROR_STATUS)

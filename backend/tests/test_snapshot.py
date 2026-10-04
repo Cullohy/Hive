@@ -186,7 +186,7 @@ class TestAssetsEndpointLiveFilter(WebTestCase):
         self.wait_done(scan_id)
 
         live = self.client.get(
-            f"/api/scans/{scan_id}/assets?live=true", headers=self.h()
+            f"/api/scans/{scan_id}/assets?live=true"
         ).json()
         self.assertTrue(live["live"])
         self.assertEqual(live["domains"], [], "没跑 http_probe，存活视图不该有域名")
@@ -197,7 +197,7 @@ class TestAssetsEndpointLiveFilter(WebTestCase):
 
         # live=false 拿到的才是原始资产投影（5 个域名），live 必须是它的子集
         every = self.client.get(
-            f"/api/scans/{scan_id}/assets?live=false", headers=self.h()
+            f"/api/scans/{scan_id}/assets?live=false"
         ).json()
         self.assertEqual(len(every["domains"]), 5)
         self.assertEqual(every["summary"]["domains"], 5)
@@ -222,10 +222,10 @@ class TestAssetsEndpointLiveFilter(WebTestCase):
         self.wait_done(scan_id)
 
         live = self.client.get(
-            f"/api/scans/{scan_id}/assets?live=true", headers=self.h()
+            f"/api/scans/{scan_id}/assets?live=true"
         ).json()
         every = self.client.get(
-            f"/api/scans/{scan_id}/assets?live=false", headers=self.h()
+            f"/api/scans/{scan_id}/assets?live=false"
         ).json()
 
         # 域名行是全局唯一的：第二次扫描看到的是**同一批**域名行
@@ -351,6 +351,119 @@ class TestSnapshotProjection(EngineTestCase):
             ))
         snaps = await self.storage.asset_snapshots(sid, "ip")
         self.assertEqual(snaps[0]["org"], "Second", "重复投影没有刷新快照")
+
+
+class TestRescanWritesThroughGlobalAssets(EngineTestCase):
+    """**重扫时那些写入路径不能被 ``scan_id`` 挡掉。**
+
+    资产表（``domain`` / ``http_endpoint`` …）在 M7-f 之后是**全局唯一**的，
+    ``scan_id`` 只表示"谁最先发现的"。于是任何 ``WHERE scan_id = ?`` 的**写入**
+    都只在"本次扫描新插入那行"时命中 —— 对上一次已发现的资产，它们**静默不生效、
+    还不报错**。
+
+    这三条以前全是这样，而测试套件**一次都没覆盖过重扫**（``TestSnapshotProjection``
+    测的是快照可读性，不是这些写入路径），所以它们活了下来。
+    """
+
+    async def _scan(self):
+        """一次跑出 example.com + 4 个子域的扫描，返回 scan_id。"""
+        scanner, _ = await self.run_scan(
+            targets=["example.com"], include=["demo_expand"]
+        )
+        return scanner.scan_id
+
+    async def test_domain_ip_link_is_written_on_a_rescan(self) -> None:
+        """第二次扫描只发 ``IP_ADDRESS``（没重发 ``DNS_NAME``）也要建关联。
+
+        真实场景：子域在上一轮已入库，这轮只解析出它的 IP。
+        """
+        from core.engine.event import Event, EventType
+
+        first = await self._scan()
+        second = await self._scan()
+        self.assertNotEqual(first, second)
+
+        # 第二轮只发 IP_ADDRESS，parent_data 指向上轮已入库的域名
+        await self.storage.project(second, Event(
+            type=EventType.IP_ADDRESS, data="9.9.9.9", module="test",
+            parent_data="www.example.com",
+        ))
+
+        row = await self.storage._fetchone(
+            "SELECT count(*) AS n FROM domain_ip di "
+            "JOIN domain d ON d.id = di.domain_id "
+            "JOIN ip i ON i.id = di.ip_id "
+            "WHERE d.name = ? AND i.addr = ?",
+            ("www.example.com", "9.9.9.9"),
+        )
+        self.assertEqual(
+            int(row["n"]), 1,
+            "重扫时域名<->IP 关联没写进去 —— 查询还带着 scan_id？",
+        )
+
+    async def test_cdn_finding_marks_the_domain_on_a_rescan(self) -> None:
+        """第二轮才判定出 CDN，``is_cdn`` 也必须点亮。
+
+        ``services/diff.py`` 正是拿 ``is_cdn`` / ``is_wildcard`` 做变更对比的 ——
+        这条不生效，"新增 CDN"这类变更监控**永远报不出来**，且不留任何痕迹。
+        """
+        from core.engine.event import Event, EventType
+
+        await self._scan()
+        second = await self._scan()
+
+        before = await self.storage._fetchone(
+            "SELECT is_cdn FROM domain WHERE name = ?", ("api.example.com",)
+        )
+        self.assertFalse(before["is_cdn"], "前置条件不成立：它一开始就是 CDN")
+
+        await self.storage.project(second, Event(
+            # FINDING 事件的 ``data`` 就是 target（见 ``_insert_finding``），
+            # ``kind`` 走 tags —— 两者别搞反，否则 UPDATE 拿域名去匹配 0 行。
+            type=EventType.FINDING, data="api.example.com", module="dns_resolve",
+            tags={"kind": "cdn", "detail": "命中 CDN 网段"},
+        ))
+
+        after = await self.storage._fetchone(
+            "SELECT is_cdn FROM domain WHERE name = ?", ("api.example.com",)
+        )
+        self.assertTrue(after["is_cdn"], "重扫的 finding 没点亮 is_cdn")
+
+    async def test_screenshot_write_survives_a_rescan(self) -> None:
+        """截图写进的是"上一轮已存在"的端点行，且**真写进去时才算成功**。
+
+        ⚠️ 端点行必须由**第一次**扫描建立 —— 那样 ``http_endpoint.scan_id``
+        才是"第一轮那个 id"，第二轮的 UPDATE 才真的面临"scan_id 对不上"。
+        （第一版测试把 HTTP_RESPONSE 也投影在第二轮，于是行本来就是第二轮的，
+        删掉修复照样绿 —— 写测试时得先确认"资产行的 scan_id 到底是谁的"。）
+        """
+        from core.engine.event import Event, EventType
+
+        url = "http://www.example.com/"
+
+        def http_response(sid: int) -> None:
+            return self.storage.project(sid, Event(
+                type=EventType.HTTP_RESPONSE, data=url, module="http_probe",
+                tags={"status": 200, "host": "www.example.com", "ip": "9.9.9.9",
+                      "port": 80, "scheme": "http"},
+            ))
+
+        first = await self._scan()
+        await http_response(first)              # ← 端点行归第一轮所有
+        second = await self._scan()
+        await http_response(second)             # 重扫：ON CONFLICT，scan_id 仍是 first
+
+        row = await self.storage._fetchone(
+            "SELECT scan_id FROM http_endpoint WHERE url = ?", (url,)
+        )
+        self.assertEqual(int(row["scan_id"]), first, "前置条件不成立")
+
+        blob = b"\x89PNG-fake-1"
+        self.assertTrue(
+            await self.storage.save_screenshot(second, url, blob),
+            "重扫时截图写不进去 —— UPDATE 还带着 scan_id？",
+        )
+        self.assertEqual(await self.storage.screenshot_blob(second, url), blob)
 
 
 if __name__ == "__main__":

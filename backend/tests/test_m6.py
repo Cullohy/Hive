@@ -448,7 +448,7 @@ class TestMonitorScheduler(DiffTestCase):
 class TestScreenshotSoftFail(unittest.IsolatedAsyncioTestCase):
     async def test_setup_soft_fails_without_browser(self) -> None:
         """浏览器起不来时必须软失败（禁用模块），而不是抛错中断扫描。"""
-        from core.domains.probe.screenshot import screenshot
+        from core.domains.web_search.screenshot import screenshot
 
         scanner = mock.Mock()
         scanner.log = None
@@ -534,13 +534,11 @@ class TestScreenshotReal(unittest.IsolatedAsyncioTestCase):
         )
 
         storage = await make_storage()
-        shots_dir = root / "screenshots"
         try:
             preset = Preset(
                 name="t",
                 include=["emit_url", "screenshot"],
                 module_dirs=[str(mods)],
-                settings={"screenshots_dir": str(shots_dir)},
             )
             scanner = Scanner(targets=["example.com"], preset=preset, storage=storage)
             try:
@@ -696,6 +694,11 @@ class TestScreenshotProjection(DiffTestCase):
 
         截图是**扫描末尾**并行落盘的，目标端点可能因为超时/被删而不在表里 ——
         那种情况下静默跳过是对的，抛出去会把整条截图链打断。
+
+        ⚠️ 返回值从"永远 True"改成了**"是否真写进去了"**（2026-10-04）。旧实现
+        无条件 ``return True``，于是 UPDATE 命中 0 行也报成功，调用方无从
+        察觉截图丢了 —— 而那正是调用方最需要知道的。这里是"什么都没写"，
+        所以必须返回 False；本测试原来 assertTrue，钉的是实现细节而不是意图。
         """
         scan_id = await self.storage.create_scan(targets=["example.com"], preset="t")
         for event in (
@@ -709,8 +712,10 @@ class TestScreenshotProjection(DiffTestCase):
             await self.storage.save_event(scan_id, event)
             await self.storage.project(scan_id, event)
 
-        self.assertTrue(
-            await self.storage.save_screenshot(scan_id, "http://nope.invalid/", b"\x89PNG")
+        # 什么都没写 → 必须如实报告 False（而不是"成功"）
+        self.assertFalse(
+            await self.storage.save_screenshot(scan_id, "http://nope.invalid/", b"\x89PNG"),
+            "URL 没有对应端点行 —— 什么都没写却报成功",
         )
         endpoints = await self.storage.endpoints(scan_id)
         self.assertEqual(len(endpoints), 1)
