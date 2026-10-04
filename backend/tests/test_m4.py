@@ -423,6 +423,62 @@ class TestResolverPoolRegression(unittest.IsolatedAsyncioTestCase):
         pool = AsyncResolverPool(pool=FakeResolverPool([_FakeResolver()]))
         self.assertEqual(await pool.a_records("whatever.example.com"), [])
 
+    async def test_all_resolvers_failing_returns_none_not_empty(self) -> None:
+        """**所有解析器都没答复时必须返回 ``None``，不能返回 ``[]``。**
+
+        起因（2026-10-05 查 scan 50 / yealink.com.cn 发现的）：``a_records()``
+        以前把"查询失败"和"域名不存在"都返回 ``[]``，于是网络故障在资产表里
+        和"这域名真的不存在"完全同形。实测 84 个域名里 **21 个（25%）** 能解析
+        的被判成不存在，其中 ``license.yealink.com.cn`` /
+        ``supportx.yealink.com.cn`` 连 ``dir_brute`` 都用 HTTP 摸到了 200 ——
+        界面却显示"未解析"。
+
+        判据：``[]`` 只留给 NXDOMAIN / NoAnswer 这种**有效回答**。
+        """
+        import dns.resolver
+
+        from core.domains.resolve._lib.resolver import AsyncResolverPool
+
+        class _DeadResolver:
+            async def resolve(self, name, rdtype, raise_on_no_answer=False):  # noqa: ANN001
+                raise dns.resolver.Timeout()
+
+        pool = AsyncResolverPool(pool=FakeResolverPool([_DeadResolver()]))
+        got = await pool.a_records("whatever.example.com")
+        # ❗ 这条就是修复点：改回去（return []）它就红
+        self.assertIsNone(got, "所有解析器都失败时必须报『查询失败』而不是『不存在』")
+        self.assertEqual(pool.stats["query_failed"], 1)
+
+    async def test_failure_is_not_cached_as_an_empty_answer(self) -> None:
+        """失败不能进缓存 —— 否则一次网络抖动会被固化成永久的"不存在"。"""
+        import dns.resolver
+
+        from core.domains.resolve._lib.resolver import AsyncResolverPool
+
+        class _DeadResolver:
+            async def resolve(self, name, rdtype, raise_on_no_answer=False):  # noqa: ANN001
+                raise dns.resolver.Timeout()
+
+        class _FakeAnswer:
+            rrset = None
+
+        class _LiveResolver:
+            async def resolve(self, name, rdtype, raise_on_no_answer=False):  # noqa: ANN001
+                return _FakeAnswer()
+
+        # 先全死（失败，不缓存），再换成能答的 —— 第二次必须真的重新查
+        fake_pool = FakeResolverPool([_DeadResolver()])
+        pool = AsyncResolverPool(pool=fake_pool)
+        self.assertIsNone(await pool.a_records("flaky.example.com"))
+        asked_before = len(fake_pool.asked)
+
+        fake_pool._resolvers = [_LiveResolver()]
+        self.assertEqual(await pool.a_records("flaky.example.com"), [])
+        self.assertGreater(
+            len(fake_pool.asked), asked_before,
+            "失败结果被缓存了 —— 解析器恢复后仍然拿不到答案",
+        )
+
     async def test_timeout_fails_over_to_another_resolver(self) -> None:
         """单条超时要**换一个解析器重试**，而不是原地重试同一个坏掉的。"""
         import dns.resolver

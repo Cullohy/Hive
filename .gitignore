@@ -22,6 +22,11 @@ data/
 node_modules/
 frontend/dist/
 frontend/.esbuild-tmp/
+# 2026-10-05 补：前端构建时把 $env:TEMP 指到仓库根的这个目录（esbuild 在
+# Windows 上会往 TEMP 里甩文件），Node 还会往里写 node-compile-cache/。
+# 之前只忽略了 frontend/.esbuild-tmp/，根目录这个漏了，于是 `git add -A`
+# 把 180 多个二进制缓存文件一并扫进暂存区。
+.esbuild-tmp/
 
 # ── 故障恢复现场（2026-10-01 postgres.py 损坏事件）──────────────────
 # 保留在磁盘上做证据，但不进版本库：里面是坏文件的副本，容易被误用。

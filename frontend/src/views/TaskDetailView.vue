@@ -172,6 +172,25 @@
                     {{ record.ips }}
                   </span>
                   <a-tag v-else-if="record.is_cloud" color="default">云 IP</a-tag>
+                  <!--
+                    有 HTTP 端点却没 IP 记录 ≠ "这个域名解析不出来"。
+                    站点明明可达（dir_brute / http_probe 拿到了真实响应），
+                    说它"未解析"是把**故障或未回填**说成了**事实** ——
+                    实测有一个任务里 21/84 个域名（25%）落进这一档。
+                    所以单独一档，并指路到真正的原因。
+                  -->
+                  <a-tooltip
+                    v-else-if="record.http_count"
+                    placement="topLeft"
+                  >
+                    <a-tag color="orange">站点可达 · IP 未记录</a-tag>
+                    <template #title>
+                      该域名有 {{ record.http_count }} 个 HTTP 端点（站点确实可达），<br />
+                      但资产表里没有关联的 IP 记录。<br />
+                      通常是解析查询失败（所有解析器都没应答）——<br />
+                      看「源统计」里 dns_resolve 的「查询失败」计数，或重跑一次任务。
+                    </template>
+                  </a-tooltip>
                   <span v-else class="tk-muted">未解析</span>
                 </template>
                 <template v-else-if="column.key === 'orgs'">

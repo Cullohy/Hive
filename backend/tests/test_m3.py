@@ -1654,6 +1654,138 @@ ENRICH_SOURCE = """
 """
 
 
+class TestResolveFailureIsNotNonexistence(EngineTestCase):
+    """**查询失败绝不能被当成"域名不存在"。**
+
+    起因（2026-10-05 查 scan 50 / yealink.com.cn 发现的真实问题）：
+
+    ``license.yealink.com.cn`` 与 ``supportx.yealink.com.cn`` 在界面上显示
+    "未解析"，但它们其实活着 —— ``dir_brute`` 用 HTTP 摸到了 200 和真实标题
+    （"Yealink License" / "Yealink Support"），DNS 也确实有 A 记录
+    （202.109.248.212，CNAME waf212.yealink-inc.com）。
+
+    根因在 ``resolver._query``：它把"所有解析器都没答复"也返回 ``[]``，
+    于是网络故障在资产表里和"这域名真的不存在"完全同形。重新逐个分类 84 个
+    域名后发现：**21 个（25%）本来能解析的域名被判成了不存在**，而界面、
+    stats、日志三处都看不出异常。
+    """
+
+    async def _scan_with_fake_dns(self, fake):
+        with mock.patch.object(AsyncResolverPool, "_query", fake):
+            return await self.run_scan(
+                targets=["example.com"],
+                include=["demo_expand", "dns_resolve"],
+            )
+
+    async def test_a_failed_lookup_is_not_reported_as_a_domain_without_ip(self) -> None:
+        """全失败时：不能当成"扫过了、没有"，必须留下痕迹。"""
+        calls: list[tuple[str, str]] = []
+
+        async def always_fails(self, name: str, rdtype: str):  # noqa: ANN001
+            calls.append((name, rdtype))
+            if rdtype == "A" and name == "www.example.com":
+                return None  # 查询失败（不是"不存在"）
+            return []
+
+        scanner, _ = await self._scan_with_fake_dns(always_fails)
+
+        # 没产出 IP_ADDRESS —— 这是对的，没有 IP 可发
+        ips = await self.storage.ips(scanner.scan_id)
+        self.assertEqual(ips, [])
+
+        # ❗ 修复点：失败要在 stats 里显形。改回"静默当不存在"这条就红。
+        stats = scanner.modules["dns_resolve"].stats
+        self.assertEqual(
+            stats["resolve_failed"], 1,
+            f"查询失败没有记进 stats，失败被伪装成了『未解析』: {stats}",
+        )
+        self.assertEqual(stats["unresolved_due_to_failure"], 1)
+
+        # 而且必须**重试过**一次（池内轮换之外，模块自己还要再试一次）
+        a_queries = [c for c in calls if c[1] == "A" and c[0] == "www.example.com"]
+        self.assertEqual(len(a_queries), 2, f"失败后没有重试: {a_queries}")
+
+    async def test_a_retry_that_succeeds_still_emits_the_ip(self) -> None:
+        """瞬时故障（限速 / 冷启动）重试成功时，资产**不能丢**。"""
+        seen: list[int] = []
+
+        async def fails_once(self, name: str, rdtype: str):  # noqa: ANN001
+            if rdtype == "A" and name == "www.example.com":
+                seen.append(1)
+                return None if len(seen) == 1 else [REAL_IP]
+            return []
+
+        scanner, _ = await self._scan_with_fake_dns(fails_once)
+
+        ips = {i["addr"] for i in await self.storage.ips(scanner.scan_id)}
+        self.assertIn(REAL_IP, ips, "重试成功了却没落库 —— 资产被故障吃掉了")
+        stats = scanner.modules["dns_resolve"].stats
+        self.assertEqual(stats["resolve_failed"], 0)
+
+    async def test_a_genuinely_missing_domain_is_not_counted_as_a_failure(self) -> None:
+        """对照组：NXDOMAIN 那种**有效回答**不该被算成故障。
+
+        这条是给上一条的 —— 判据不能是"查不到就报失败"，否则真正死掉的域名
+        会把失败计数刷满，统计又失去意义。
+        """
+        async def nxdomain_everywhere(self, name: str, rdtype: str):  # noqa: ANN001
+            return []
+
+        scanner, _ = await self._scan_with_fake_dns(nxdomain_everywhere)
+
+        stats = scanner.modules["dns_resolve"].stats
+        self.assertEqual(stats["resolve_failed"], 0, "有效回答被误记成故障")
+        self.assertEqual(stats.get("unresolved_due_to_failure", 0), 0)
+
+    async def test_end_to_end_all_resolvers_timing_out_is_not_nonexistence(self) -> None:
+        """**端到端**：真的让所有解析器超时，走**真实**的 ``_query`` 代码路径。
+
+        单独一条的理由是变异验证逼出来的：上面三条把 ``_query`` 整个替换掉了，
+        所以它们只测到"模块能处理 ``None``"，测不到"**池子能不能把失败报成
+        ``None``**"。实测把 ``_query`` 的 ``return None`` 改回 ``return []``，
+        上面三条**依然全绿** —— 真根因没被钉住。这条才是钉住根因的那条：
+        它只替换最底层的 ``Resolver.resolve``，上面每一层都是真代码。
+        """
+        import dns.asyncresolver
+        import dns.resolver
+
+        async def always_timeout(self, *a, **kw):  # noqa: ANN001
+            raise dns.resolver.Timeout()
+
+        with mock.patch.object(dns.asyncresolver.Resolver, "resolve", always_timeout):
+            scanner, _ = await self.run_scan(
+                targets=["example.com"],
+                include=["demo_expand", "dns_resolve"],
+                module_config={"dns_resolve": {
+                    # 内联地址串（`load_resolvers` 支持逗号/空白分隔）—— 传列表
+                    # 会被预设层字符串化成 "['8.8.8.8']"，dnspython 直接拒收
+                    "resolvers": "8.8.8.8",
+                    # 跳过启动健康校验：让**每次查询**都超时，而不是让池子建不起来
+                    "verify_resolvers": False,
+                }},
+            )
+
+        ips = await self.storage.ips(scanner.scan_id)
+        self.assertEqual(ips, [], "全超时不该产出 IP")
+
+        stats = scanner.modules["dns_resolve"].stats
+        # ❗ 这条就是根因判据：池子把超时报成 None，模块据此记成"查询失败"，
+        # 而不是让它悄悄变成"这个域名不存在"。
+        #
+        # 刻意**不**钉死具体个数（种子与 demo_expand 产出的名字有去重，
+        # 数一数就会变成另一条与本判据无关的脆弱断言）。要钉的是这三条不变量：
+        #   1) 确实有失败发生        —— 变异掉修复后这里是 0，测试立刻红
+        #   2) 每次失败都上浮到模块   —— query_failed == resolve_failed
+        #   3) 一次都没丢            —— unresolved_due_to_failure == resolve_failed
+        self.assertGreater(
+            stats["resolve_failed"], 0,
+            f"真实超时一条都没记成查询失败，仍被伪装成了『未解析』: {stats}",
+        )
+        self.assertEqual(stats["query_failed"], stats["resolve_failed"], stats)
+        self.assertEqual(
+            stats["unresolved_due_to_failure"], stats["resolve_failed"], stats)
+
+
 class TestEnrichmentProjection(EngineTestCase):
     async def test_duplicate_event_enriches_asset_without_looping(self) -> None:
         self.add_module_file("enrich", ENRICH_SOURCE)
