@@ -63,3 +63,8 @@ _transcripts/
 backend/_transcripts/
 backend/_gbk_*.tsv
 backend/_*.py
+# 2026-10-04 追加：临时分析脚本一律落在仓库根的 `.testtmp/`（已忽略）。
+# 下面这条挡的是"cwd 弄错、脚本落到 backend/ 里"的情况 —— 当时 cwd 在
+# backend，Out-File 就近写下了 `.tmpq.py`，差点跟着提交进去。
+.tmp*.py
+backend/.tmp*.py
