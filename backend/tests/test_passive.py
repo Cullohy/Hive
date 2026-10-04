@@ -473,19 +473,32 @@ class TestSourceErrorIsolation(EngineTestCase):
 # --------------------------------------------------------------------- 敏感域名闸门
 
 class TestForbiddenGate(EngineTestCase):
-    async def test_gov_cn_target_is_blocked_by_default(self) -> None:
-        _, summary = await self.run_scan(targets=["test.gov.cn"], include=["demo_expand"])
-        self.assertGreaterEqual(summary["events_forbidden"], 1)
-        self.assertEqual(summary["events_new"], 0)
+    """敏感域名闸门 —— **默认不拦**（2026-10-04 从「默认拒绝」改回）。
 
-    async def test_forbidden_list_can_be_overridden(self) -> None:
+    走真实的 ``demo_expand`` 模块做端到端验证：``.gov.cn`` / ``.edu.cn`` 这类
+    目标默认必须能正常展开子域，而不是在分发第一步就被静默丢掉。
+
+    机制本身保留 —— 显式配了 ``settings.forbidden_domains`` 仍会拦，
+    所以另一条测试守着「配置了就得生效」，免得那行配置变成骗人的摆设。
+    """
+
+    async def test_gov_cn_is_not_blocked_by_default(self) -> None:
+        """默认配置下 gov.cn 照常展开：SEED + 4 个子域 = 5 条新事件。"""
+        _, summary = await self.run_scan(
+            targets=["test.gov.cn"], include=["demo_expand"]
+        )
+        self.assertEqual(summary["events_forbidden"], 0, "gov.cn 被默认闸门拦了")
+        self.assertEqual(summary["events_new"], 5)
+
+    async def test_forbidden_list_still_arms_when_configured(self) -> None:
+        """显式配了 gov.cn 就必须拦得住 —— SEED 直接被丢，一条事件都发不出去。"""
         _, summary = await self.run_scan(
             targets=["test.gov.cn"],
             include=["demo_expand"],
-            settings={"forbidden_domains": []},
+            settings={"forbidden_domains": ["gov.cn"]},
         )
-        self.assertEqual(summary["events_forbidden"], 0)
-        self.assertEqual(summary["events_new"], 5)  # SEED + 4 个子域
+        self.assertGreaterEqual(summary["events_forbidden"], 1, "显式配了却没拦")
+        self.assertEqual(summary["events_new"], 0)
 
 
 # --------------------------------------------------------------------- 递归枚举

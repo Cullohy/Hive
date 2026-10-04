@@ -350,7 +350,7 @@ port_scan（asyncio connect 扫描，进程内，无外部二进制）
 | 闸门 | 作用 |
 |---|---|
 | **范围校验** | `DNS_NAME` 必须落在目标域名之下，越界直接丢弃（`--no-scope` 可关，默认强制） |
-| **敏感域名** | 默认拒绝 `gov.cn` / `edu.cn` / `org.cn` / `mil.cn`（ARL 默认是空列表，三项全被注释） |
+| **敏感域名** | 默认**不拦任何后缀**；需要时在预设 `settings.forbidden_domains` 里写死后缀（后缀语义） |
 | **递归深度** | `scope_distance > max_scope_distance` 不再分发，防止自我喂养死循环 |
 | **去重** | 同 `(type, data)` 只分发一次；**FINDING 额外带 `kind`**（否则同一目标上的多条结论会互相顶掉）；资产投影仍会执行 |
 
@@ -949,7 +949,7 @@ frontend_dist()    # 前端构建产物（可用 RECON_FRONTEND_DIR 覆盖）
 | 探活只看状态码 | 拿不到标题/响应头/长度 | 一次请求取全（还顺手算 favicon mmh3） |
 | 截图用 PhantomJS（2018 停更） | 无维护、有安全风险 | 未实现（M6 可选，用 Playwright） |
 | 口令 `hex_md5('arlsalt!@#'+pwd)` | 不可接受的哈希 | M5 用 bcrypt / argon2 |
-| `BLACK_IPS` 注释掉内网段、`FORBIDDEN_DOMAINS` 为空 | 默认可扫内网、不拦 gov/edu | **已实现**：敏感域名默认拒绝 + 端口扫描前内网段闸门 |
+| `BLACK_IPS` 注释掉内网段、`FORBIDDEN_DOMAINS` 为空 | 默认可扫内网、不拦 gov/edu | **内网段照旧**（端口扫描前默认拒绝内网与保留地址）；`FORBIDDEN_DOMAINS` **2026-10-04 改回与 ARL 一致的空列表**，敏感域名闸门默认不拦 |
 
 **未采纳的 ARL 数据**：`dicts/webapp.json`（667 KB 指纹库）—— 来源疑似 GPL-3.0 的 wappalyzer，
 与 ARL 自身的 MIT 无关。本项目改用自研规则集（115 种技术）。
@@ -1385,8 +1385,8 @@ URL 事件 → 截图落盘 → FINDING(kind=screenshot, data=URL, detail=相对
 
 **仅对已获得明确书面授权的目标使用。**
 
-已内置的保护：范围校验默认强制、敏感域名默认拒绝、端口扫描前内网与保留地址默认拒绝、
-被动源与主动模块用 flags 严格区分、所有过滤/跳过行为都留痕。
+已内置的保护：范围校验默认强制、端口扫描前内网与保留地址默认拒绝、敏感域名闸门默认不拦
+（需要时在预设里写死后缀）、被动源与主动模块用 flags 严格区分、所有过滤/跳过行为都留痕。
 
 **授权白名单**（Web 入口失败关闭，空白名单拒绝一切下发）与**分级审计**
 （每条审计带 `mode=passive/active`，事后可查清哪次操作向目标发过包）已完成，见 §13。

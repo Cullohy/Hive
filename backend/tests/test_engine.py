@@ -61,6 +61,20 @@ OUT_OF_SCOPE = """
             await self.emit_event("evil.example.net", EventType.DNS_NAME, parent=event)
 """
 
+EDU_EMITTER = """
+    from core.engine.event import EventType
+    from core.engine.module import BaseModule
+
+
+    class eduleak(BaseModule):
+        watched_events = (EventType.SEED,)
+        produced_events = (EventType.DNS_NAME,)
+        flags = ("passive", "safe")
+
+        async def handle_event(self, event):
+            await self.emit_event("jwc.edu.cn", EventType.DNS_NAME, parent=event)
+"""
+
 #: 一条 6 跳的线性链：SEED -> IP -> PORT -> HTTP_RESPONSE -> URL -> DNS_NAME
 #: 每一跳的类型都不同（除最后一步），模拟"种子→解析→探活→抽链接→…"的真实流水线。
 LINEAR_CHAIN = """
@@ -270,6 +284,47 @@ class TestGates(EngineTestCase):
         self.assertGreaterEqual(summary["events_too_deep"], 1)
         # SEED(1) + x.example.com(2) + x.x.example.com(3) = 3 条新事件
         self.assertEqual(summary["events_new"], 3)
+
+
+class TestSensitiveDomainGateOffByDefault(EngineTestCase):
+    """**敏感域名闸门默认不拦** —— 2026-10-04 从「默认拒绝」改回「默认放行」。
+
+    改的起因是这个机制**只会挡路**：全仓 40 多处测试夹具都写着
+    ``settings={"forbidden_domains": []}`` 才能跑，也就是说它唯一的实际用法
+    就是被关掉。而实际工作以高校/职院的授权测试为主（``edu.cn`` 是主战场），
+    每次都得先改预设 yml 才扫得动。
+
+    钉的是**不变量**而不是「默认值恰好是空的」：``.edu.cn`` 必须能落库。
+    """
+
+    async def test_edu_cn_is_not_blocked_by_default(self) -> None:
+        """不配任何东西，``.edu.cn`` 也必须真的落库。"""
+        self.add_module_file("eduleak", EDU_EMITTER)
+        scanner, summary = await self.run_scan(
+            targets=["edu.cn"], include=["eduleak"]
+        )
+
+        self.assertEqual(summary["events_forbidden"], 0, "edu.cn 被闸门拦了")
+        names = {d["name"] for d in await self.storage.domains(scanner.scan_id)}
+        self.assertIn("jwc.edu.cn", names, "edu 子域没落库")
+
+    async def test_still_arms_when_explicitly_configured(self) -> None:
+        """机制没被删掉 —— 显式配了就必须生效，否则那行配置就是骗人的。"""
+        self.add_module_file("eduleak", EDU_EMITTER)
+        scanner, summary = await self.run_scan(
+            targets=["edu.cn"], include=["eduleak"],
+            settings={"forbidden_domains": ["gov.cn", "edu.cn"]},
+        )
+
+        self.assertGreaterEqual(summary["events_forbidden"], 1, "显式配了却没拦")
+        names = {d["name"] for d in await self.storage.domains(scanner.scan_id)}
+        self.assertNotIn("jwc.edu.cn", names, "该拦的没拦住")
+
+    def test_default_constant_is_empty(self) -> None:
+        """默认常量本身是空的（防止有人只改别处、这里还留着老值）。"""
+        from core.engine.scanner import DEFAULT_FORBIDDEN_DOMAINS
+
+        self.assertEqual(DEFAULT_FORBIDDEN_DOMAINS, ())
 
 
 class TestModuleLifecycle(EngineTestCase):
