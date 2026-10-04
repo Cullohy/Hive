@@ -448,7 +448,7 @@ class TestMonitorScheduler(DiffTestCase):
 class TestScreenshotSoftFail(unittest.IsolatedAsyncioTestCase):
     async def test_setup_soft_fails_without_browser(self) -> None:
         """浏览器起不来时必须软失败（禁用模块），而不是抛错中断扫描。"""
-        from core.domains.web_search.screenshot import screenshot
+        from core.domains.web_hunter.screenshot import screenshot
 
         scanner = mock.Mock()
         scanner.log = None

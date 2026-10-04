@@ -12,7 +12,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from core.domains.web_search._lib.extract import extract_links, host_of, normalize
+from core.domains.web_hunter._lib.extract import extract_links, host_of, normalize
 from core.util.domain import host_of as util_host_of
 from tests.base import EngineTestCase
 
@@ -423,12 +423,12 @@ class TestJsAssets(unittest.TestCase):
     """
 
     def _urls(self, js: str) -> list[str]:
-        from core.domains.web_search._lib.jsassets import extract_urls
+        from core.domains.web_hunter._lib.jsassets import extract_urls
 
         return extract_urls(js)
 
     def _hosts(self, js: str) -> list[str]:
-        from core.domains.web_search._lib.jsassets import extract_hosts
+        from core.domains.web_hunter._lib.jsassets import extract_hosts
 
         return extract_hosts(js)
 
@@ -532,7 +532,7 @@ class TestJsAssets(unittest.TestCase):
             self.assertNotIn(token, blob, f"敏感内容漏进来了: {token}")
 
     def test_looks_like_host_rejects_files_and_ips(self) -> None:
-        from core.domains.web_search._lib.jsassets import looks_like_host
+        from core.domains.web_hunter._lib.jsassets import looks_like_host
 
         for value in ("jquery.min.js", "app.css", "logo.png", "app.js.map",
                       "1.2.3.4", "localhost", "example.com:8080", "-bad.com",
@@ -541,7 +541,7 @@ class TestJsAssets(unittest.TestCase):
                 self.assertFalse(looks_like_host(value), f"误收: {value}")
 
     def test_looks_like_host_accepts_real_domains(self) -> None:
-        from core.domains.web_search._lib.jsassets import looks_like_host
+        from core.domains.web_hunter._lib.jsassets import looks_like_host
 
         for value in ("example.com", "api.example.com", "a.b.c.d.example.com",
                       "xn--fiqs8s.example", "my-service.example.co.uk"):
@@ -557,17 +557,17 @@ class TestJsLiteralDecoding(unittest.TestCase):
     """
 
     def _urls(self, js: str) -> list[str]:
-        from core.domains.web_search._lib.jsassets import extract_urls
+        from core.domains.web_hunter._lib.jsassets import extract_urls
 
         return extract_urls(js)
 
     def _hosts(self, js: str) -> list[str]:
-        from core.domains.web_search._lib.jsassets import extract_hosts
+        from core.domains.web_hunter._lib.jsassets import extract_hosts
 
         return extract_hosts(js)
 
     def _paths(self, js: str) -> list[str]:
-        from core.domains.web_search._lib.jsassets import extract_paths
+        from core.domains.web_hunter._lib.jsassets import extract_paths
 
         return extract_paths(js)
 
@@ -731,7 +731,7 @@ class TestJsLiteralDecoding(unittest.TestCase):
     # ------------------------------------------------------------------ 排序
     def test_api_like_paths_are_ranked_first(self) -> None:
         """预算截断时先保接口 —— 被砍掉的应该是资源而不是 ``/api/v1``。"""
-        from core.domains.web_search._lib.jsassets import rank_paths
+        from core.domains.web_hunter._lib.jsassets import rank_paths
 
         got = rank_paths(["/about", "/api/v1/users", "/public/js/app.js",
                           "/admin/login", "/static/logo.svg"])
@@ -739,7 +739,7 @@ class TestJsLiteralDecoding(unittest.TestCase):
         self.assertIn("/about", got)
 
     def test_rank_is_stable_and_total(self) -> None:
-        from core.domains.web_search._lib.jsassets import rank_paths
+        from core.domains.web_hunter._lib.jsassets import rank_paths
 
         paths = ["/a", "/b", "/c", "/d"]
         self.assertEqual(sorted(rank_paths(paths)), sorted(paths))
