@@ -476,43 +476,51 @@ class passive_my_source(PassiveSourceModule):
 
 ```
 domains/
-├── subdomain/          子域收集           13 个模块 + _lib/
-│   ├── passive/        被动收集（8）不碰目标
-│   ├── active/         主动收集（3）会向目标发 DNS 查询
-│   ├── standalone/     单独模块（2）demo_expand · seed_asset
+├── subdomain/          子域收集           19 个模块 + _lib/
+│   ├── passive/        被动收集（12）不碰目标
+│   ├── active/         主动收集（4）会向目标发 DNS 查询
+│   ├── standalone/     单独模块（3）demo_expand · seed_asset · shadow_asset
 │   └── _lib/           dns_query.py · dnsgen.py
-├── resolve/            DNS 解析 + IP 富化   2 个模块 + _lib/（resolver · resolver_pool）
-├── probe/              存活与证书          3 个模块 + _lib/（tls）
+├── resolve/            DNS 解析 + IP 富化   4 个模块 + _lib/（resolver · resolver_pool）
 ├── port/               端口扫描            1 个模块 + _lib/（ports）
-├── fingerprint/        指纹 / CDN / WAF    2 个模块 + _lib/（rules · library · waf · importers）
-├── urls/               URL / JS 采集       2 个模块 + _lib/（extract · jsendpoints）
-└── fuzz/               目录 / 敏感文件      1 个模块 + _lib/（soft404）
+├── fingerprint/        指纹 / CDN / WAF    1 个模块 + _lib/（rules · library · waf · importers）
+└── web_search/         HTTP 面             7 个模块 + _lib/（soft404 · techdicts · bypass
+                        探活→抽链接→挖 JS→    · extract · discovery · jsassets · tls
+                        目录爆破→证书→截图      · webprofile）
 ```
 
 | 位置 | 个数 | 内容 |
 |---|---|---|
-| `domains/subdomain/passive/` | 8 | 只查第三方公开数据，`flags` 全是 `passive, safe` |
-| `domains/subdomain/active/` | 3 | `dns_brute` / `dns_permute` / `wildcard_detect` |
-| `domains/subdomain/standalone/` | 2 | `demo_expand`（离线演示源）· `seed_asset`（把种子本身产出为资产） |
+| `domains/subdomain/passive/` | 12 | 只查第三方公开数据，`flags` 全是 `passive, safe` |
+| `domains/subdomain/active/` | 4 | `dns_brute` / `dns_permute` / `wildcard_detect` / `admin_plane` |
+| `domains/subdomain/standalone/` | 3 | `demo_expand`（离线演示源）· `seed_asset`（把种子本身产出为资产）· `shadow_asset` |
 | `domains/resolve/` | 4 | `dns_resolve` + `zone_transfer` + `ip_ptr` + `asn_enrich` |
-| `domains/probe/` | 3 | `http_probe` + `tls_cert` + `screenshot` |
 | `domains/port/` | 1 | `port_scan` |
-| `domains/fingerprint/` | 2 | `fingerprint` + `waf_detect` |
-| `domains/urls/` | 2 | `url_extract`（抽链接，零流量）+ `js_endpoints`（挖 JS 接口，要发请求） |
-| `domains/fuzz/` | 1 | `dir_brute`（目录爆破，软 404 画像 + 403 熔断） |
+| `domains/fingerprint/` | 1 | `fingerprint`（WAF 识别内联进 `dir_brute` / `js_assets`，判据仍走 `fingerprint/_lib/waf.py`） |
+| `domains/web_search/` | 7 | `http_probe`（探活）+ `url_extract`（抽链接，零流量）+ `js_assets`（捞 JS 里的 URL 与主机名）+ `soft404_probe`（软 404 画像）+ `dir_brute`（目录爆破 + 403 熔断）+ `tls_cert` + `screenshot` |
 
 ### 这套划分对应整条流水线
 
 ```
 种子域名 → 子域收集 → 清洗 → DNS解析 → 存活 → 端口 → 指纹/WAF/CDN
          → URL/JS → 目录/敏感文件 → 入库/监控
-  SEED    subdomain 引擎+wild- resolve  probe   port   fingerprint
-                    card+sanitize          urls/       fuzz/
+  SEED    subdomain 引擎+wild- resolve              port   fingerprint
+                    card+sanitize  └──── web_search/ ────┘
 ```
 
-**按"这一步要回答什么问题"分，不按"用什么工具"分。** 所以 `probe/` 里
+**按"这一步要回答什么问题"分，不按"用什么工具"分。** 所以 `web_search/` 里
 `http_probe` 和 `tls_cert` 放一起（都在回答"这个端口上跑的是什么服务"），
 而不是按"httpx 一个域、openssl 一个域"。
+
+> `web_search/` 是 2026-10-04 由 `probe/`（探活）、`urls/`（URL 采集）、
+> `fuzz/`（目录爆破）三个域合并来的。这三个域按**产物名**分而不是按**能力**分，
+> 边界天然模糊 —— `soft404.py` 被三个域共用、`techdicts.py` 被两个域共用、
+> `dir_brute` 反过来从 `probe` 和 `urls` 各 import 一次。合并后**跨域 import 归零**，
+> 模块名与 flags 一律没动，所以**扫描行为零变化**。归位记录见
+> `core/domains/web_search/__init__.py`。
+>
+> ⚠️ `port/` 没有并进来：端口扫描是 **TCP 层**，产物是 `OPEN_TCP_PORT`，
+> 不是 HTTP 面。事件链上是 `IP_ADDRESS` → `OPEN_TCP_PORT` → `HTTP_RESPONSE`。
 
 **"清洗"不是一个域**，它拆在三层 —— 详见 `domains/subdomain/__init__.py`：
 去重在引擎里、泛解析画像做成 `wildcard_detect` 模块（因为要被爆破/置换共用）、
@@ -549,14 +557,23 @@ domains/
 
 唯一的额外规则：`_` 开头的**文件名**仍然跳过（Python 里那是"私有的"惯用写法）。
 
-### 三个新模块（都借鉴了成熟工具）
+### 三个自研模块（都借鉴了成熟工具）
 
 | 模块 | 借鉴 | 成本 |
 |---|---|---|
-| `urls/url_extract` | — | **零流量**（只读已抓到的正文） |
-| `urls/js_endpoints` | [LinkFinder](https://github.com/GerbenJavado/LinkFinder) MIT · [URLFinder](https://github.com/pingc0y/URLFinder) MIT | `active, loud` —— **要抓 JS 文件** |
-| `fuzz/dir_brute` | [ffuf](https://github.com/ffuf/ffuf) MIT · [feroxbuster](https://github.com/epi052/feroxbuster) MIT · [gobuster](https://github.com/OJ/gobuster) Apache-2.0 | `active, loud, invasive` —— **默认被预设拦住** |
-| `fingerprint/waf_detect` | [wafw00f](https://github.com/EnableSecurity/wafw00f) BSD-3 | **零流量**（只读已有响应） |
+| `web_search/url_extract` | — | **零流量**（只读已抓到的正文） |
+| `web_search/js_assets` | [LinkFinder](https://github.com/GerbenJavado/LinkFinder) MIT · [URLFinder](https://github.com/pingc0y/URLFinder) MIT | `active, loud` —— **要抓 JS 文件** |
+| `web_search/dir_brute` | [ffuf](https://github.com/ffuf/ffuf) MIT · [feroxbuster](https://github.com/epi052/feroxbuster) MIT · [gobuster](https://github.com/OJ/gobuster) Apache-2.0 | `active, loud, invasive` —— **默认被预设拦住** |
+
+### WAF 识别：借鉴了 wafw00f，但**故意不做成独立模块**
+
+| 借鉴 | 落地方式 |
+|---|---|
+| [wafw00f](https://github.com/EnableSecurity/wafw00f) BSD-3 | 内联进 `dir_brute._find_waf`（整台放弃）与 `js_assets._waf_ok`（跳过这批路径验证），判据走共用的 `fingerprint/_lib/waf.py` |
+
+原 `fingerprint/waf_detect` 于 2026-10-03 删除。作为独立模块它只能**事后报一条
+finding，拦不住已经发出去的请求** —— 而「认出 WAF 就不发请求」正是它存在的
+全部意义。独立模块的存在形式和它的目的自相矛盾，所以合并掉了。
 
 **没有照抄任何一个。** 而且有几个流行项目**因为许可证不能用**：
 
@@ -569,7 +586,7 @@ domains/
 
 > GitHub 上"没写许可证"**不等于**可以随便用。
 
-**`fuzz/dir_brute` 实测**（本地 catch-all 服务器：未知路径全部返回 200 + 同一页面）：
+**`web_search/dir_brute` 实测**（本地 catch-all 服务器：未知路径全部返回 200 + 同一页面）：
 
 ```
 字典 10 条；真命中路径 ['/.env', '/admin', '/backup.zip', '/swagger.json']
@@ -807,21 +824,24 @@ D:\Search\recon\                 ← 仓库根（项目名 recon）
 │   │   │   ├── preset.py       #   预设加载、flags 过滤、-c 覆盖
 │   │   │   └── log.py
 │   │   ├── domains/            # ★ 一个能力域一个文件夹（详见 §8）
-│   │   │   ├── subdomain/      #   子域收集（13 个模块）
-│   │   │   │   ├── passive/    #     被动收集（8）anubis / subdomaincenter / rapiddns
-│   │   │   │   │               #     certspotter / crtsh / hackertarget / urlscan / commoncrawl
-│   │   │   │   ├── active/     #     主动收集（3）dns_brute / dns_permute / wildcard_detect
-│   │   │   │   ├── standalone/ #     单独模块（1）demo_expand
+│   │   │   ├── subdomain/      #   子域收集（19 个模块）
+│   │   │   │   ├── passive/    #     被动收集（12）anubis / certspotter / commoncrawl /
+│   │   │   │   │               #     crtsh / fofa / hackertarget / hunter / quake /
+│   │   │   │   │               #     rapiddns / subdomaincenter / urlscan / wayback
+│   │   │   │   ├── active/     #     主动收集（4）dns_brute / dns_permute /
+│   │   │   │   │               #     wildcard_detect / admin_plane
+│   │   │   │   ├── standalone/ #     单独模块（3）demo_expand / seed_asset / shadow_asset
 │   │   │   │   └── _lib/       #     域专属库：dns_query.py · dnsgen.py
-│   │   │   ├── resolve/        #   DNS 解析 + IP 富化（2）dns_resolve / asn_enrich
+│   │   │   ├── resolve/        #   DNS 解析 + IP 富化（4）dns_resolve / zone_transfer
+│   │   │   │                   #     / ip_ptr / asn_enrich
 │   │   │   │   └── _lib/       #     resolver.py · resolver_pool.py（★ 见 §10.5）
-│   │   │   ├── probe/          #   存活与证书（3）http_probe / tls_cert / screenshot
-│   │   │   │   └── _lib/       #     tls.py
 │   │   │   ├── port/           #   端口扫描（1）port_scan
 │   │   │   │   └── _lib/       #     ports.py
-│   │   │   ├── fingerprint/    #   指纹 / CDN / WAF（2）fingerprint · waf_detect
-│   │   │   ├── urls/           #   URL / JS 采集（2）url_extract · js_endpoints
-│   │   │   └── fuzz/           #   目录 / 敏感文件（1）dir_brute
+│   │   │   ├── fingerprint/    #   指纹 / CDN / WAF（1）fingerprint
+│   │   │   └── web_search/     #   HTTP 面（7）http_probe · url_extract · js_assets
+│   │   │                       #     · soft404_probe · dir_brute · tls_cert · screenshot
+│   │   │                       #     _lib/：soft404 · techdicts · bypass · extract
+│   │   │                       #     · discovery · jsassets · tls · webprofile
 │   │   ├── services/           # **跨域通用**的能力，仅此四类
 │   │   │   ├── http.py         #   异步 HTTP —— 被动源/探活/截图都在用
 │   │   │   ├── diff.py         #   两次扫描的资产差异对比
@@ -924,8 +944,8 @@ frontend_dist()    # 前端构建产物（可用 RECON_FRONTEND_DIR 覆盖）
 | `app/utils/domain.py` | 域名校验与禁止域名语义（另修了 BOM 问题） | `backend/core/util/domain.py` |
 | `app/utils/ip.py::not_in_black_ips` | 黑名单 IP 的语义 | `backend/core/util/net.py`（默认值反过来） |
 | `app/services/portScan.py` | 端口集 + "开放端口异常多"的经验值（>600） | `backend/core/util/net.py` / `backend/core/domains/port/port_scan.py` |
-| `app/services/probeHTTP.py` | "https 活着就别单独记 http"、弱状态码清单 | `backend/core/domains/active/http_probe.py` |
-| `app/utils/cert.py` | 证书字段清单（subject/issuer/validity/fingerprint） | `backend/core/domains/probe/_lib/tls.py`（改用 cryptography） |
+| `app/services/probeHTTP.py` | "https 活着就别单独记 http"、弱状态码清单 | `backend/core/domains/web_search/http_probe.py` |
+| `app/utils/cert.py` | 证书字段清单（subject/issuer/validity/fingerprint） | `backend/core/domains/web_search/_lib/tls.py`（改用 cryptography） |
 | `dicts/*` | domain_2w / altdnsdict / cdn_info / 端口集 | `backend/core/resources/` |
 | `frontend-src/src/App.vue` | 布局骨架：固定侧栏 170/50px + 64px 顶栏 + 内容区 24/32 留白 | `frontend/src/App.vue` |
 | `frontend-src/src/styles/global.css` | 主题令牌（`#1a1a1a` 侧栏 / `#c2410c` 强调色）与 antd 覆盖 | `frontend/src/styles/global.css` |
@@ -1081,7 +1101,7 @@ python -m core                   # 后端自动托管 frontend/dist 并做 SPA �
   记录类型只有 A/AAAA/CNAME/NS（NS 供 `zone_transfer` 用）。
 - **JS 深度分析（SPA 渲染 / webpack chunk 递归 / sourcemap）没做，也是实测后的决定**：
   4 个实际目标全量抓 JS，`webpack=0`、`srcmap=0`、**范围内新主机=0** —— 它们是 jQuery 时代的
-  服务端渲染站，没有 chunk 可递归。测量表见 `core/domains/urls/__init__.py`。
+  服务端渲染站，没有 chunk 可递归。测量表见 `core/domains/web_search/__init__.py`。
 - 免 key 被动源的池子**已经挖干**：对 `panabit.com` 逐个量过候选（otx 超时 / robtex 只返回 NS 记录 /
   threatminer 522 / jldc 403 / bufferover 服务已死 / mnemonic 无子域）。剩下的已知可用源
   （fofa / quake / hunter / shodan / zoomeye / censys / virustotal / chaos）**全部要 API Key**，
