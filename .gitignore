@@ -59,10 +59,19 @@ frontend/.tmp/
 # ── 调试遗留（2026-10-01 排查 postgres.py 损坏时产生）────────────────
 # 这些是我和代理在排查过程中落下的中间产物：转录、GBK 码表、形状检查脚本。
 # 它们不是代码，不该进版本库，也不该留在包目录旁边误导人。
+#
+# ⚠️ 这里必须用**一条通配**而不是按后缀枚举。原来写的是
+#     backend/_gbk_*.tsv
+#     backend/_*.py
+# 结果 `50f2ced` 那次 `git add -A` 把 `_fallbacks.json` / `_picks.json` /
+# `_proposals.json` / `_pua_chars.txt` / `_remaining.txt` / `_suspect.txt` /
+# `_fixenc.ps1` 七个**后缀不在名单里**的文件一起提交进了版本库。
+# 枚举式忽略规则必然会漏 —— 排查时随手产出什么后缀就用什么。
+# backend/ 下不存在任何合法的 `_` 开头文件（`_lib/` 里的都在子目录里），
+# 所以这里可以放心通配。
 _transcripts/
 backend/_transcripts/
-backend/_gbk_*.tsv
-backend/_*.py
+backend/_*
 # 2026-10-04 追加：临时分析脚本一律落在仓库根的 `.testtmp/`（已忽略）。
 # 下面这条挡的是"cwd 弄错、脚本落到 backend/ 里"的情况 —— 当时 cwd 在
 # backend，Out-File 就近写下了 `.tmpq.py`，差点跟着提交进去。
