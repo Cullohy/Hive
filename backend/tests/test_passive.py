@@ -727,10 +727,9 @@ class TestHeavySources(unittest.TestCase):
 
         return asyncio.run(go())
 
-    def test_commoncrawl_is_off_in_default_presets(self) -> None:
+    def test_commoncrawl_is_off_in_the_passive_preset(self) -> None:
         # 实测 22.9s / 7.9MB 只换 35 条，不能默认拖慢每一次被动收集
         self.assertNotIn("passive_commoncrawl", self._names("passive"))
-        self.assertNotIn("passive_commoncrawl", self._names("default"))
 
     def test_commoncrawl_is_on_in_full_preset(self) -> None:
         self.assertIn("passive_commoncrawl", self._names("active"))

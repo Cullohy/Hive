@@ -54,16 +54,19 @@ def main() -> int:
     print(f"\n  /api/presets         -> {[p['name'] for p in presets]}")
 
     print("\n  -- 授权白名单 --")
-    print(f"  未配黑名单前下发        -> {call('/api/scans', 'POST', {'targets': ['example.com'], 'preset': 'default'})[0]}")
+    print(f"  未配黑名单前下发        -> {call('/api/scans', 'POST', {'name': '冒烟 · 未配白名单', 'targets': ['example.com'], 'preset': 'default'})[0]}")
     call("/api/settings", "PUT", {
         "authorized_targets": ["example.com"],
         "require_authorization": True,
         "max_concurrent_scans": 2,
     })
-    print(f"  未授权目标 evil.com     -> {call('/api/scans', 'POST', {'targets': ['evil.com'], 'preset': 'default'})[0]} (应 403)")
+    print(f"  未授权目标 evil.com     -> {call('/api/scans', 'POST', {'name': '冒烟 · 未授权目标', 'targets': ['evil.com'], 'preset': 'default'})[0]} (应 403)")
 
     print("\n  -- 真的跑一次扫描（default 预设，会联网）--")
-    status, record = call("/api/scans", "POST", {"targets": ["example.com"], "preset": "default"})
+    status, record = call(
+        "/api/scans", "POST",
+        {"name": "冒烟 · example.com", "targets": ["example.com"], "preset": "default"},
+    )
     if status != 201:
         print(f"  下发失败: {status} {record}")
         return 1

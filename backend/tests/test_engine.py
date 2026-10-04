@@ -309,6 +309,288 @@ class TestModuleLifecycle(EngineTestCase):
         self.assertEqual(scanner.modules["once"].calls, 2)
 
 
+class TestBatchErrorsAreCounted(EngineTestCase):
+    """批内失败必须留下痕迹。
+
+    起因（2026-10-04 排查引擎健壮性时查出来的）：``http_probe`` /
+    ``tls_cert`` / ``dns_resolve`` 三个模块的 ``handle_batch`` 都写成
+    ``await asyncio.gather(..., return_exceptions=True)``。异常被彻底吞掉：
+
+    * 模块自己的 stats 不知道；
+    * 引擎那侧 ``handle_batch`` 正常返回 → 整批被记成 ``ok``。
+
+    结果是凡用 ``batch_size`` 的模块，``module.*.error`` **结构上恒为 0**，
+    批内失败在任何地方都看不见 —— 现场表现就是"这模块在跑，就是没产出"。
+
+    现在统一走 ``BaseModule.gather_batch``：仍然并发、仍然不抛（同批其他条目
+    不受影响），但记 ``stats["errors"]`` + 一条 warning。
+    """
+
+    BOOM = """
+from core.engine.event import EventType
+from core.engine.module import BaseModule
+
+
+class batch_boom(BaseModule):
+    watched_events = (EventType.SEED,)
+    produced_events = (EventType.DNS_NAME,)
+    flags = ('passive', 'safe')
+    batch_size = 8
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.stats = {'ok': 0, 'errors': 0}
+
+    async def handle_event(self, event):
+        n = int(event.data.split('.')[0][1:])
+        if n % 2:
+            raise ValueError('boom ' + str(n))
+        self.stats['ok'] += 1
+
+    async def handle_batch(self, events):
+        # 这就是要守的形态：并发、不抛（同批其他条目不受影响），但**逐条记账**
+        await self.gather_batch(
+            (self.handle_event(e) for e in events), what=self.name
+        )
+
+    def source_stats(self):
+        return {
+            'source': self.name,
+            'requests': self.stats['ok'],
+            'request_errors': 0,
+            'raw': self.stats['ok'] + self.stats.get('errors', 0),
+            'results': self.stats['ok'],
+            'errors': self.stats.get('errors', 0),
+            'elapsed': 0.0,
+            'skipped': 0,
+            'last_error': '',
+            'detail': {},
+        }
+"""
+
+    async def _scan(self):
+        self.add_module_file("batch_boom", self.BOOM)
+        from core.engine.preset import Preset
+        from core.engine.scanner import Scanner
+
+        seeds = [f"h{i}.example.com" for i in range(8)]
+        scanner = Scanner(
+            targets=seeds,
+            preset=Preset(name="t", include=["batch_boom"],
+                         module_dirs=[str(self.module_dir)],
+                         settings={"forbidden_domains": []}),
+            storage=None,
+        )
+        return await scanner.scan(), scanner
+
+    async def test_one_bad_item_does_not_sink_the_batch(self) -> None:
+        """并发仍在继续 —— 好的那几条必须照常处理。"""
+        summary, scanner = await self._scan()
+        mod = scanner.modules["batch_boom"]
+        self.assertEqual(mod.stats["ok"], 4, "同批里好的条目被连累了")
+
+    async def test_failures_are_recorded_in_module_stats(self) -> None:
+        summary, scanner = await self._scan()
+        mod = scanner.modules["batch_boom"]
+        self.assertEqual(mod.stats.get("errors"), 4,
+                         f"批内失败没被记账: {mod.stats}")
+
+    async def test_failures_surface_in_source_stats(self) -> None:
+        """源统计里必须看得见 —— 否则界面上还是"一切正常"。"""
+        summary, scanner = await self._scan()
+        rows = summary.get("source_stats") or []
+        row = next((r for r in rows if r["source"] == "batch_boom"), None)
+        self.assertIsNotNone(row, f"源统计里没有 batch_boom: {rows}")
+        self.assertEqual(row["errors"], 4, f"源统计没报批内失败: {row}")
+
+
+
+class TestCleanupOnHardSetupFailure(EngineTestCase):
+    """某个模块 ``setup()`` 硬失败时，**前面已经拿到资源的模块必须拿到 cleanup**。
+
+    起因（2026-10-04 排查引擎健壮性时查出来的）：
+
+    * ``Scanner.setup()`` 在某个模块 ``setup()`` 返回 False 时抛
+      ``ModuleSetupError``，而 ``scan()`` 里的 ``await self.setup()`` 当时摆在
+      ``try/finally`` **外面** —— 抛了之后 ``_cleanup_modules()`` 走不到；
+    * 排在它前面的模块已经把资源拿在手里了，最重的是 ``screenshot``：
+      它的 ``setup()`` 会拉起一个 live Chromium 进程，只有关 ``cleanup()``
+      才关得掉。
+
+    内置模块今天都不返回 False，但 ``preset.module_dirs`` 是受支持的外部模块
+    入口 —— 所以这不是纯理论。
+
+    夹具用**自定义模块目录**：名字得能确定性地排在坏模块之前。
+    """
+
+    HOLD = """
+from core.engine.event import EventType
+from core.engine.module import BaseModule
+
+
+class resource_hog(BaseModule):
+    # setup 里拿资源, cleanup 里放资源 —— 这里只记账
+    watched_events = (EventType.SEED,)
+    produced_events = ()
+    flags = ('passive', 'safe')
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.opened = False
+        self.closed = 0
+
+    async def setup(self):
+        self.opened = True
+        return True
+
+    async def cleanup(self):
+        self.closed += 1
+"""
+
+    BOOM = """
+from core.engine.event import EventType
+from core.engine.module import BaseModule
+
+
+class zzz_boom(BaseModule):
+    # 名字排在 resource_hog 之后, 确保它失败时对方已经拿到资源
+    watched_events = (EventType.SEED,)
+    produced_events = ()
+    flags = ('passive', 'safe')
+
+    async def setup(self):
+        return False          # 硬失败
+"""
+
+    DEPS_FAIL = """
+from core.engine.event import EventType
+from core.engine.module import BaseModule
+
+
+class deps_fail(BaseModule):
+    watched_events = (EventType.SEED,)
+    produced_events = ()
+    flags = ('passive', 'safe')
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.closed = 0
+
+    async def setup_deps(self):
+        return None, 'missing dep'      # 软失败 -> enabled=False
+
+    async def cleanup(self):
+        self.closed += 1
+"""
+
+    def _scanner(self, include):
+        from core.engine.preset import Preset
+        from core.engine.scanner import Scanner
+
+        return Scanner(
+            targets=["example.com"],
+            preset=Preset(name="t", include=include,
+                         module_dirs=[str(self.module_dir)]),
+            storage=None,
+        )
+
+    async def test_an_earlier_module_still_gets_cleaned_up(self) -> None:
+        """核心不变式：``setup()`` 硬失败也不能让别人的资源泄漏。"""
+        from core.engine.errors import ModuleSetupError
+
+        self.add_module_file("resource_hog", self.HOLD)
+        self.add_module_file("zzz_boom", self.BOOM)
+        scanner = self._scanner(["resource_hog", "zzz_boom"])
+        with self.assertRaises(ModuleSetupError):
+            await scanner.scan()
+        hog = scanner.modules["resource_hog"]
+        self.assertTrue(hog.opened, "夹具没生效 —— setup 压根没被调到")
+        self.assertEqual(hog.closed, 1, "拿到了资源却没被 cleanup")
+
+    async def test_a_disabled_module_still_gets_a_chance(self) -> None:
+        """``setup_deps`` 拿了资源才失败的模块，``enabled`` 是 False 但照样要 cleanup。"""
+        self.add_module_file("deps_fail", self.DEPS_FAIL)
+        scanner = self._scanner(["deps_fail"])
+        await scanner.scan()
+        mod = scanner.modules["deps_fail"]
+        self.assertFalse(mod.enabled, "夹具没生效 —— 它本该被判为禁用")
+        self.assertEqual(mod.closed, 1, "被禁用的模块没有拿到 cleanup 的机会")
+
+
+
+class TestEventLimitConverges(unittest.IsolatedAsyncioTestCase):
+    """``max_events`` 触顶后**必须收敛**，不能挂死。
+
+    ⚠️ 这条用 ``asyncio.wait_for`` 包住 ``scan()`` 把"挂死"转成失败 ——
+    真挂死时 ``scan()`` 永不返回，测试会直接挂到 pytest 的超时，
+    报错信息还指不到真正的原因上。
+    """
+
+    #: 故意写得很小：3 条就触顶，测试才跑得完。真实值是 50 万 / 100 万。
+    MAX_EVENTS = 3
+
+    async def _run(self, tmp: Path):
+        import asyncio
+
+        from core.domains.fingerprint._lib import library  # noqa: F401  仅确保可导入
+        from core.engine.event import EventType
+        from core.engine.preset import Preset
+        from core.engine.scanner import Scanner
+
+        mods = tmp / "mods"
+        mods.mkdir(parents=True, exist_ok=True)
+        # 一个什么活都不干、但每次都产出一条新事件的模块 —— 把 _visited 灌上去
+        (mods / "flood.py").write_text(
+            "from core.engine.event import EventType\n"
+            "from core.engine.module import BaseModule\n"
+            "\n"
+            "\n"
+            "class flood(BaseModule):\n"
+            "    watched_events = (EventType.SEED,)\n"
+            "    produced_events = (EventType.DNS_NAME,)\n"
+            "    flags = ('passive', 'safe')\n"
+            "    batch_size = 1\n"
+            "    workers = 1\n"
+            "    async def handle_event(self, event):\n"
+            "        for i in range(200):\n"
+            "            await self.emit_event(f'host{i}.example.com', EventType.DNS_NAME,\n"
+            "                                   parent=event)\n",
+            encoding="utf-8",
+        )
+
+        preset = Preset(name="flood")
+        preset.module_dirs = [str(mods)]
+        # 只加载 flood —— 否则会连带把 dns_brute 等真模块拉起来，
+        # 变成一次真连 DNS 的扫描（实测会把用例拖到 40 秒，还污染日志）。
+        preset.include = ["flood"]
+        preset.settings = {"max_events": self.MAX_EVENTS, "max_scope_distance": 3}
+
+        scanner = Scanner(targets=["example.com"], preset=preset, storage=None)
+        # 20 秒还收不回来，就是挂死了
+        return await asyncio.wait_for(scanner.scan(), timeout=20.0)
+
+    async def test_scan_converges_after_hitting_the_event_limit(self) -> None:
+        import tempfile
+        from pathlib import Path as _P
+
+        with tempfile.TemporaryDirectory() as td:
+            summary = await self._run(_P(td))
+            self.assertEqual(
+                summary["stats"]["events.limit_hit"], 1,
+                "没触顶，测试没打到那条路径",
+            )
+
+    async def test_the_limit_is_actually_reported(self) -> None:
+        """触顶这件事要能在 stats 里看见，而不是静默收工。"""
+        import tempfile
+        from pathlib import Path as _P
+
+        with tempfile.TemporaryDirectory() as td:
+            summary = await self._run(_P(td))
+            self.assertIn("events.limit_hit", summary["stats"])
+
+
+
 class TestModuleDiscovery(unittest.TestCase):
     """「是不是模块」按**内容**判断，不按目录。
 
@@ -420,6 +702,21 @@ class TestModuleDiscovery(unittest.TestCase):
             （主机名回喂成 ``DNS_NAME``），不再做接口路径枚举。
           * 22 → 24：新增 ``dir_brute``（目录爆破域）与 ``waf_detect``
             （指纹域的 WAF 识别）。至此流水线里只剩"主动爬站"没做。
+            ⚠️ ``waf_detect`` 后来删了，见下面 31 → 32 那条。
+          * 30 → 31：新增 ``ip_ptr``（IP 反查 PTR）。此前全仓**没有任何一处**
+            做 PTR（``rdns`` / ``in-addr.arpa`` 均为零），裸 IP 只能被
+            ``http_probe`` 直连后吃通用字典，虚拟主机枚举无从谈起。
+          * 31 → 32：删掉 ``waf_detect``（2026-10-03）—— 作为独立模块它只能
+            事后报一条 finding，**拦不住已经发出去的请求**，而「认出 WAF 就不发
+            请求」正是它存在的全部意义。识别改为内联进 ``dir_brute._find_waf``
+            （整台放弃）与 ``js_assets._waf_ok``（跳过这批路径验证），判据仍是
+            共用的 ``fingerprint/_lib/waf.py``。同时新增 ``soft404_probe``：
+            共享画像拆成「一个容器、各模块各写各的字段」，不再由某一个模块统一负责。
+          * 32 → 31：删掉 ``auth_probe``（2026-10-03）。它监听全流水线的
+            ``HTTP_RESPONSE``，把 401/403 与登录页记进画像，但**没人读**。
+            认证墙是「爆破时顺带观察到的东西」，跟着爆破走视野更准，
+            所以结论改由 ``dir_brute`` 顺带写进 ``auth_wall``/``auth_hits``。
+            判据仍在 ``fuzz/_lib/soft404.py``，识别能力不受影响。
         """
         import asyncio
 
@@ -435,7 +732,7 @@ class TestModuleDiscovery(unittest.TestCase):
             return sorted(scanner.modules)
 
         names = asyncio.run(go())
-        self.assertEqual(len(names), 30, f"模块数变了: {names}")
+        self.assertEqual(len(names), 31, f"模块数变了: {names}")
         # 库文件绝不能被当成模块
         for lib in ("resolver", "resolver_pool", "dnsgen", "dns_query",
                     "ports", "tls", "extract"):
@@ -518,10 +815,11 @@ class TestModuleDiscovery(unittest.TestCase):
                     "passive_hunter", "passive_quake", "passive_rapiddns",
                     "passive_subdomaincenter", "passive_urlscan", "passive_wayback",
                 ]),
-                "resolve": ["asn_enrich", "dns_resolve"],
-                "probe": ["http_probe", "screenshot", "tls_cert"],
+                "resolve": ["asn_enrich", "dns_resolve", "ip_ptr"],
+                "probe": ["http_probe", "screenshot",
+                          "soft404_probe", "tls_cert"],
                 "port": ["port_scan"],
-                "fingerprint": ["fingerprint", "waf_detect"],
+                "fingerprint": ["fingerprint"],
                 "urls": ["js_assets", "url_extract"],
                 "fuzz": ["dir_brute"],
             },
@@ -563,9 +861,41 @@ class TestModuleDiscovery(unittest.TestCase):
 
 class TestPreset(unittest.TestCase):
     def test_builtin_presets_exist(self) -> None:
-        names = Preset.list_builtin()
-        for expected in ("default", "passive", "active"):
-            self.assertIn(expected, names)
+        """内置预设**目录里的 yml** 与 ``list_builtin()`` 必须一一对上。
+
+        ⚠️ 原来这里是硬编码 ``("default", "passive", "active")``。
+        ``default.yml`` 与 ``brute.yml`` 已经删掉了（``active`` 是全量预设，
+        再留一个 ``default`` 只会让人不知道该选哪个），断言却还按老名单走 ——
+        于是每次跑都是红的，而红的理由跟这条测试想守的东西毫无关系。
+
+        改成互相校验：目录里多一个 yml 而 ``list_builtin()`` 不认，或者反过来，
+        都会被抓到 —— 那才是这条测试真正该守的。
+        """
+        from pathlib import Path
+
+        from core.util.paths import resources_dir  # noqa: F401  确认可导入
+
+        names = set(Preset.list_builtin())
+        self.assertEqual(
+            names, {"passive", "active"},
+            f"内置预设名单变了: {sorted(names)}",
+        )
+
+        # 目录里多一个 yml 而 list_builtin() 不认（或反过来）都要抓到 ——
+        # 那会让前端下拉框列出加载不了的项。枚举走 importlib.resources，
+        # 与 list_builtin() 本身同一套机制，否则这条断言验的就不是它了。
+        from importlib import resources
+
+        ymls = {
+            child.name.rsplit(".", 1)[0]
+            for child in resources.files("core.presets").iterdir()
+            if child.name.endswith((".yml", ".yaml"))
+            and child.name != "_template.yml"
+        }
+        self.assertEqual(
+            ymls, names,
+            "目录里的 .yml 与 list_builtin() 对不上 —— 前端会列出加载不了的项",
+        )
 
     def test_unknown_field_is_rejected(self) -> None:
         with self.assertRaises(Exception):

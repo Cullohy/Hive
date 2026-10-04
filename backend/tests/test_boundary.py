@@ -24,8 +24,10 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
 import unittest
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -38,6 +40,21 @@ from core.engine.module import (  # noqa: E402
     validate_flags,
 )
 from core.engine.preset import PLATFORM_DENY_FLAGS, Preset  # noqa: E402
+
+#: 测试私有目录的根。见 ``base.py``：不用 ``tempfile.mkdtemp``。
+TEST_TMP_ROOT = Path(__file__).resolve().parents[1] / ".testtmp"
+
+
+def _tmp_dir(case: unittest.TestCase) -> Path:
+    """建一个测试私有目录，收尾自动删。
+
+    **刻意不用 ``tempfile.mkdtemp``** —— 它在 Windows 上以 0700 建目录，
+    受限令牌/沙箱下会拒绝继续在其中创建文件（同 ``base.py`` 的说明）。
+    """
+    root = TEST_TMP_ROOT / f"b{uuid.uuid4().hex[:10]}"
+    root.mkdir(parents=True, exist_ok=True)
+    case.addCleanup(shutil.rmtree, root, ignore_errors=True)
+    return root
 from core.engine.scanner import Scanner  # noqa: E402
 
 
@@ -146,9 +163,7 @@ class TestPlatformConstitution(unittest.TestCase):
         deny，那么 ``preset.load(我的.yml)`` 就是一条绕过宪法的后门。
         所以并入点在 ``from_dict`` —— 所有入口共用。
         """
-        import tempfile
-
-        path = Path(tempfile.mkdtemp()) / "mine.yml"
+        path = _tmp_dir(self) / "mine.yml"
         path.write_text(
             "name: mine\ninclude: []\ndeny_flags: []\n", encoding="utf-8"
         )
@@ -191,9 +206,7 @@ class verify_poc_scanner(BaseModule):
 '''
 
     def test_module_loads_but_preset_denies_it(self) -> None:
-        import tempfile
-
-        root = Path(tempfile.mkdtemp())
+        root = _tmp_dir(self)
         (root / "mods").mkdir()
         (root / "mods" / "verify_poc.py").write_text(self.SOURCE, encoding="utf-8")
 

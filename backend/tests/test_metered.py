@@ -50,15 +50,15 @@ from .test_m5 import WebTestCase  # noqa: E402
 class TestPresetEnableChannel(unittest.TestCase):
     """``Preset.enable`` 的优先级语义。"""
 
-    def _preset(self, name: str = "default") -> Preset:
+    def _preset(self, name: str = "passive") -> Preset:
         return Preset.load_builtin(name)
 
     def test_builtin_presets_deny_metered(self) -> None:
-        """**所有**内置预设都默认拒绝 —— 包括「全量」。
+        """**所有**内置预设都默认拒绝 —— 包括「主动模式」。
 
         额度不该因为选了"全量"就默认烧起来。
         """
-        for name in ("default", "passive", "active"):
+        for name in Preset.list_builtin():
             with self.subTest(preset=name):
                 self.assertIn(
                     FLAG_METERED, self._preset(name).deny_flags,
@@ -111,6 +111,8 @@ class TestMeteredNotRunByDefault(WebTestCase):
     """
 
     def _scan(self, body: dict) -> dict:
+        # 名称是必填的（见 ScanRequest）；这组用例只关心 metered 勾选，统一补一个
+        body.setdefault("name", "计量源测试")
         resp = self.client.post("/api/scans", json=body, headers=self.h())
         self.assertIn(resp.status_code, (200, 201), resp.text)
         return resp.json()

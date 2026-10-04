@@ -9,14 +9,24 @@
           </a-button>
           <div class="head-main">
             <h3 class="head-title" :title="`内部 ID #${scan.scan_id ?? id}`">
-              扫描 {{ scan.task_code || scan.scan_id || id }}
+              <!-- 任务名称是用户填的，当主标题；「扫描 xxx」在有名时退成次要说明 -->
+              <span v-if="scan.name" class="head-name">{{ scan.name }}</span>
+              <span :class="{ 'tk-muted': !!scan.name }">
+                扫描 {{ scan.task_code || scan.scan_id || id }}
+              </span>
               <span class="tk-mono targets">{{ (scan.targets || []).join(', ') }}</span>
             </h3>
             <div class="head-meta">
               <a-badge :status="statusBadge(scan.status)" :text="statusText(scan.status)" />
-              <a-tag v-if="scan.mode === 'active'" color="orange">主动</a-tag>
-              <a-tag v-else-if="scan.mode === 'passive'" color="blue">被动</a-tag>
-              <a-tag>{{ scan.preset }}</a-tag>
+              <!--
+                标签跟的是**预设**（用户选了什么），不是后端 flag 推导出来的
+                `mode`。后者对 `passive` 也会报 active —— DNS 解析和证书抓取
+                确实会向目标发包，报得没错，但摆在这儿会让人以为选错了预设。
+                flag 的真相在「源统计」和审计记录里。
+              -->
+              <a-tag v-if="scan.preset === 'active'" color="orange">主动</a-tag>
+              <a-tag v-else-if="scan.preset === 'passive'" color="blue">被动</a-tag>
+              <a-tag v-else>{{ scan.preset }}</a-tag>
               <span class="tk-muted">耗时 {{ scan.elapsed ?? 0 }}s</span>
               <span v-if="scan.error" class="err">{{ scan.error }}</span>
             </div>
@@ -53,6 +63,15 @@
           <div class="tk-muted progress-text">
             新事件 {{ progress.events_new ?? 0 }} · 去重 {{ progress.events_deduped ?? 0 }} ·
             越界丢弃 {{ progress.events_out_of_scope ?? 0 }}
+          </div>
+          <!-- 各模块自报的在跑进度。"新事件"不动时靠它区分"在跑"和"挂了"：
+               慢模块（目录爆破）整个主机跑完前一条事件都不发，两者界面表现
+               原本一模一样。有这一行就能一眼看出在打哪个主机、打到第几条。 -->
+          <div v-if="busyModules.length" class="tk-muted progress-text module-busy">
+            正在处理
+            <span v-for="m in busyModules" :key="m.name" class="module-busy-chip">
+              {{ m.name }} {{ m.hint }}
+            </span>
           </div>
         </div>
       </div>
@@ -626,6 +645,17 @@ const clusterColumns = [
 ]
 const clusterRows = computed(() => assets.value.clusters?.[clusterBy.value] || [])
 
+// 后端 progress.busy: {模块名: 一句话进度}。值可能不是对象（老后端没这字段，
+// 或 SSE 收到半截帧），所以整体按不可信输入处理，坏了就当"没在跑"，
+// 绝不能因此让整个进度块白屏。
+const busyModules = computed(() => {
+  const raw = progress.value?.busy
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return []
+  return Object.entries(raw)
+    .filter(([, hint]) => typeof hint === 'string' && hint)
+    .map(([name, hint]) => ({ name, hint }))
+})
+
 const portColumns = [
   { title: '端点', key: 'endpoint', width: 200 },
   { title: '协议', dataIndex: 'protocol', key: 'protocol', width: 80 },
@@ -1048,6 +1078,10 @@ onUnmounted(() => {
   font-weight: 400;
   color: var(--tk-text-secondary);
 }
+/* 用户填的任务名称：作为标题主标识，「扫描 xxx」在有名时退成次要说明 */
+.head-name {
+  font-weight: 600;
+}
 .head-meta {
   display: flex;
   align-items: center;
@@ -1069,6 +1103,16 @@ onUnmounted(() => {
 .progress-text {
   font-size: 12.5px;
   margin-top: 4px;
+}
+.module-busy-chip {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border: 1px solid var(--tk-border);
+  border-radius: 10px;
+  background: var(--tk-bg-subtle, rgba(0, 0, 0, 0.03));
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
 }
 .trace-node {
   display: flex;

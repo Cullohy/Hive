@@ -11,7 +11,7 @@
       <a-input
         v-model:value="filterText"
         size="large"
-        placeholder="搜索目标 / TaskId / 预设"
+        placeholder="搜索名称 / 目标 / TaskId / 预设"
         allow-clear
       >
         <template #prefix><SearchOutlined class="tk-muted" /></template>
@@ -51,10 +51,16 @@
         row-key="scan_id"
         size="middle"
         :pagination="{ pageSize: 20, showSizeChanger: false }"
-        :scroll="{ x: 1080 }"
+        :scroll="{ x: 1260 }"
       >
         <template #bodyCell="{ column, record }">
-          <template v-if="column.key === 'targets'">
+          <template v-if="column.key === 'name'">
+            <!-- 名称是可选标签：没填时不留空，也不重复显示目标（目标有自己一列） -->
+            <span v-if="record.name">{{ record.name }}</span>
+            <span v-else class="tk-muted">未命名</span>
+          </template>
+
+          <template v-else-if="column.key === 'targets'">
             <span class="tk-mono">{{ (record.targets || []).join(', ') }}</span>
           </template>
 
@@ -95,7 +101,7 @@
                 停止
               </a-button>
               <a-popconfirm
-                title="删除这次扫描及其全部资产？审计日志会保留。"
+                :title="`删除这次扫描？它带出的域名 / IP / 端口 / URL / 端点 / 技术栈 / 发现会一起删除，其他扫描也共用到的资产同样会没。审计日志保留。`"
                 ok-text="删除"
                 cancel-text="取消"
                 @confirm="onDelete(record)"
@@ -136,14 +142,16 @@ const filteredScans = computed(() => {
     if (status !== 'all' && s.status !== status) return false
     if (!q) return true
     const targets = (s.targets || []).join(' ').toLowerCase()
+    const name = (s.name || '').toLowerCase()
     const code = (s.task_code || '').toLowerCase()
     const preset = (s.preset || '').toLowerCase()
-    return targets.includes(q) || code.includes(q) || preset.includes(q)
+    return targets.includes(q) || name.includes(q) || code.includes(q) || preset.includes(q)
   })
 })
 let timer = null
 
 const columns = [
+  { title: '任务名称', key: 'name', width: 170, ellipsis: true },
   { title: '目标', key: 'targets', width: 240 },
   // TaskId 是 scan_id 的短码（见后端 util/ids.py）—— 对外展示不用连续整数
   { title: 'TaskId', dataIndex: 'task_code', key: 'task_code', width: 110 },

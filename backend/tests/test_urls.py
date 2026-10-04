@@ -550,6 +550,217 @@ class TestJsAssets(unittest.TestCase):
                 self.assertTrue(looks_like_host(value), f"漏收: {value}")
 
 
+class TestJsLiteralDecoding(unittest.TestCase):
+    r"""字面量解码 —— 三类在真实前端产物里成片出现、却被"引号+形态"正则漏掉的写法。
+
+    这组用例是**回归钉子**：早期实现是一条大正则扫全文（LinkFinder / JSFinder
+    的做法），于是下面三种一个都认不出来。改成"先切字面量再判形态"之后才补上。
+    """
+
+    def _urls(self, js: str) -> list[str]:
+        from core.domains.urls._lib.jsassets import extract_urls
+
+        return extract_urls(js)
+
+    def _hosts(self, js: str) -> list[str]:
+        from core.domains.urls._lib.jsassets import extract_hosts
+
+        return extract_hosts(js)
+
+    def _paths(self, js: str) -> list[str]:
+        from core.domains.urls._lib.jsassets import extract_paths
+
+        return extract_paths(js)
+
+    # ------------------------------------------------------------------ 三类盲点
+    def test_escaped_slash_is_decoded(self) -> None:
+        r"""``https:\/\/api.example.com`` —— 压缩器 / 转义产物的标准写法。
+
+        老正则在字符类里排掉了反斜杠，于是 ``\/\/`` 直接把 ``//`` 打断，
+        整条地址一个字符都取不到。
+        """
+        self.assertEqual(
+            self._urls(r'var a="https:\/\/api.example.com\/v1\/user";'),
+            ["https://api.example.com/v1/user"],
+        )
+        self.assertEqual(
+            self._hosts(r'var a="https:\/\/api.example.com\/v1";'),
+            ["api.example.com"],
+        )
+
+    def test_backtick_template_is_scanned(self) -> None:
+        """反引号模板字符串 —— 现代前端产物里密度很高，老正则只认两种引号。"""
+        self.assertEqual(
+            self._urls("var b=`https://api.example.com/x`;"),
+            ["https://api.example.com/x"],
+        )
+        self.assertEqual(
+            self._hosts("var b=`api.example.com`;"),
+            ["api.example.com"],
+        )
+
+    def test_hex_and_unicode_escapes_are_decoded(self) -> None:
+        r"""``\xNN`` 与 ``\uNNNN`` —— 混淆过的前端产物会这么写。"""
+        self.assertEqual(
+            self._paths(r'var c="\x2f\x61\x70\x69\x2f\x75\x73\x65\x72";'),
+            ["/api/user"],
+        )
+        self.assertEqual(
+            self._paths(r'var d="/api/v1";'), ["/api/v1"],
+        )
+        self.assertEqual(
+            self._paths(r'var e="\u002f\u0061\u0070\u0069";'), ["/api"],
+        )
+
+    def test_decoded_escapes_can_form_a_full_url(self) -> None:
+        r"""转义 + 拼接叠在一起时仍要还原 —— 两种形态不是各管一段的。"""
+        self.assertEqual(
+            self._urls(r'var a="\x68\x74\x74\x70\x73://api.example.com/x";'),
+            ["https://api.example.com/x"],
+        )
+
+    # ------------------------------------------------------------------ 拼接折叠
+    def test_literal_concatenation_is_folded(self) -> None:
+        """``"https://" + "api.example.com/v1"`` 要还原成一条完整地址。"""
+        self.assertEqual(
+            self._urls('var e="https://" + "api.example.com/v1";'),
+            ["https://api.example.com/v1"],
+        )
+
+    def test_folding_stops_at_a_variable(self) -> None:
+        """碰到变量就停手 —— ``"https://" + host`` 里的 host 是什么我们不知道。
+
+        硬拼出来的 ``https://undefined`` 是**发明资产**，比漏掉坏得多。
+        """
+        got = self._urls('var e="https://" + host + "/v1";')
+        self.assertNotIn("https://undefined/v1", got)
+        self.assertEqual(got, [])
+
+    def test_protocol_relative_split_across_literals(self) -> None:
+        """``"https:" + "//cdn.example.com/lib.js"`` —— 真实写法，不是 ``https://`` + ``//``。"""
+        self.assertEqual(
+            self._urls('var q="https:" + "//cdn.example.com/lib.js";'),
+            ["https://cdn.example.com/lib.js"],
+        )
+
+    # ------------------------------------------------------------------ 模板插值
+    def test_leading_interpolation_is_stripped(self) -> None:
+        r"""``${base}/api/v1`` 里 ``/api/v1`` 是完全确定的，不该连坐丢掉。"""
+        self.assertEqual(self._paths("var j=`${base}/api/v1`;"), ["/api/v1"])
+
+    def test_nested_interpolation_does_not_swallow_the_path(self) -> None:
+        r"""``${a ? {b:1} : 2}/api/v2`` —— 花括号要配对地跳。
+
+        数到第一个 ``}`` 就停的话，插值**后面**的路径会被一起吃掉。
+        """
+        self.assertEqual(
+            self._paths("var k=`${a ? {b:1} : 2}/api/v2`;"), ["/api/v2"],
+        )
+
+    def test_middle_interpolation_is_rejected(self) -> None:
+        """``/api/${id}/x`` 判断不了 —— 整条当不是，而不是发一条瞎猜的请求。"""
+        self.assertEqual(self._paths("var r=`/api/${id}/x`;"), [])
+
+    def test_interpolation_marker_never_leaks(self) -> None:
+        """占位符绝不能进产出 —— 那是内部控制字符，泄漏出去就是脏数据。"""
+        for js in ("var j=`${base}/api/v1`;", "var k=`${a}/${b}/v2`;"):
+            with self.subTest(js=js):
+                for got in self._paths(js):
+                    self.assertNotIn("\x00", got)
+
+    # ------------------------------------------------------------------ 路径形态
+    def test_only_root_relative_paths_are_taken(self) -> None:
+        """点相对与裸相对**没有可用基准**，认了就是发明资产。
+
+        ``./x`` / ``a/b.php`` 的基准是**文档 URL**，而抽取时只看得到 JS 文件
+        自己的 URL —— 拿它当基准拼出来的地址是凭空造的。相比之下根相对
+        不需要基准，接上站点 origin 就是确定的。
+        """
+        self.assertEqual(self._paths('var f="/api/v1/users";'), ["/api/v1/users"])
+        self.assertEqual(self._paths('var g="/admin/list.php";'),
+                         ["/admin/list.php"])
+        for js in ('var h="../up/load.action";', 'var i="user/list.json";',
+                   'var j="./chunk.js";'):
+            with self.subTest(js=js):
+                self.assertEqual(self._paths(js), [],
+                                 f"没有基准的相对形态被收了: {js}")
+
+    def test_query_string_is_kept_but_fragment_is_not(self) -> None:
+        """query 能看出"这是个带租户的接口"，值得留；fragment 不改变服务端行为。"""
+        self.assertEqual(
+            self._paths('var m="/api/v1/list?tenant=1#top";'),
+            ["/api/v1/list?tenant=1"],
+        )
+
+    def test_noise_is_filtered(self) -> None:
+        """静态资源与打包器内部结构**不值得花请求去验证**。
+
+        抽路径是为了替代字典爆破，而字典爆破找的是目录/接口/后台。
+        """
+        for js in (
+            'var l="/static/img/logo.png";',
+            'var l="/static/css/app.css";',
+            'var l="/static/js/chunk.js";',
+            'require("webpack:///./src/x.js");',
+            'var s="main.js";',                  # 单段文件名：噪声太大
+            'var s="/";',                        # 光秃秃一个斜杠
+            'var s="not a path";',               # 含空格
+            # ↓ 这两条**没有**静态扩展名，静态资源那一关拦不住它们，
+            #   只有打包器噪声名单能拦。少了那一步它们就会漏进来。
+            'var m="/node_modules/lodash/index";',
+            'var m="/webpack/build/helper";',
+        ):
+            with self.subTest(js=js):
+                self.assertEqual(self._paths(js), [], f"噪声没收干净: {js}")
+
+    def test_full_urls_are_not_reported_as_paths(self) -> None:
+        """地址归 ``extract_urls``，路径归 ``extract_paths`` —— 两边不重叠。"""
+        for js in ('a="https://api.example.com/x";', 'a="//cdn.example.com/y.js";'):
+            with self.subTest(js=js):
+                self.assertEqual(self._paths(js), [])
+
+    def test_urls_still_refuse_bare_paths(self) -> None:
+        """**契约没变** —— ``extract_urls`` 仍然只给写全了的地址。
+
+        相对路径是候选（走 ``extract_paths``），要验证过才算资产。
+        老的 ``TestJsAssets`` 边界用例依赖这条，不能因为加了路径抽取就松掉。
+        """
+        for js in ('a="/api/v1/users";', 'a="./x";', 'a="../a/b.json";'):
+            with self.subTest(js=js):
+                self.assertEqual(self._urls(js), [])
+
+    # ------------------------------------------------------------------ 排序
+    def test_api_like_paths_are_ranked_first(self) -> None:
+        """预算截断时先保接口 —— 被砍掉的应该是资源而不是 ``/api/v1``。"""
+        from core.domains.urls._lib.jsassets import rank_paths
+
+        got = rank_paths(["/about", "/api/v1/users", "/public/js/app.js",
+                          "/admin/login", "/static/logo.svg"])
+        self.assertEqual(got[:2], ["/api/v1/users", "/admin/login"])
+        self.assertIn("/about", got)
+
+    def test_rank_is_stable_and_total(self) -> None:
+        from core.domains.urls._lib.jsassets import rank_paths
+
+        paths = ["/a", "/b", "/c", "/d"]
+        self.assertEqual(sorted(rank_paths(paths)), sorted(paths))
+        self.assertEqual(rank_paths(paths), rank_paths(paths))
+
+    # ------------------------------------------------------------------ 性能
+    def test_pathological_quote_density_does_not_blow_up(self) -> None:
+        """引号密集的输入不能让回溯爆炸 —— 找收尾引号那一步必须无回溯。"""
+        import time
+
+        for src in ("'" * 50000, '"' * 50000, "`" * 50000):
+            with self.subTest(n=len(src)):
+                t0 = time.monotonic()
+                self._paths(src)
+                self.assertLess(
+                    time.monotonic() - t0, 5.0,
+                    "引号密集的输入耗时异常 —— 量词失去上界了",
+                )
+
+
 JS_TARGET = "https://www.example.com/static/app.js"
 
 JS_BODY = """
@@ -622,9 +833,14 @@ class emit_js_url(BaseModule):
         self.assertIn("https://cdn.example.com/logo.png", got)
         # 外链不能进库
         self.assertFalse(any("other.com" in u for u in got), f"外链泄漏: {got}")
-        # 裸路径 / 相对路径不能进库（边界）
-        self.assertFalse(any("/admin/users" in u for u in got), f"裸路径泄漏: {got}")
+        # 点相对（`./chunk-abc.js`）没有可用基准，**永远**不该进库
         self.assertFalse(any("chunk-abc" in u for u in got), f"相对路径泄漏: {got}")
+        # 根相对路径**可以**进库，但必须先验证过。这个 fixture 里每条请求都
+        # 返回同一份 JS 正文，软 404 画像会把候选全判成噪声，所以一条都进不来
+        # —— 这正是「没验证的路径不许算数」。真验证通过的那条见
+        # TestJsPathVerification。
+        self.assertFalse(any("/admin/users" in u for u in got),
+                         f"未经验证的路径泄漏: {got}")
 
     async def test_emits_dns_names_for_js_hosts(self) -> None:
         """**JS 里发现的主机名要回喂成 DNS_NAME。**
@@ -686,7 +902,7 @@ class emit_js_url(BaseModule):
         self.assertEqual(len(await self._emitted(scanner.scan_id, "DNS_NAME")), 2)
 
     async def test_stats_are_reported(self) -> None:
-        _, summary = await self._scan()
+        _, summary = await self._scan(verify_paths=False)
         row = next(
             (r for r in summary["source_stats"] if r["source"] == "js_assets"), None
         )
@@ -694,10 +910,587 @@ class emit_js_url(BaseModule):
         self.assertGreater(row["raw"], 0)
         self.assertGreater(row["results"], 0)
         self.assertEqual(row["requests"], 1, "抓了 1 个 JS 文件")
+        self.assertEqual(row["detail"]["路径验证请求"], 0,
+                         "verify_paths=False 时不该有任何验证请求")
 
     async def test_non_200_is_ignored(self) -> None:
         scanner, _ = await self._scan(status=404)
         self.assertEqual(await self._emitted(scanner.scan_id), set())
+
+
+#: JS 里写的路径，以及其中**确实存在**的那些。存在的返回真内容，
+#: 不存在的返回固定 404 页 —— 这是最常见的真实形态。
+PATH_JS_BODY = """
+var cfg = {
+  real:  "/api/v1/admin/users",
+  fake:  "/api/v1/does/not/exist",
+  also:  "/api/v1/orders",
+  img:   "/static/img/logo.png",
+};
+"""
+
+_EXISTING = {"/api/v1/admin/users", "/api/v1/orders"}
+_NOT_FOUND = (
+    "<!DOCTYPE html><html><head><title>404</title></head>"
+    "<body><h1>404 Not Found</h1><p>The requested page does not exist.</p>"
+    "</body></html>"
+)
+
+
+class TestJsPathVerification(EngineTestCase):
+    r"""根相对路径**验证之后**才进库 —— 这是拿 JS 替代字典爆破的落点。
+
+    这组用例守的是整个改动里最要紧的那条线：
+
+    * 没验证的路径**一条都不许进库**（否则就是在发明资产）
+    * 验证过、确认存在的**必须**进库（否则白抽）
+    * 验证请求要**如实记账**（用户换这条路的原因就是流量）
+    """
+
+    EMIT_JS_URL = """
+from core.engine.event import EventType
+from core.engine.module import BaseModule
+
+
+class emit_js_url(BaseModule):
+    watched_events = (EventType.SEED,)
+    produced_events = (EventType.URL,)
+    flags = ("passive", "safe")
+
+    async def handle_event(self, event):
+        await self.emit_event(%r, EventType.URL, parent=event)
+""" % JS_TARGET
+
+    async def _scan(self, *, body: str = PATH_JS_BODY, **cfg):
+        """跑一次完整链路，返回 ``(scanner, 实际发出去的 URL, 汇总)``。"""
+        from core.services.http import FetchResult, HTTPClient
+
+        self.add_module_file("emit_js", self.EMIT_JS_URL)
+        sent: list[str] = []
+
+        def responder(url: str):
+            from urllib.parse import urlsplit
+
+            sent.append(url)
+            if url == JS_TARGET:
+                return FetchResult(
+                    url=url, status=200, headers={}, text=body,
+                )
+            path = urlsplit(url).path
+            if path in _EXISTING:
+                return FetchResult(
+                    url=url, status=200,
+                    headers={"content-type": "application/json"},
+                    text='{"code":0,"data":[{"id":1,"name":"admin"}]}',
+                )
+            return FetchResult(url=url, status=404, headers={}, text=_NOT_FOUND)
+
+        def fake_fetch(client, url, **kwargs):  # noqa: ANN001
+            async def go():
+                return responder(url)
+            return go()
+
+        with mock.patch.object(HTTPClient, "fetch", fake_fetch):
+            scanner, summary = await self.run_scan(
+                targets=["example.com"],
+                include=["emit_js_url", "js_assets"],
+                module_config={"js_assets": cfg},
+            )
+        return scanner, sent, summary
+
+    async def _emitted(self, scan_id: int) -> set[str]:
+        events = await self.storage.events(scan_id, limit=1000, event_type="URL")
+        return {e["data"] for e in events if e["module"] == "js_assets"}
+
+    @staticmethod
+    def _row(summary: dict) -> dict:
+        return next(
+            (r for r in summary["source_stats"] if r["source"] == "js_assets"), {}
+        )
+
+    @staticmethod
+    def _probes(sent: list[str]) -> list[str]:
+        """除抓 JS 那一条以外，模块自己发出去的所有请求。"""
+        return [u for u in sent if not u.endswith("app.js")]
+
+    # ------------------------------------------------------------------ 该进的
+    async def test_verified_path_is_emitted(self) -> None:
+        scanner, _sent, _summary = await self._scan()
+        got = await self._emitted(scanner.scan_id)
+        self.assertIn("https://www.example.com/api/v1/admin/users", got,
+                      "验证通过却没入库 —— 那就白抽了")
+
+    async def test_noise_path_is_not_emitted(self) -> None:
+        """**这条是整个改动的命门**：软 404 判成噪声的路径一条都不许进库。
+
+        ``/api/v1/does/not/exist`` 在 JS 里写得和真接口一模一样，不验证就
+        发出去的话，资产表里会多出一条根本不存在的接口。
+        """
+        scanner, _sent, _summary = await self._scan()
+        got = await self._emitted(scanner.scan_id)
+        self.assertNotIn("https://www.example.com/api/v1/does/not/exist", got,
+                         "软 404 被当成了真实接口")
+
+    async def test_static_asset_is_not_probed_at_all(self) -> None:
+        """静态资源不该占验证请求 —— 这条本来就该在抽取阶段就被滤掉。"""
+        _scanner, sent, _summary = await self._scan()
+        self.assertFalse(any("logo.png" in u for u in sent),
+                         f"静态资源被拿去验证了: {sent}")
+
+    # ------------------------------------------------------------------ 流量
+    async def test_traffic_is_far_below_a_dictionary(self) -> None:
+        """**这是换这条路的全部意义**，所以必须钉死。
+
+        一个站点抽出来的候选只有个位数到几十条；目录字典动辄几百条。
+        请求量差一个数量级，才值得把爆破换掉。
+        """
+        _scanner, sent, _summary = await self._scan()
+        probes = self._probes(sent)
+        # 2 条校准 + 3 条候选（两条真 + 一条假）
+        self.assertEqual(len(probes), 5, f"验证请求数失控: {probes}")
+        self.assertLess(len(probes), 10,
+                        "验证请求比字典还多，这条路就没有意义了")
+
+    async def test_requests_are_reported_honestly(self) -> None:
+        """统计里的请求数**必须包含验证请求**。
+
+        藏起来的话，用户在界面上看到的还是「只抓了 1 个 JS」，
+        换来的省流量就成了看不见的代价。
+        """
+        _scanner, sent, summary = await self._scan()
+        row = self._row(summary)
+        self.assertEqual(row["detail"]["路径验证请求"], 3)
+        self.assertEqual(row["detail"]["确认存在的路径"], 2)
+        self.assertEqual(row["detail"]["判为软 404"], 1)
+        self.assertEqual(row["requests"], len(sent),
+                         "requests 必须等于实际发出的请求数")
+
+    async def test_verification_can_be_turned_off(self) -> None:
+        """``verify_paths: false`` → 退回旧行为，**一个额外请求都不发**。"""
+        _scanner, sent, summary = await self._scan(verify_paths=False)
+        self.assertEqual(self._probes(sent), [], "关掉后仍在发验证请求")
+        self.assertEqual(self._row(summary)["detail"]["路径验证请求"], 0)
+
+    async def test_per_host_budget_caps_probes(self) -> None:
+        """``max_paths_per_host`` 是硬上限 —— 它是这个模块最贵的一项。"""
+        _scanner, sent, _summary = await self._scan(max_paths_per_host=1)
+        probes = self._probes(sent)
+        # 2 条校准 + 1 条候选
+        self.assertEqual(len(probes), 3, f"上限没生效: {probes}")
+
+    # ------------------------------------------------------------------ 画像
+    async def test_profile_is_built_once_per_origin(self) -> None:
+        """一个站点几十个 JS 文件都在同一个 origin 上，重复校准就是白烧流量。
+
+        3 条候选共用一条画像 —— 校准只发 2 条，不是每条候选都重新校准一次。
+        """
+        _scanner, sent, summary = await self._scan()
+        self.assertEqual(self._row(summary)["detail"]["JS 校准次数"], 1)
+        self.assertEqual(len(self._probes(sent)), 5)
+
+    async def test_same_path_in_many_chunks_is_verified_once(self) -> None:
+        """**这是本模块最该省的地方。**
+
+        真实前端产物里，同一个接口路径常常在十几个 chunk 里各写一遍
+        （路由表、公共模块、懒加载页各一份）。不跨文件去重的话，
+        请求量直接翻十几倍 —— 去重比什么都值钱。
+        """
+        from core.services.http import FetchResult, HTTPClient
+
+        chunks = [f"https://www.example.com/static/c{i}.js" for i in range(4)]
+        self.add_module_file("emit_chunks", """
+from core.engine.event import EventType
+from core.engine.module import BaseModule
+
+URLS = %r
+
+
+class emit_chunks(BaseModule):
+    watched_events = (EventType.SEED,)
+    produced_events = (EventType.URL,)
+    flags = ("passive", "safe")
+
+    async def handle_event(self, event):
+        for url in URLS:
+            await self.emit_event(url, EventType.URL, parent=event)
+""" % (chunks,))
+
+        sent: list[str] = []
+
+        def fake_fetch(client, url, **kwargs):  # noqa: ANN001
+            from urllib.parse import urlsplit
+
+            async def go():
+                sent.append(url)
+                if url in chunks:
+                    # 四个 chunk 里**写的是同一批路径**
+                    return FetchResult(url=url, status=200, headers={},
+                                       text=PATH_JS_BODY)
+                if urlsplit(url).path in _EXISTING:
+                    return FetchResult(url=url, status=200, headers={},
+                                       text='{"code":0}')
+                return FetchResult(url=url, status=404, headers={},
+                                   text=_NOT_FOUND)
+            return go()
+
+        with mock.patch.object(HTTPClient, "fetch", fake_fetch):
+            scanner, summary = await self.run_scan(
+                targets=["example.com"],
+                include=["emit_chunks", "js_assets"],
+                module_config={"js_assets": {}},
+            )
+
+        # 4 个 JS + 2 条校准 + **3 条候选（不是 4×3）**
+        self.assertEqual(len(sent), 9, f"跨文件去重没生效: {sent}")
+        # 画像按 origin 建，**四个 chunk 共用一条** —— 每个文件都重新校准一遍
+        # 的话就是 8 条校准请求，比候选本身还多
+        self.assertEqual(self._row(summary)["detail"]["JS 校准次数"], 1,
+                         "每个 JS 文件都重新校准了一遍 —— 白烧流量")
+        got = await self._emitted(scanner.scan_id)
+        self.assertIn("https://www.example.com/api/v1/admin/users", got)
+
+    async def test_second_chunk_with_new_paths_reuses_the_profile(self) -> None:
+        """第二个 chunk 带来**新路径**时，也要用同一个 origin 已建好的画像。
+
+        这是画像缓存唯一真正吃劲的场景 —— 上一个用例里四个 chunk 写的路径
+        全一样，第二个文件在候选去重后就没有候选了，压根走不到建画像那步。
+        这里让第二个 chunk 带一条只有它有的路径，才真的踩到缓存。
+        """
+        from core.services.http import FetchResult, HTTPClient
+
+        c0, c1 = ("https://www.example.com/static/c0.js",
+                  "https://www.example.com/static/c1.js")
+        bodies = {
+            c0: 'var a = "/api/v1/one"; var b = "/api/v1/two";',
+            c1: 'var c = "/api/v1/three";',
+        }
+        self.add_module_file("emit_two", """
+from core.engine.event import EventType
+from core.engine.module import BaseModule
+
+URLS = %r
+
+
+class emit_two(BaseModule):
+    watched_events = (EventType.SEED,)
+    produced_events = (EventType.URL,)
+    flags = ("passive", "safe")
+
+    async def handle_event(self, event):
+        for url in URLS:
+            await self.emit_event(url, EventType.URL, parent=event)
+""" % ([c0, c1],))
+
+        sent: list[str] = []
+
+        def fake_fetch(client, url, **kwargs):  # noqa: ANN001
+            from urllib.parse import urlsplit
+
+            async def go():
+                sent.append(url)
+                if url in bodies:
+                    return FetchResult(url=url, status=200, headers={},
+                                       text=bodies[url])
+                if urlsplit(url).path.startswith("/api/"):
+                    return FetchResult(url=url, status=200, headers={},
+                                       text='{"code":0}')
+                return FetchResult(url=url, status=404, headers={},
+                                   text=_NOT_FOUND)
+            return go()
+
+        with mock.patch.object(HTTPClient, "fetch", fake_fetch):
+            scanner, summary = await self.run_scan(
+                targets=["example.com"],
+                include=["emit_two", "js_assets"],
+                module_config={"js_assets": {}},
+            )
+
+        # 2 个 JS + 2 条校准（**不是 4 条**）+ 3 条候选
+        self.assertEqual(len(sent), 7, f"画像被重建了: {sent}")
+        self.assertEqual(self._row(summary)["detail"]["JS 校准次数"], 1)
+        got = await self._emitted(scanner.scan_id)
+        self.assertIn("https://www.example.com/api/v1/three", got,
+                      "第二个 chunk 的新路径没验上")
+
+    async def test_unusable_profile_skips_every_candidate(self) -> None:
+        """画像立不起来时**一条候选都不许发**。
+
+        判不了就等于没判，把候选全打出去只会得到一堆判不了的响应 ——
+        既没结论，又把流量花光了。
+        """
+        from core.services.http import FetchResult, HTTPClient
+
+        self.add_module_file("emit_js", self.EMIT_JS_URL)
+        sent: list[str] = []
+
+        def fake_fetch(client, url, **kwargs):  # noqa: ANN001
+            async def go():
+                sent.append(url)
+                if url == JS_TARGET:
+                    return FetchResult(url=url, status=200, headers={},
+                                       text=PATH_JS_BODY)
+                # 每条都返回完全不一样的东西 → 基线立不起来。
+                # 幅度要大到**超出容差**（8 字节）：差几字节属于正常抖动，
+                # 那种情况软 404 画像照样立得起来，测试就变成在测别的东西了。
+                pad = "x" * (200 * len(sent))
+                return FetchResult(url=url, status=200, headers={},
+                                   text=f"<html>{pad}</html>")
+            return go()
+
+        with mock.patch.object(HTTPClient, "fetch", fake_fetch):
+            scanner, _ = await self.run_scan(
+                targets=["example.com"],
+                include=["emit_js_url", "js_assets"],
+                module_config={"js_assets": {}},
+            )
+
+        got = await self._emitted(scanner.scan_id)
+        self.assertFalse(any("/api/v1/" in u for u in got),
+                         f"画像不可用却还是发了候选: {got}")
+        self.assertEqual([u for u in sent if "/api/v1/" in u], [],
+                         "画像不可用却仍在验证候选")
+
+
+_PARENT_EMIT_MODULE = """
+from core.engine.event import EventType
+from core.engine.module import BaseModule
+
+HTML = %s
+URL = "https://www.example.com/"
+
+
+class emit_html(BaseModule):
+    watched_events = (EventType.SEED,)
+    produced_events = (EventType.HTTP_RESPONSE,)
+    flags = ("active", "loud")
+
+    async def handle_event(self, event):
+        await self.emit_event(URL, EventType.HTTP_RESPONSE, parent=event,
+                              tags={"url": URL, "final_url": URL,
+                                    "body_snippet": HTML, "status": 200})
+"""
+
+
+_PARENT_EMIT_MODULE = """
+from core.engine.event import EventType
+from core.engine.module import BaseModule
+
+HTML = %s
+URL = "https://www.example.com/"
+
+
+class emit_html(BaseModule):
+    watched_events = (EventType.SEED,)
+    produced_events = (EventType.HTTP_RESPONSE,)
+    flags = ("active", "loud")
+
+    async def handle_event(self, event):
+        await self.emit_event(URL, EventType.HTTP_RESPONSE, parent=event,
+                              tags={"url": URL, "final_url": URL,
+                                    "body_snippet": HTML, "status": 200})
+"""
+
+
+class TestParentDirDerivation(EngineTestCase):
+    """父目录推导 —— 2026-10-03 从 ``dir_brute`` 搬到 ``url_extract``。
+
+    搬家的理由：**``dir_brute`` 该只干「猜字典」**，而从页面里「读」出目录
+    是采集的活。而且原来两边都在抽同一份首页正文（``dir_brute`` 自己抓一遍
+    首页，``url_extract`` 也抽一遍），那是实打实的重复。
+
+    ⚠️ 搬过来之后语义变了：这些是**已发现、未验证**的地址。验证要发请求，
+    那是 active 的事；``url_extract`` 是 ``passive, safe``，加了验证就破坏
+    性质了。所以事件上带 ``verified=False`` 标记。
+    """
+
+    HOST = "https://www.example.com"
+
+    #: 首页里写着的链接
+    INDEX_HTML = (
+        '<html><head><link href="/static/app.css" rel="stylesheet"></head>'
+        '<body><a href="/docs/guide/intro.html">指南</a>'
+        '<a href="/docs/api/reference.html">接口</a>'
+        '<a href="https://other.example.org/external-only-path">外站</a>'
+        '<script src="/static/app.js"></script></body></html>'
+    )
+
+    async def _scan(self, html: str = None, **cfg):
+        """跑一条链：``SEED → HTTP_RESPONSE(带正文) → url_extract``。
+
+        ⚠️ **刻意不 mock HTTPClient** —— 这条链上任何模块发了请求都会真的
+        出去，那就不是「纯读」了。``test_derivation_sends_no_requests`` 专门
+        盯这条（那里才去 mock）。
+        """
+        self.add_module_file(
+            "emit_html", _PARENT_EMIT_MODULE % repr(self.INDEX_HTML if html is None else html)
+        )
+        scanner, _summary = await self.run_scan(
+            targets=["example.com"],
+            include=["emit_html", "url_extract"],
+            module_config={"url_extract": cfg},
+            settings={"forbidden_domains": []},
+        )
+        return scanner
+
+    async def _parents(self, scan_id: int) -> list[str]:
+        # ⚠️ 两个坑叠在一起，踩过一次：
+        # 1. ``kind`` **列**只对 FINDING 事件填（见 postgres.save_event），
+        #    URL 事件的 kind 留在 tags 里；
+        # 2. 而 ``tags_json`` 这一列读回来是**字符串**，不是 dict。
+        # 所以要自己 json.loads 一下。
+        import json as _json
+
+        rows = await self.storage.events(scan_id, limit=2000, event_type="URL")
+        out = []
+        for row in rows:
+            try:
+                tags = _json.loads(row.get("tags_json") or "{}")
+            except (TypeError, ValueError):
+                tags = {}
+            if tags.get("kind") == "parent_dir":
+                out.append(row["data"])
+        return out
+
+    # ------------------------------------------------------------------ 该发的
+    async def test_parent_directories_are_emitted(self) -> None:
+        """``/docs/guide/intro.html`` 要推出 ``/docs`` 与 ``/docs/guide``。"""
+        scanner = await self._scan()
+        parents = await self._parents(scanner.scan_id)
+        for path in ("/docs", "/docs/guide"):
+            self.assertIn(f"{self.HOST}{path}", parents, f"父目录没发出来: {path}")
+
+    async def test_parents_are_marked_unverified(self) -> None:
+        """**必须标成「未验证」** —— 目录存在 ≠ 请求它有有用响应。
+
+        很多站点目录列表是关的，``/docs/`` 本身回 403 或空页。把它当成
+        「已确认存在」入库，后面的人就白跑一趟。
+        """
+        scanner = await self._scan()
+        parents = await self._parents(scanner.scan_id)
+        self.assertTrue(parents, "一条父目录都没发")
+        # ``verified`` 存在 tags_json 里（读回来是字符串），这里只验它确实
+        # 以 False 落库，而不是压根没写这个标记
+        for url in parents:
+            row = await self.storage.events(
+                scanner.scan_id, limit=50, event_type="URL"
+            )
+            hit = [r for r in row if r["data"] == url]
+            self.assertTrue(hit, f"父目录事件不见了: {url}")
+            self.assertIn('"verified":false',
+                          str(hit[0].get("tags_json") or "").lower().replace(
+                              '"verified": false', '"verified":false'),
+                          f"没标未验证: {url}")
+
+    # ------------------------------------------------------------------ 不该发的
+    async def test_external_links_are_not_derived(self) -> None:
+        """**只推本站** —— 外站路径拿到本站验证纯属浪费。
+
+        ⚠️ 断言必须落在**路径**上，不能查 URL 里有没有外站域名：
+        就算把本站过滤关掉，发出去的也是 ``https://本站/外站路径``，
+        URL 里根本不会出现那个域名，按域名查是查不出问题的。
+        """
+        scanner = await self._scan()
+        parents = await self._parents(scanner.scan_id)
+        self.assertFalse([p for p in parents if "external-only-path" in p],
+                         f"外站的路径被拿来推导了: {parents}")
+
+    async def test_static_assets_are_not_seeds(self) -> None:
+        """静态资源在推之前丢掉 —— ``/static/app.js`` 会拖出 ``/static``。"""
+        scanner = await self._scan()
+        parents = await self._parents(scanner.scan_id)
+        self.assertFalse([p for p in parents if p.endswith("/static")],
+                         f"构建目录被推导出来了: {parents}")
+        self.assertFalse([p for p in parents if p.endswith(".js")],
+                         f"静态资源本身被推导出来了: {parents}")
+
+    async def test_shallow_is_ranked_first(self) -> None:
+        """**越浅的越先** —— ``/a/`` 是正经入口，深的是构建产物。
+
+        这个顺序就是预算不够时丢谁的决定，所以要钉住。
+        """
+        # 深的那条**写在前面**，才能证明排序确实生效而不是碰巧顺着文档顺序。
+        # ⚠️ 两段都得**至少两层**：单段的 ``/z`` 没有祖先（``include_self=False``），
+        # 拿它当"浅"的样本会得到空列表。
+        html = ('<html><body><a href="/a/b/c/d">deep</a>'
+                '<a href="/z/w">shallow</a></body></html>')
+        scanner = await self._scan(html)
+        parents = await self._parents(scanner.scan_id)
+        self.assertIn(f"{self.HOST}/z", parents)
+        self.assertIn(f"{self.HOST}/a/b", parents)
+        self.assertLess(parents.index(f"{self.HOST}/z"),
+                        parents.index(f"{self.HOST}/a/b"),
+                        f"深路径排在浅路径前面了: {parents}")
+
+    async def test_same_depth_keeps_document_order(self) -> None:
+        """同深度**保持文档顺序** —— 稳定排序不是可有可无的。
+
+        深度相同时谁先谁后，就是「同一层里先试哪条」的决定。
+        """
+        html = ('<html><body><a href="/a/x">x</a>'
+                '<a href="/c/y">y</a></body></html>')
+        scanner = await self._scan(html)
+        parents = await self._parents(scanner.scan_id)
+        # 两段的祖先都是深度 1，顺序就该跟文档里一样
+        self.assertEqual(parents, [f"{self.HOST}/a", f"{self.HOST}/c"],
+                         f"同深度顺序被改动了: {parents}")
+
+    async def test_the_link_itself_is_not_re_emitted(self) -> None:
+        """**只推祖先，不推叶子。**
+
+        叶子链接上面已经正常抽过一次了，再发一遍会被引擎按
+        ``(type, data, kind)`` 去重掉（URL 事件的 kind 列恒为空，必然撞）——
+        推它是白费一次事件预算。真正有价值的是链接里没有的祖先目录。
+        """
+        html = '<html><body><a href="/a/b/c">x</a></body></html>'
+        scanner = await self._scan(html)
+        parents = await self._parents(scanner.scan_id)
+        self.assertIn(f"{self.HOST}/a/b", parents)
+        self.assertIn(f"{self.HOST}/a", parents)
+        self.assertNotIn(f"{self.HOST}/a/b/c", parents,
+                         "叶子被当成父目录又发了一遍")
+
+    # ------------------------------------------------------------------ 预算
+    async def test_budget_caps_parents(self) -> None:
+        html = "".join(f'<a href="/d{i}/x/y">x</a>' for i in range(10))
+        scanner = await self._scan(html, max_parents_per_page=3)
+        self.assertEqual(len(await self._parents(scanner.scan_id)), 3)
+
+    async def test_total_budget_stops_early(self) -> None:
+        html = "".join(f'<a href="/d{i}/x/y">x</a>' for i in range(10))
+        scanner = await self._scan(html, max_parents_per_page=8,
+                                  max_parents_total=4)
+        self.assertEqual(len(await self._parents(scanner.scan_id)), 4)
+
+    async def test_can_be_turned_off(self) -> None:
+        """``derive_parents: false`` → 一条都不发。"""
+        scanner = await self._scan(derive_parents=False)
+        self.assertEqual(await self._parents(scanner.scan_id), [])
+
+    # ------------------------------------------------------------------ 契约
+    async def test_derivation_sends_no_requests(self) -> None:
+        """**纯读，一个请求都不许多发。**
+
+        这是它能待在 ``passive, safe`` 里的唯一理由 —— 加了验证就破坏性质。
+        """
+        from core.services.http import HTTPClient
+
+        called: list[str] = []
+
+        async def boom(*a, **k):  # pragma: no cover
+            called.append(str(a[:1]))
+            raise AssertionError("父目录推导发了请求")
+
+        self.add_module_file(
+            "emit_html", _PARENT_EMIT_MODULE % repr(self.INDEX_HTML)
+        )
+        with mock.patch.object(HTTPClient, "fetch", boom):
+            await self.run_scan(
+                targets=["example.com"],
+                include=["emit_html", "url_extract"],
+                module_config={"url_extract": {}},
+                settings={"forbidden_domains": []},
+            )
+        self.assertEqual(called, [], "父目录推导发了请求")
 
 
 if __name__ == "__main__":

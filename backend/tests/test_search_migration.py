@@ -36,9 +36,11 @@ from .pgutil import (  # noqa: E402
 from .test_m5 import WebTestCase  # noqa: E402
 
 #: 资产表上都挂着这个外键（``scan_id REFERENCES scan(id) ON DELETE CASCADE``）。
-#: 见 TestSearchSurvivesDeletedFirstDiscoverer 的说明：它和迁移文档写的
-#: "删扫描 → 资产本身留着"是矛盾的，所以有两条测试要先把它摘掉，才能到达
-#: 迁移文档描述的那个状态。
+#:
+#: 这是**产品语义本身**，不是遗留：任务是主，删扫描 = 删掉它带出的全部资产
+#: （见 schema.sql 的「ON DELETE 语义」段）。下面那条测试要先把它摘掉，是为了
+#: 人工造出"资产行在、scan 行不在"这个正常路径到不了的状态，单独验证查询层
+#: 不会因此把资产藏起来。
 _DOMAIN_SCAN_FK = "domain_scan_id_fkey"
 
 HOST = "a.example.com"
@@ -179,18 +181,27 @@ class TestSearchUrlEndpointJoin(_RealDatabase):
 
 
 class TestSearchSurvivesDeletedFirstDiscoverer(_RealDatabase):
-    """资产不能因为"首个发现者那次扫描被删了"就从搜索里消失。
+    """资产行还在、但 ``scan`` 行没了时，搜索**不能**把它藏起来。
+
+    ## 这条测试现在测的是什么
+
+    产品语义是**任务为王**：删扫描 = 删掉它带出的全部资产
+    （见 ``schema.sql`` 的「ON DELETE 语义」段与
+    ``PostgresStorage.delete_scan``）。所以"删掉首个发现者那次扫描、资产
+    还在"这个状态**正常路径下到不了** —— ``delete_scan`` 会把两者一起删。
+
+    留这条是为了钉住**查询层**的性质：万一将来出现"资产行在、scan 行不在"
+    的数据（手工改库、从旧备份导入、``ON DELETE SET NULL`` 化），
+    ``search_assets`` 也不能因为 LEFT JOIN 拿不到 scan 行就把资产藏起来 ——
+    那是静默丢数据。
 
     ## ⚠️ 这条测试为什么先摘外键
 
-    迁移文档（``schema.sql`` 的「ON DELETE 语义」段）写得明确：**删扫描 → 删掉
-    "这次看到了什么"的记录，资产本身留着**。但资产表上的 ``scan_id`` 外键**还是**
-    ``ON DELETE CASCADE``（迁移前的遗留），于是今天删扫描会把资产行一起删掉 ——
-    "孤儿资产行"根本出现不了，``JOIN`` 与 ``LEFT JOIN`` 的结果也就没有区别。
-
-    所以这里先 ``DROP CONSTRAINT`` 到达**文档描述的那个状态**，再钉住
-    ``search_assets`` 这一层的行为：只要资产行还在，搜索就不能因为 ``scan``
-    行没了而把它藏起来（那正是迁移要干的事 —— 资产跨扫描长期存在）。
+    资产表上的 ``scan_id`` 外键是 ``ON DELETE CASCADE``，正常删扫描时资产会
+    跟着没，压根到不了这里要测的状态。所以先 ``DROP CONSTRAINT`` 人工造出
+    那个状态，再断言搜索行为。**这也是它当年被写出来的原因** —— 那时文档
+    写的是"资产本身留着"，与外键矛盾（见 git 历史）；现在文档已改成"任务为
+    王"，矛盾消除，但查询层这条性质仍然值得钉住。
     """
 
     async def test_asset_is_still_searchable_after_its_scan_is_deleted(self) -> None:

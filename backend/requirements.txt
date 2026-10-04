@@ -1,4 +1,8 @@
 asyncpg>=0.29
+httpx>=0.27.0
+# HTTP/2 支持（httpx 的 http2 依赖）。brotli 配合 httpx 自动处理压缩。
+# 如只需 HTTP/1.1 可以只装 httpx。
+httpx[http2,brotli]>=0.27.0
 dnspython>=2.2
 PyYAML>=6.0
 rich>=13.0

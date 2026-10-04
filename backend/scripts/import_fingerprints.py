@@ -40,6 +40,12 @@ _RANGE_TOTAL = re.compile(r"/(\d+)\s*$")
 #: **安静地重试 25 次然后失败** —— 看不出是"域名不通"还是"网络抖动"。
 #: ``cdn.jsdelivr.net/gh/<owner>/<repo>@<branch>/<path>`` 内容一致、实测可达，
 #: 所以三个地址都换成它。分支要写进路径（``@main``），不留默认分支。
+#:
+#: ⚠️ **2026-10 复测：jsDelivr 自己在这台机器上也连不上了**
+#: （``urllib`` 报 ``SSL: UNEXPECTED_EOF_WHILE_READING``，``curl.exe`` 报
+#: ``schannel: failed to receive handshake``），而 ``git clone`` 仍然通。
+#: 本脚本**没有** git 回退，所以在这台机器上只会静默重试到失败。
+#: 同期的 ``import_dirmap_dicts.py`` 加了 git 回退，可作改造参考。
 SOURCES = {
     "fh": {
         "name": "FingerprintHub (0x727)",

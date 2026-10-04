@@ -79,16 +79,26 @@ class WebTestCase(unittest.TestCase):
             return {"Authorization": f"Bearer {self.AUTH_TOKEN}"}
         return {}
 
-    def start(self, targets: list[str], preset: str | None = None) -> dict:
-        resp = self.client.post(
-            "/api/scans",
-            json={
-                "targets": targets,
-                "preset": preset or str(self.preset_path),
-                "overrides": [],
-            },
-            headers=self.h(),
-        )
+    def start(
+        self,
+        targets: list[str],
+        preset: str | None = None,
+        name: str | None = "测试任务",
+    ) -> dict:
+        """下发一次扫描。
+
+        ``name`` 默认给一个 —— 名称是**必填**的（见 ``TestScanName``），
+        但绝大多数用例不关心它，不该每处都手写一遍。
+        """
+        body: dict = {
+            "targets": targets,
+            "preset": preset or str(self.preset_path),
+            "overrides": [],
+        }
+        # ``name=None`` 是**故意不发这个字段**，用来测"缺名称应当被拒"
+        if name is not None:
+            body["name"] = name
+        resp = self.client.post("/api/scans", json=body, headers=self.h())
         self.assertEqual(resp.status_code, 201, resp.text)
         return resp.json()
 
@@ -102,6 +112,102 @@ class WebTestCase(unittest.TestCase):
         raise AssertionError(f"扫描 #{scan_id} 未在 {timeout}s 内结束")
 
 
+class TestScanName(WebTestCase):
+    """任务名称：**必填**，且三条读路径都要带出来。
+
+    为什么必填：它在「任务管理」和「任务分组」里都是主要标识 —— 分组同步要靠
+    名字挑"把哪次扫描同步进来"（见 AssetGroupView 的同步下拉）。留空如果只是
+    存个空串，界面上就多出一批分不清的任务。
+
+    两条读路径必须分别测：进程内的那份走 ``ManagedScan.to_dict()``，
+    服务重启后从库里拼的那份走 ``_historical_scan()`` —— 是两段代码。
+    """
+
+    def test_name_round_trips_through_all_three_paths(self) -> None:
+        record = self.start(["example.com"], name="每月巡检 · 主站")
+        self.assertEqual(record["name"], "每月巡检 · 主站", "创建响应里没名字")
+
+        scan_id = record["scan_id"]
+        detail = self.wait_done(scan_id)
+        self.assertEqual(detail["name"], "每月巡检 · 主站", "详情里没名字")
+
+        listed = {
+            s["scan_id"]: s
+            for s in self.client.get("/api/scans", headers=self.h()).json()
+        }
+        self.assertEqual(listed[scan_id]["name"], "每月巡检 · 主站", "列表里没名字")
+
+    def test_missing_name_is_rejected(self) -> None:
+        """**不发 name 字段 = 422**，而不是默默建一个没名字的任务。"""
+        resp = self.client.post(
+            "/api/scans",
+            json={"targets": ["example.com"], "preset": str(self.preset_path)},
+            headers=self.h(),
+        )
+        self.assertEqual(resp.status_code, 422, resp.text)
+
+    def test_blank_name_is_rejected(self) -> None:
+        """纯空白也不算填了 —— ``min_length=1`` 拦不住 ``"   "``，由 validator 拦。"""
+        for blank in ("", "   ", "\t\n"):
+            with self.subTest(blank=repr(blank)):
+                resp = self.client.post(
+                    "/api/scans",
+                    json={
+                        "name": blank,
+                        "targets": ["example.com"],
+                        "preset": str(self.preset_path),
+                    },
+                    headers=self.h(),
+                )
+                self.assertEqual(resp.status_code, 422, resp.text)
+
+    def test_overlong_name_is_rejected(self) -> None:
+        """名称是给人看的标签，不是塞大文本的地方（上限 120）。"""
+        resp = self.client.post(
+            "/api/scans",
+            json={
+                "name": "长" * 121,
+                "targets": ["example.com"],
+                "preset": str(self.preset_path),
+            },
+            headers=self.h(),
+        )
+        self.assertEqual(resp.status_code, 422, resp.text)
+
+    def test_manager_also_refuses_blank_name(self) -> None:
+        """第二道闸门：绕过 HTTP 直接调 ``manager.start()`` 也拒。
+
+        API 层与 manager 层都拦，任何新入口都不会悄悄漏掉名称。
+        """
+        import asyncio
+
+        manager = self.client.app.state.manager
+
+        async def go() -> None:
+            with self.assertRaises(ValueError):
+                await manager.start(name="   ", targets=["example.com"])
+
+        asyncio.run(go())
+
+    def test_name_shows_up_in_historical_view(self) -> None:
+        """服务重启后从库里拼的那一份（``_historical_scan``）也要带名字。"""
+        record = self.start(["example.com"], name="hist")
+        self.wait_done(record["scan_id"])
+        # 丢掉内存记录 → 强制走"历史扫描"分支。
+        # ``forget`` 是同步的，所以不会踩 pgutil 里那个"跨事件循环用连接"的坑。
+        self.client.app.state.manager.forget(record["scan_id"])
+        detail = self.client.get(
+            f"/api/scans/{record['scan_id']}", headers=self.h()
+        ).json()
+        self.assertTrue(detail.get("historical"), "没走到历史扫描分支")
+        self.assertEqual(detail["name"], "hist")
+
+    def test_name_is_stripped(self) -> None:
+        """首尾空白去掉再存 —— 否则列表里会出现"看不见的空格差异"。"""
+        record = self.start(["example.com"], name="  月度巡检  ")
+        self.assertEqual(record["name"], "月度巡检")
+
+
 class TestMetaEndpoints(WebTestCase):
     def test_health(self) -> None:
         data = self.client.get("/api/health").json()
@@ -110,17 +216,28 @@ class TestMetaEndpoints(WebTestCase):
 
     def test_presets_include_builtins(self) -> None:
         names = {p["name"] for p in self.client.get("/api/presets").json()}
-        for expected in ("default", "passive", "brute", "active"):
-            self.assertIn(expected, names)
+        # 只剩两个模式：被动 / 主动
+        self.assertEqual(names, {"passive", "active"})
 
     def test_modules_for_preset(self) -> None:
         data = self.client.get("/api/modules", params={"preset": "passive"}).json()
         names = {m["name"] for m in data["modules"]}
         self.assertIn("passive_crtsh", names)
-        # passive 只允许 passive 模块
+        # 判据是"有没有探测流量"，不是"模块自称 passive" ——
+        # dns_resolve 的 flags 是 ("active","safe")，但它不发探测流量，
+        # 所以必须在。写成 require_flags:[passive] 会把它连带 ip_ptr /
+        # tls_cert / admin_plane 一起砍掉。
+        self.assertIn("dns_resolve", names)
+        self.assertIn("ip_ptr", names)
+        # 而真正会发探测流量的一个都不该在
+        for module in ("port_scan", "http_probe", "dir_brute", "dns_brute"):
+            self.assertIn(module, data["skipped"], f"{module} 不该在 passive 里跑")
+        # 兜底：列表里不该出现任何带 loud/invasive/heavy 的模块
         for m in data["modules"]:
-            self.assertIn("passive", m["flags"])
-        self.assertIn("dns_resolve", data["skipped"])
+            self.assertFalse(
+                {"loud", "invasive", "heavy", "metered"} & set(m["flags"]),
+                f"{m['name']} 带探测流量标签，却在 passive 预设里",
+            )
 
     def test_static_frontend_is_served(self) -> None:
         """前端是独立的 Vue 工程，后端只托管它的构建产物。
@@ -314,7 +431,13 @@ class TestSourceKeySettings(WebTestCase):
         # 免 key 的源不能被标成需要 key
         self.assertNotIn("passive_crtsh", needing)
 
-    def test_key_is_stored_but_never_echoed(self) -> None:
+    def test_key_is_echoed_back_for_editing(self) -> None:
+        """源 API Key **明文回显**，好让设置页能显示、复制、在原值上改。
+
+        与 ``auth_token`` 的纪律不同（那个永不回传，只给 ``auth_token_set``）：
+        Key 只回传"已设置"的话，用户看不出自己配的是哪个账号的 Key，
+        也没法在原值上改一个字符 —— 只能整条重填。
+        """
         resp = self.client.put(
             "/api/settings",
             json={"max_concurrent_scans": 2,
@@ -322,11 +445,15 @@ class TestSourceKeySettings(WebTestCase):
             headers=self.h(),
         )
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertNotIn("SECRET-XYZ", resp.text, "PUT 的响应里回显了密钥")
+        self.assertEqual(
+            resp.json()["source_keys"], {"passive_fofa": "SECRET-XYZ"},
+            "PUT 的响应里没带回明文 Key，前端就没法回显",
+        )
+        # "已设置"列表继续保留：前端用它判断哪些源配过（回显值缺失时的兜底）
         self.assertEqual(resp.json()["source_keys_set"], ["passive_fofa"])
 
         got = self.client.get("/api/settings", headers=self.h())
-        self.assertNotIn("SECRET-XYZ", got.text, "GET 的响应里回显了密钥")
+        self.assertEqual(got.json()["source_keys"], {"passive_fofa": "SECRET-XYZ"})
         self.assertEqual(got.json()["source_keys_set"], ["passive_fofa"])
 
     def test_key_is_persisted_for_the_next_scan(self) -> None:
@@ -536,7 +663,7 @@ class TestAuditLevels(WebTestCase):
         """active 预设含主动模块，审计必须标成 active（这是分级审计的意义）。"""
         resp = self.client.post(
             "/api/scans",
-            json={"targets": ["example.com"], "preset": "active",
+            json={"name": "分级审计 · active", "targets": ["example.com"], "preset": "active",
                   "overrides": ["modules.dns_brute.max_words=1",
                                 "modules.port_scan.ports=top10",
                                 "modules.asn_enrich.qps=0"]},

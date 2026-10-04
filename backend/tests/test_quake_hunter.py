@@ -38,18 +38,26 @@ from .base import EngineTestCase  # noqa: E402
 
 
 class _FakeResponse:
-    """够用的 aiohttp 响应替身（Quake 走 ``request()``，拿的是原始响应）。"""
+    """够用的 **httpx** 响应替身（Quake 走 ``request()``，拿的是原始响应）。
+
+    ⚠️ 刻意照 httpx 的真实形状来：``status_code``、``text`` 是**属性**（不是协程）、
+    收尾用 ``await aclose()``。迁移到 httpx 时若这里仍保留 aiohttp 的
+    ``status`` / ``await text()`` / ``release()``，测试就是在替一个不存在的接口
+    背书 —— ``services/http.py`` 里 ``async with response`` 那个 bug 正是这样
+    被一直罩住的（生产早坏了，测试还是绿的）。
+    """
 
     def __init__(self, status: int, text: str) -> None:
-        self.status = status
+        self.status_code = status
         self._text = text
-        self.released = False
+        self.closed = False
 
-    async def text(self) -> str:
+    @property
+    def text(self) -> str:
         return self._text
 
-    def release(self) -> None:
-        self.released = True
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 # ══════════════════════════════════════════════════════════════════════ Quake
@@ -89,8 +97,8 @@ class TestQuakeAuthFailure(unittest.TestCase):
         self.assertNotIn("JSONDecodeError", msg)
         self.assertIn("api_key", msg, "没告诉用户该去检查什么")
 
-    def test_releases_the_response(self) -> None:
-        """``request()`` 拿到的是原始响应，不 release 会漏连接。"""
+    def test_closes_the_response(self) -> None:
+        """``request()`` 拿到的是原始响应，不收尾会漏连接。"""
         import asyncio
 
         captured: list[_FakeResponse] = []
@@ -109,7 +117,7 @@ class TestQuakeAuthFailure(unittest.TestCase):
                         pass
 
         asyncio.run(go())
-        self.assertTrue(captured and captured[0].released, "响应没被 release")
+        self.assertTrue(captured and captured[0].closed, "响应没被 aclose")
 
     def test_non_json_body_is_reported_clearly(self) -> None:
         import asyncio

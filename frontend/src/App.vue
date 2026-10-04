@@ -70,6 +70,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   AppstoreOutlined,
+  ClusterOutlined,
   DatabaseOutlined,
   DeploymentUnitOutlined,
   MenuFoldOutlined,
@@ -111,6 +112,7 @@ const router = useRouter()
 const menuItems = [
   { key: 'task', label: '任务管理', icon: AppstoreOutlined, path: '/taskList' },
   { key: 'assets', label: '资产管理', icon: DatabaseOutlined, path: '/assets' },
+  { key: 'asset-groups', label: '资产分组', icon: ClusterOutlined, path: '/asset-groups' },
   { key: 'fingerprints', label: '指纹库', icon: DeploymentUnitOutlined, path: '/fingerprints' },
 ]
 

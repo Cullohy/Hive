@@ -627,12 +627,12 @@ class TestPresetHygiene(EngineTestCase):
         self.assertFalse(preset.module_config["port_scan"].get("allow_private", False))
         self.assertEqual(preset.config_for("port_scan")["ports"], "top100")
 
-    def test_default_preset_does_not_run_port_scan(self) -> None:
-        preset = Preset.load_builtin("default")
+    def test_passive_preset_does_not_run_port_scan(self) -> None:
+        preset = Preset.load_builtin("passive")
         # port_scan / http_probe 是 loud, 应被 deny_flags 挡掉
         self.assertFalse(preset.allows("port_scan", ("active", "loud")))
         self.assertFalse(preset.allows("http_probe", ("active", "loud")))
-        # 内网闸门相关的模块配置不该在 default 里被打开
+        # 内网闸门相关的开关不该在 passive 里被打开
         self.assertNotIn("allow_private", preset.settings)
 
 
@@ -696,6 +696,156 @@ class TestFaviconHash(unittest.TestCase):
                 self.tls.favicon_hash(b"b")
                 self.tls.favicon_hash(b"c")
         self.assertEqual(len(captured.output), 1, f"告警刷屏: {captured.output}")
+
+
+class TestUpstreamErrorPorts(EngineTestCase):
+    """**非 HTTP 端口上的 502/503/504 不得被记成活端点。**
+
+    ## 背景
+
+    本机所有出站都走本地代理（``127.0.0.1:7897``），而代理对任何非 HTTP 端口
+    一律回 502 —— 那是**一个完全合法的 HTTP 响应**。于是朴素的探活判据
+    （"没抛异常就算活"）会把 SMTP/POP3/MySQL/Redis 全部记成活端点，
+    界面上出现"Redis 6379 是一个存活的 HTTP 服务"。
+
+    实测（sinosoft.com.cn，2026-10-03）134 个探活 URL 里有 43 个落在非 HTTP
+    端口上，全是这类 502。而资产库的 ``live`` 判据就是 ``http_endpoint``
+    表里有没有这一行（``storage/postgres.py::_LIVE_MATCH``），所以在这里拦下
+    就等于把污染挡在源头。
+
+    ## 为什么不能一刀切所有 502
+
+    真的挂掉的站点也回 502/503/504，那**值得记录**。区分靠端口：
+    非标准端口 → 那端口压根不跑 HTTP；标准端口 → 站点自己的问题，照记。
+    """
+
+    def _responder(self, url: str):
+        """非 HTTP 端口回 502（模拟代理拒绝），标准端口回 200。"""
+        if url.endswith("/favicon.ico"):
+            return FetchResult(url=url, status=200, text="")
+        if ":25" in url or ":6379" in url or ":110" in url:
+            return FetchResult(url=url, status=502, text="", history=[], elapsed=0.01)
+        return FetchResult(
+            url=url, status=200,
+            headers={"server": "nginx/1.24.0"},
+            text="<html><head><title>Real</title></head><body>x</body></html>",
+            history=[], elapsed=0.01,
+        )
+
+    async def _run(self, ports: list[int], **cfg):
+        self.add_module_file("emit_ips", EMIT_IPS)
+        module_cfg = {"schemes": ["http"], "prefer_https": False, "fetch_favicon": False}
+        module_cfg.update(cfg)
+        with mock.patch.object(ConnectScanner, "scan", make_fake_scan({REAL_IP: ports})), \
+             mock.patch.object(HTTPClient, "fetch", make_fake_fetch(self._responder)):
+            scanner, _ = await self.run_scan(
+                targets=["example.com"],
+                include=["emit_ips", "port_scan", "http_probe"],
+                module_config={"port_scan": {"ports": "full"}, "http_probe": module_cfg},
+            )
+        return scanner
+
+    async def test_non_http_port_with_502_is_not_recorded(self) -> None:
+        """25 / 6379 / 110 三个端口回 502 → ``http_endpoint`` 里一行都不该有。"""
+        scanner = await self._run([25, 110, 6379])
+        endpoints = await self.storage.endpoints(scanner.scan_id)
+        self.assertEqual(
+            endpoints, [],
+            f"非 HTTP 端口被记成活端点了：{[e['url'] for e in endpoints]}",
+        )
+
+    async def test_standard_port_with_502_is_still_recorded(self) -> None:
+        """**标准端口**上的 502 是站点自己的问题，必须记（并打 weak 标签）。
+
+        这是"不一刀切"的那一半：全挡掉会把真的故障站点从资产库里抹掉。
+        """
+        def bad_site(url: str):
+            if url.endswith("/favicon.ico"):
+                return FetchResult(url=url, status=200, text="")
+            return FetchResult(url=url, status=503, text="", history=[], elapsed=0.01)
+
+        self.add_module_file("emit_ips", EMIT_IPS)
+        with mock.patch.object(ConnectScanner, "scan", make_fake_scan({REAL_IP: [8080]})), \
+             mock.patch.object(HTTPClient, "fetch", make_fake_fetch(bad_site)):
+            scanner, _ = await self.run_scan(
+                targets=["example.com"],
+                include=["emit_ips", "port_scan", "http_probe"],
+                module_config={
+                    "port_scan": {"ports": "full"},
+                    "http_probe": {
+                        "schemes": ["http"], "prefer_https": False,
+                        "fetch_favicon": False,
+                    },
+                },
+            )
+
+        endpoints = await self.storage.endpoints(scanner.scan_id)
+        self.assertEqual(len(endpoints), 1, "标准端口上的 503 不该被丢掉")
+        self.assertEqual(endpoints[0]["status"], 503)
+
+    async def test_mixed_ports_keep_only_the_real_ones(self) -> None:
+        """混合场景：非 HTTP 端口挡掉、真站点照记。"""
+        scanner = await self._run([25, 6379, 80])
+        urls = {e["url"] for e in await self.storage.endpoints(scanner.scan_id)}
+        self.assertEqual(urls, {"http://example.com"}, f"实际记了：{urls}")
+
+    async def test_switch_can_be_turned_off(self) -> None:
+        """``reject_upstream_errors=False`` 回到旧行为 —— 开关必须真的有效。
+
+        留着它是为了可对比：万一将来直连（不经代理），非标准端口上的 502
+        可能有别的含义，能一条配置切回去看。
+        """
+        scanner = await self._run([25], reject_upstream_errors=False)
+        endpoints = await self.storage.endpoints(scanner.scan_id)
+        self.assertTrue(
+            endpoints, "开关关掉后不该拦截（否则这条配置形同虚设）"
+        )
+
+    def test_port_classification_covers_the_usual_suspects(self) -> None:
+        from core.domains.probe.http_probe import _port_should_serve_http
+
+        for port in (25, 110, 143, 3306, 6379, 22, 587, 465):
+            self.assertFalse(
+                _port_should_serve_http(port), f"{port} 不是 HTTP 端口"
+            )
+        for port in (80, 443, 3000, 5000, 8000, 8008, 8080, 8081, 8443, 8888):
+            self.assertTrue(_port_should_serve_http(port), f"{port} 应该是 HTTP 端口")
+
+    def test_upstream_error_detection(self) -> None:
+        from core.util.net import is_upstream_error
+
+        for status in (502, 503, 504):
+            self.assertTrue(is_upstream_error(status), str(status))
+        for status in (200, 301, 401, 403, 404, 500, 501):
+            self.assertFalse(is_upstream_error(status), str(status))
+        self.assertFalse(is_upstream_error(None), "None 不是上游错误")
+
+    def test_skip_reason_distinguishes_port_from_upstream(self) -> None:
+        """两种 502 必须**说不同的话**。
+
+        把"上游不可达"说成"端口不是 HTTP 服务"会让用户去换端口，
+        而真正要做的其实是换个网络环境或确认站点是否存活。
+        """
+        from core.util.net import describe_upstream_error
+
+        non_std = describe_upstream_error(3306)
+        self.assertIn("不提供 HTTP", non_std)
+
+        for port in (None, 80, 443, 8080):
+            text = describe_upstream_error(port)
+            self.assertIn("上游不可达", text, f"端口 {port}")
+            self.assertNotIn("不提供 HTTP 服务", text, f"端口 {port} 的说法错了")
+
+    def test_soft404_and_http_probe_share_one_constant(self) -> None:
+        """两处判的是**同一件事**，必须同源。
+
+        各自写一份迟早会对不上，而对不上的后果是"前面放行、后面拦截"的
+        半吊子状态 —— 资产库里留下污染行，字典又不跑。
+        """
+        from core.domains.fuzz._lib import soft404
+        from core.util.net import UPSTREAM_ERROR_STATUS
+
+        self.assertIs(soft404.UPSTREAM_ERROR_STATUS, UPSTREAM_ERROR_STATUS)
 
 
 if __name__ == "__main__":

@@ -302,16 +302,15 @@ class TestNotifyHub(unittest.IsolatedAsyncioTestCase):
         sent: list[str] = []
 
         class FakeResponse:
-            status = 200
+            """httpx 形状：``status_code``、同步 ``json()``、``await aclose()``。"""
 
-            async def __aenter__(self):
-                return self
+            status_code = 200
 
-            async def __aexit__(self, *exc):
-                return False
-
-            async def json(self, content_type=None):
+            def json(self):
                 return {"errcode": 0}
+
+            async def aclose(self):
+                return None
 
         async def fake_request(self, method, url, **kwargs):
             sent.append(url)
@@ -433,7 +432,7 @@ class TestMonitorScheduler(DiffTestCase):
 
     async def test_trigger_failure_backs_off(self) -> None:
         """并发打满时不该每个 tick 都撞一次。"""
-        await self.storage.create_monitor(name="m4", targets=["example.com"], preset="default")
+        await self.storage.create_monitor(name="m4", targets=["example.com"], preset="passive")
         hub = NotifyHub(NotifyConfig())
         scheduler = await self._scheduler(hub)
         scheduler.manager.max_concurrent = 0  # 强制触发 RuntimeError
@@ -722,6 +721,265 @@ class TestScreenshotProjection(DiffTestCase):
         self.assertIsNone(
             await self.storage.screenshot_blob(scan_id, "http://nope.invalid/")
         )
+
+
+class TestNoiseFindings(DiffTestCase):
+    """截图流水账不该出现在"发现"里。
+
+    ## 为什么要单独一组
+
+    截图模块改过设计：现在直接写 ``http_endpoint.screenshot_data``，**不发
+    FINDING**。但老版本发过，一条 ``kind='screenshot'``、``detail`` 是
+    ``14/9ef6512….png``。这些行留在库里会淹没真正的结论 —— 实测一次
+    qq.com 扫描 1,951 条 finding 里 **1,398 条（72%）**是它。
+
+    读侧已经到处排除（见 ``core/storage/postgres.py`` 的 ``_NOISE_KINDS``），
+    这里钉的是**五个出口一个都不许漏** —— 加新的读取点时忘了排除，
+    用户就会在某个页面又看到一堆 ``screenshot``。
+    """
+
+    async def _seed_noise(self) -> int:
+        """造一次扫描，同时塞进一条真结论和一条历史遗留的截图 finding。"""
+        scan_id = await self.storage.create_scan(targets=["example.com"], preset="t")
+        for event in (
+            ev(EventType.DNS_NAME, "www.example.com", source="brute"),
+            ev(EventType.FINDING, "www.example.com", kind="cdn",
+               detail="命中 CDN: 又拍云", severity="info"),
+        ):
+            await self.storage.save_event(scan_id, event)
+            await self.storage.project(scan_id, event)
+        # 绕过 ``project()`` 直接塞 —— 现在的代码路径**已经产不出**这种行，
+        # 要复现历史数据只能手写（也正因为产不出，这里用底层 SQL）。
+        await self.storage.conn.execute(
+            "INSERT INTO finding (scan_id, kind, severity, target, detail,"
+            " created_at) VALUES (?, 'screenshot', 'info', 'http://www.example.com',"
+            " '14/9ef6512da2e2e714.png', ?)",
+            (scan_id, "2026-01-01T00:00:00+00:00"),
+        )
+        return scan_id
+
+    async def test_findings_reader_hides_screenshot(self) -> None:
+        scan_id = await self._seed_noise()
+        rows = await self.storage.findings(scan_id, limit=1000)
+        self.assertEqual(
+            [r["kind"] for r in rows], ["cdn"],
+            f"findings() 还在返回截图流水账: {rows}",
+        )
+
+    async def test_summary_card_matches_the_tab(self) -> None:
+        """任务详情页的「发现」卡片读 ``summary()``，页签读 ``findings()``。
+
+        两者口径必须一致 —— 否则卡片写 430、页签列 3 条，
+        用户会以为还有 427 条没加载出来。
+        """
+        scan_id = await self._seed_noise()
+        self.assertEqual(
+            (await self.storage.summary(scan_id))["findings"],
+            len(await self.storage.findings(scan_id, limit=1000)),
+        )
+
+    async def test_flat_search_hides_screenshot(self) -> None:
+        """资产库那张合并表走 ``search_flat``，是另一个 WHERE 拼装点。"""
+        scan_id = await self._seed_noise()
+        res = await self.storage.search_flat(
+            "example.com", types=["findings"], scan_id=scan_id, live=False,
+        )
+        self.assertNotIn(
+            "screenshot", {r["kind"] for r in res["rows"]},
+            f"合并表里还有截图 finding: {res['rows']}",
+        )
+        self.assertEqual(res["total"], 1, f"total 也没排除: {res['total']}")
+
+    async def test_typed_search_hides_screenshot(self) -> None:
+        """``search_assets`` 是第四个拼装点（分类型搜索接口用它）。"""
+        scan_id = await self._seed_noise()
+        hits = await self.storage.search_assets(
+            "example.com", types=["findings"], scan_id=scan_id, live=False,
+        )
+        self.assertNotIn(
+            "screenshot", {r["kind"] for r in hits["findings"]},
+            f"分类型搜索里还有截图 finding: {hits}",
+        )
+
+    async def test_host_detail_hides_screenshot(self) -> None:
+        """抽屉里的「发现」区块走 ``host_detail``，第五个拼装点。"""
+        await self._seed_noise()
+        detail = await self.storage.host_detail("www.example.com")
+        self.assertNotIn(
+            "screenshot", {f["kind"] for f in detail["findings"]},
+            f"主机详情里还有截图 finding: {detail['findings']}",
+        )
+
+    async def test_global_stats_matches_the_table(self) -> None:
+        """概览的「发现」数与库里真结论数必须一致。"""
+        await self._seed_noise()
+        self.assertEqual((await self.storage.global_stats())["findings"], 1)
+
+    async def test_purge_drops_legacy_rows_on_open(self) -> None:
+        """``open()`` 自带清理 —— 备份恢复 / 换机器时这些行会回来。"""
+        scan_id = await self._seed_noise()
+        self.assertEqual(
+            await self.storage._purge_noise_findings(), 1,
+            "清理没有删掉历史遗留的截图 finding",
+        )
+        # 再跑一次必须是 0（幂等），否则每次启动都在做无用功
+        self.assertEqual(await self.storage._purge_noise_findings(), 0)
+        # 真结论一条都不能少
+        self.assertEqual(
+            [r["kind"] for r in await self.storage.findings(scan_id, limit=10)], ["cdn"],
+        )
+
+
+class TestScanDeleteCascade(DiffTestCase):
+    """删任务 = 删掉这次扫描牵出的**全部**数据，不留悬挂引用。
+
+    ## 语义
+
+    「任务是主」：删掉扫描，``domain / ip / port / url / http_endpoint /
+    technology`` 里 ``scan_id`` 是它的行、以及 ``event / finding / scan_asset``，
+    全部消失。审计日志保留（留痕）。
+
+    ## 真正难的是"没外键的那几张表"
+
+    资产是跨扫描去重的：一个域名被两次扫描都看到，只存**一行**、``scan_id``
+    记的是首个发现者。于是删掉首个发现者那次的扫描时，**另一次**扫描在
+    ``scan_asset`` 里的关联行会指向已经不存在的资产 —— 而 ``scan_asset``
+    自己没被删（它属于那次幸存的扫描）。
+
+    这类引用没有外键，CASCADE 管不到。实测旧实现在真实库上删 #13 会残留
+    **348** 条、删 #10 残留 **67** 条悬空的关联记录 —— 症状是资产列表里
+    莫名其妙多出几条点开是空的行。
+    """
+
+    async def _scan_with_asset(self, name: str = "shared.example.com") -> int:
+        """一次扫描：DNS + IP + 端口 + 端点 + URL + 技术栈 + 发现，全套。"""
+        scan_id = await self.storage.create_scan(targets=[name], preset="t")
+        for event in (
+            ev(EventType.DNS_NAME, name, source="brute"),
+            ev(EventType.IP_ADDRESS, "1.1.1.1"),
+            ev(EventType.OPEN_TCP_PORT, "1.1.1.1:80", ip="1.1.1.1", port=80),
+            ev(EventType.HTTP_RESPONSE, f"http://{name}",
+               url=f"http://{name}", domain=name, ip="1.1.1.1", port=80,
+               scheme="http", status=200, title="T"),
+            ev(EventType.URL, f"http://{name}/x", domain=name),
+            ev(EventType.TECHNOLOGY, name, name="Nginx"),
+            ev(EventType.FINDING, name, kind="cdn", severity="info"),
+        ):
+            await self.storage.save_event(scan_id, event)
+            await self.storage.project(scan_id, event)
+        return scan_id
+
+    async def _c(self, sql: str, params=()) -> int:
+        cur = self.storage.conn.execute(sql, params)
+        return int((await cur.fetchone())[0])
+
+    async def test_assets_owned_by_the_scan_all_disappear(self) -> None:
+        scan_id = await self._scan_with_asset()
+        self.assertTrue(await self.storage.delete_scan(scan_id))
+
+        for table in ("event", "finding", "domain", "ip", "port", "url",
+                      "http_endpoint", "technology", "scan_asset"):
+            with self.subTest(table=table):
+                self.assertEqual(
+                    await self._c(f"SELECT COUNT(*) FROM {table}"), 0,
+                    f"{table} 里还有这次扫描的数据",
+                )
+
+    async def test_no_orphan_scan_asset_left_behind(self) -> None:
+        """**别的扫描**对共享资产的关联行必须一起清掉。
+
+        两次扫描都看到 shared.example.com，它只存一行、``scan_id`` 记第一次。
+        删掉第一次之后，第二次的那条关联行不能变成指向空气的孤儿。
+        """
+        first = await self._scan_with_asset()
+        second = await self.storage.create_scan(targets=["other"], preset="t")
+        again = ev(EventType.DNS_NAME, "shared.example.com", source="brute")
+        await self.storage.save_event(second, again)
+        await self.storage.project(second, again)
+
+        self.assertEqual(
+            await self._c("SELECT COUNT(*) FROM scan_asset WHERE scan_id = ?",
+                          (second,)), 1,
+            "前提：第二次扫描确实也关联到了这个域名",
+        )
+
+        await self.storage.delete_scan(first)
+
+        self.assertEqual(
+            await self._c("SELECT COUNT(*) FROM scan_asset"), 0,
+            "共享资产的关联行没跟着清 —— 留下了指向已删资产的孤儿记录",
+        )
+        self.assertEqual(
+            await self._c("SELECT COUNT(*) FROM domain"), 0,
+            "共享域名应该随首个发现者那次扫描一起删（任务是主）",
+        )
+
+    async def test_asset_group_entries_are_cleaned(self) -> None:
+        """资产分组存的是域名字面量，不引 domain.id —— 外键管不到。"""
+        scan_id = await self._scan_with_asset()
+        gid = await self.storage.create_group(
+            name="g1", description="", scopes=["example.com"],
+        )
+        await self.storage.sync_scan_to_group(gid, scan_id)
+        before = await self._c("SELECT COUNT(*) FROM asset_group_asset")
+        self.assertGreater(
+            before, 0, "前提：同步确实把资产收进了组",
+        )
+
+        await self.storage.delete_scan(scan_id)
+
+        self.assertEqual(
+            await self._c("SELECT COUNT(*) FROM asset_group_asset"), 0,
+            f"分组里留下了 {before} 条指向已删资产的条目",
+        )
+        # 分组本身与它的范围不受影响 —— 那是长期配置，不是这次扫描的产物
+        self.assertEqual(await self._c("SELECT COUNT(*) FROM asset_group"), 1)
+        self.assertEqual(await self._c("SELECT COUNT(*) FROM asset_group_scope"), 1)
+
+    async def test_monitor_baseline_and_change_history_are_cleaned(self) -> None:
+        """``change`` / ``monitor.last_scan_id`` 是裸 BIGINT，没有外键。"""
+        scan_id = await self._scan_with_asset()
+        mid = await self.storage.create_monitor(
+            name="m1", targets=["example.com"], preset="t",
+        )
+        await self.storage.conn.execute(
+            "UPDATE monitor SET last_scan_id = ? WHERE id = ?", (scan_id, mid)
+        )
+        await self.storage.conn.execute(
+            "INSERT INTO change (monitor_id, old_scan_id, new_scan_id, target,"
+            " total, created_at) VALUES (?, NULL, ?, 'example.com', 3, '2026-01-01')",
+            (mid, scan_id),
+        )
+
+        await self.storage.delete_scan(scan_id)
+
+        self.assertEqual(
+            await self._c("SELECT COUNT(*) FROM monitor WHERE last_scan_id = ?",
+                          (scan_id,)),
+            0, "monitor 还指着已删的扫描当基线",
+        )
+        self.assertEqual(
+            await self._c("SELECT COUNT(*) FROM monitor"), 1, "监控本身不该被删")
+        self.assertEqual(
+            await self._c("SELECT COUNT(*) FROM change"), 0,
+            "拿已删扫描当基线的变更记录没清掉",
+        )
+
+    async def test_audit_log_is_kept(self) -> None:
+        """审计是留痕，不该因为删任务而消失（schema 里是 ON DELETE SET NULL）。"""
+        scan_id = await self._scan_with_asset()
+        await self.storage.record_audit(
+            action="scan_start", actor="web", target="example.com",
+            scan_id=scan_id,
+        )
+        await self.storage.delete_scan(scan_id)
+        self.assertEqual(
+            await self._c("SELECT COUNT(*) FROM audit"), 1,
+            "删任务把审计日志也删了 —— 留痕就没了",
+        )
+        # scan_id 置空而不是留下悬空引用
+        self.assertEqual(
+            await self._c("SELECT COUNT(*) FROM audit WHERE scan_id IS NOT NULL"), 0)
 
 
 class TestEnvironmentGuards(unittest.TestCase):

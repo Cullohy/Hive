@@ -11,6 +11,26 @@
     @update:open="$emit('update:open', $event)"
   >
     <a-form layout="vertical" style="margin-bottom: 0">
+      <a-form-item required>
+        <template #label>
+          任务名称
+          <a-tooltip
+            title="必填。会显示在「任务管理」与「任务分组」里 —— 分组同步就是按名字挑哪次扫描。只是标签：不参与扫描逻辑，也允许重名（每月都叫「月度巡检」没问题）。"
+          >
+            <QuestionCircleOutlined class="tk-muted" />
+          </a-tooltip>
+        </template>
+        <a-input
+          v-model:value="name"
+          :maxlength="120"
+          placeholder="例如：每月巡检 · 主站"
+          allow-clear
+        />
+        <div class="tk-muted name-hint">
+          必填。「任务管理」和「任务分组」都用它标识这次扫描。
+        </div>
+      </a-form-item>
+
       <a-form-item label="目标（每行一个根域名或 IP，可含 CIDR）">
         <a-textarea
           v-model:value="targets"
@@ -100,7 +120,11 @@ const props = defineProps({ open: Boolean })
 const emit = defineEmits(['update:open', 'created'])
 
 const targets = ref('')
-const preset = ref('default')
+//: 任务名称。**必填**（后端也强制）—— 任务管理与任务分组都靠它标识一次扫描。
+const name = ref('')
+//: 默认选**被动**。这个工具会向目标发包，默认就该是安全的那一档 ——
+//: 以前叫 `default`，合并成两模式后它的能力被 `passive` 完整吸收了。
+const preset = ref('passive')
 const overrides = ref('')
 const presets = ref([])
 const mode = ref('unknown')
@@ -118,24 +142,36 @@ const meteredChecked = ref([])
 const targetList = computed(() =>
   targets.value.split('\n').map((s) => s.trim()).filter(Boolean),
 )
-const canStart = computed(() => targetList.value.length > 0 && !starting.value)
+const canStart = computed(
+  () => targetList.value.length > 0 && name.value.trim().length > 0 && !starting.value,
+)
 const moduleCount = computed(() => enabledCount.value + meteredChecked.value.length)
 const activeCount = computed(() => activeModules.value.length)
 const loudCount = computed(() => loudModules.value.length)
 
+//: 主动/被动**由预设决定**，不是由模块 flags 推出来的。
+//:
+//: 后端那个 flag 推导出来的 `mode` 现在对 `passive` 也会报 active ——
+//: 因为 DNS 解析 / 证书抓取确实会向目标发包，**报得没错**。但用户选的是
+//: 「预设」，不是「flags 的并集」，在这里显示成"主动模式"只会让人以为自己
+//: 选错了。flag 的真相留给下面的「主动模块 / 高噪声」两个计数去说。
 const modeText = computed(() =>
-  mode.value === 'active' ? '主动模式' : mode.value === 'passive' ? '被动模式' : '未知',
+  preset.value === 'active' ? '主动模式'
+    : preset.value === 'passive' ? '被动模式'
+      : preset.value,
 )
 const modeHint = computed(() => {
-  if (mode.value === 'active') {
+  if (preset.value === 'active') {
     return '会向目标发送 DNS 查询、TCP 连接与 HTTP 请求。请确认你已获得授权。'
   }
-  if (mode.value === 'passive') {
-    return '只查询第三方数据源（证书透明度、公开 DNS 数据集），不直接触碰目标。'
+  if (preset.value === 'passive') {
+    return '不扫端口、不探活、不爆破；只做 DNS 解析 + PTR 反查 + 证书 SAN + 第三方源查询。'
   }
-  return '未能判定。'
+  return '自定义预设：以「启用模块 / 主动模块 / 高噪声」三个计数为准。'
 })
-const modeClass = computed(() => (mode.value === 'active' ? 'is-active' : 'is-passive'))
+const modeClass = computed(() =>
+  preset.value === 'active' ? 'is-active' : preset.value === 'passive' ? 'is-passive' : '',
+)
 
 async function loadPresetInfo() {
   try {
@@ -171,9 +207,16 @@ watch(
 )
 
 async function start() {
+  // 按钮已经被 canStart 禁掉了，这里再兜一道：回车提交 / 程序化调用也拦得住。
+  if (!name.value.trim()) {
+    message.warning('请填写任务名称')
+    return
+  }
   starting.value = true
   try {
     const record = await createScan({
+      // 留空就传空串：后端统一把空串当成"没填"，存 NULL
+      name: name.value.trim(),
       targets: targetList.value,
       preset: preset.value,
       // 勾了的额度源显式启用 —— 不勾就什么都不传，预设默认 deny 掉它们
@@ -198,6 +241,11 @@ async function start() {
 <style scoped>
 .metered-row {
   margin-bottom: 4px;
+}
+/* 必填说明紧贴输入框，别和下一个表单项的间距混在一起 */
+.name-hint {
+  font-size: 12px;
+  margin-top: 4px;
 }
 .metered-name {
   font-family: ui-monospace, monospace;

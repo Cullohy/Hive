@@ -2,8 +2,8 @@ import { createRouter, createWebHistory } from 'vue-router'
 
 const TaskListView = () => import('@/views/TaskListView.vue')
 const TaskDetailView = () => import('@/views/TaskDetailView.vue')
-const AssetSearchView = () => import('@/views/AssetSearchView.vue')
 const AssetView = () => import('@/views/AssetView.vue')
+const AssetGroupView = () => import('@/views/AssetGroupView.vue')
 const FingerprintView = () => import('@/views/FingerprintView.vue')
 
 // 菜单结构对标 ARL：图标 + 中文标签，顺序也保持一致的观感
@@ -24,16 +24,16 @@ const routes = [
     meta: { title: '任务详情', menu: 'task' },
   },
   {
-    path: '/search',
-    name: 'asset-search',
-    component: AssetSearchView,
-    meta: { title: '资产搜索', menu: 'asset-search' },
-  },
-  {
     path: '/assets',
     name: 'assets',
     component: AssetView,
     meta: { title: '资产管理', menu: 'assets' },
+  },
+  {
+    path: '/asset-groups',
+    name: 'asset-groups',
+    component: AssetGroupView,
+    meta: { title: '资产分组', menu: 'asset-groups' },
   },
   {
     path: '/fingerprints',

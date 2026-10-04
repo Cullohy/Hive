@@ -80,10 +80,41 @@ export const screenshotUrl = (relativePath) => `/api/screenshots/${relativePath}
 // ── 全局资产搜索 ─────────────────────────────────────────────────────
 // 同样只搜探活确认过的资产（后端 live 默认 true）。不过滤的话搜 qq.com
 // 会命中 15542 个域名，其中只有 325 个是活的。
-export const searchAssets = (q, type = 'all', limit = 50, scanId) =>
+// filters: 多维筛选数组，格式 [{field, op, value}]，序列化后传给后端
+// groupId: 只看归集到某个分组的资产
+export const searchAssets = (q, type = 'all', limit = 50, scanId, filters = null, groupId = null) =>
   http.get('/api/search', {
-    params: { q, type, limit, ...(scanId ? { scan_id: scanId } : {}) },
+    params: {
+      q,
+      type,
+      limit,
+      ...(scanId ? { scan_id: scanId } : {}),
+      ...(groupId ? { group_id: groupId } : {}),
+      ...(filters && filters.length
+        ? { filters: JSON.stringify(filters) }
+        : {}),
+    },
   })
+
+// ── 单表分页检索（资产管理页那张合并表）────────────────────────────
+// 与 searchAssets 的区别：这里在数据库里 UNION ALL 后统一排序再切页，
+// 拿得到真实的总命中数（searchAssets 那种"每类各取 N 条"拿不到）。
+export const searchAssetsFlat = (q, { type = 'all', limit = 50, offset = 0, filters = null, groupId = null } = {}) =>
+  http.get('/api/search/flat', {
+    params: {
+      q,
+      type,
+      limit,
+      offset,
+      ...(groupId ? { group_id: groupId } : {}),
+      ...(filters && filters.length ? { filters: JSON.stringify(filters) } : {}),
+    },
+  })
+
+// ── 单资产详情（右侧详情面板）────────────────────────────────────────
+// 一次拉完：探测 / 技术栈 / 路径 / 发现 / 溯源，面板不用再发第二个请求
+export const getHostDetail = (host, pathLimit = 200) =>
+  http.get('/api/host', { params: { host, path_limit: pathLimit } })
 
 // ── 资产分组（对应 ARL 的「资产分组」）───────────────────────────────
 // 分组 = 一组范围（主域名 / IP 网段）+ 归集到组里的资产。

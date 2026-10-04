@@ -260,15 +260,24 @@ SEED ────────────────┤                        
 1. `tls_cert` 从证书 SAN 里挖出新域名 → 回到 `dns_resolve` → 又可能扫出新端口和新证书
 2. `asn_enrich` 用"重发同一事件 + 更多标签"的方式补全已有资产（见 §7）
 
-### 主动/被动可选 = 模块 flags
+### 只有两种模式 = 模块 flags
 
 | 预设 | 机制 | 用途 |
 |---|---|---|
-| `passive` | `require_flags: [passive]` | 绝不向目标发包 |
-| `default` | `deny_flags: [loud, invasive]` | 被动收集 + DNS 解析 + CDN 判定 |
-| `brute` | `include: [wildcard_detect, dns_brute, dns_permute, dns_resolve]` | 只补主动面 |
-| `active` | 无过滤 | 全量，含端口扫描与探活 |
-| `demo` | `include: [demo_expand, dns_resolve]` | 离线链路自检 |
+| `passive` | `deny_flags: [loud, invasive, heavy, metered]` | 不发起探测流量：DNS 解析（含 CNAME 链与 CDN 判定）+ PTR + 证书 SAN + 第三方源查询 |
+| `active` | `deny_flags: [metered]` | 全量：泛解析探测、字典爆破、域名置换、端口扫描、HTTP 探活 |
+
+以前是四个预设（`passive` / `default` / `brute` / `active`），差别其实只是
+「拦哪些 flags」的组合 —— 记哪个是哪个比扫描本身还费劲。收敛成两个之后
+语义只有一句话：**passive = 不发探测流量，active = 全量**。
+
+`passive` 刻意**不用** `require_flags: [passive]`：`dns_resolve` 的 flags 是
+`("active", "safe")`，按 require 写会被连带砍掉，连带 `ip_ptr` / `tls_cert` /
+`admin_plane` / `wildcard_detect` 一起消失。判据是「有没有探测流量」，
+不是「模块自称 passive」—— DNS 解析会向权威 DNS 发查询，但那不是探测流量。
+
+> `brute`（只补主动面、不做被动源）已随合并删除。它需要「主动但不跑被动源」
+> 这个组合，两个模式表达不了。历史上从未被用过。
 
 ---
 
@@ -618,7 +627,7 @@ SEED(example.com) → ??? → DNS_NAME(example.com) → dns_resolve → IP_ADDRE
 | `passive_hackertarget` | passive, safe | HackerTarget hostsearch（纯文本 CSV，**易被限流**） |
 | `passive_urlscan` | passive, safe | urlscan.io 检索 |
 | `passive_commoncrawl` | passive, safe, **heavy** | Common Crawl 历史索引（**默认关闭**，见下） |
-| `asn_enrich` | passive, safe | ASN / 归属地富化（默认 **不在** `default`/`passive` 里） |
+| `asn_enrich` | passive, safe | ASN / 归属地富化（两个预设都 **exclude** 了它 —— 会把目标 IP 发给第三方接口） |
 | `fingerprint` | passive, safe | 技术栈指纹（只用已有响应，不发请求） |
 | `seed_asset` | passive, safe | **把种子本身产出为资产**（域名→DNS_NAME，IP→IP_ADDRESS）。没有它根域名和裸 IP 目标都不会被解析 |
 | `url_extract` | passive, safe | 从已抓到的正文里抽 URL（**不发额外请求**） |
@@ -645,11 +654,16 @@ SEED(example.com) → ??? → DNS_NAME(example.com) → dns_resolve → IP_ADDRE
 > 所以它在免费账号上会直接报错 —— 那是预期行为，不是 bug。
 >
 > **Key 填在「系统设置 → 源 API Key」里**（不在每次任务的配置覆盖里填）。
-> 设置文件只回传"哪些源已配置"，**密钥值永不回传**；建任务时自动注入，
-> 某次任务想临时换 Key 仍可在「配置覆盖」里覆盖。
+> 设置文件**会把这几个 Key 明文回传**（`GET /api/settings`），所以设置页里
+> 能直接看见、复制、在原值上改一个字符；清空某一格再保存 = 删掉该 Key。
+> 建任务时自动注入，某次任务想临时换 Key 仍可在「配置覆盖」里覆盖。
 > 之所以不推荐填在配置覆盖里：**监控任务**的覆盖项会被明文写进
 > `monitor.overrides_json` 且接口会回显 —— 一次性任务没这个问题（不落库），
 > 监控有。
+>
+> ⚠️ 因为 Key 是明文回传的，`/api/settings` 相当于一份密钥清单：**默认只绑
+> `127.0.0.1`，对外监听必须配 `--token`**（`auth_token` 本身仍然永不回传，
+> 只给 `auth_token_set`；告警里的 webhook/邮箱密钥同样不回传）。
 > （缺 Key 时软失败、扫描继续），需要时按 `passive_hackertarget.py` 的写法加回来。
 
 `passive_otx` **已删除**：两次实测都是 HTTP 429，基本不可用。
@@ -744,7 +758,7 @@ API count exceeded`。实现见 `SourceStats`；请求数由 `HTTPClient.stats` 
 
 **③ `heavy` flag —— 对应 `IsDefault() == false`。**
 `passive_commoncrawl` 能用但**很贵**：22.9s、7.9MB，只换 35 条。
-所以带 `heavy` 标签，`passive` / `default` 预设 `deny_flags` 掉它，
+所以带 `heavy` 标签，`passive` 预设 `deny_flags` 掉它，
 `-p active`（全量）才启用。subfinder 对它也是 `IsDefault() = false`。
 
 **url_extract 的实测产出（页面里抽链接）**
@@ -842,7 +856,7 @@ D:\Search\recon\                 ← 仓库根（项目名 recon）
 │   │   │   ├── manager.py      #   进程内扫描管理（不引入 Celery/Redis）
 │   │   │   ├── scheduler.py    #   周期监控调度（进程内 asyncio 任务）
 │   │   │   └── settings.py     #   授权白名单 / 令牌 / 告警配置
-│   │   ├── presets/            # passive / default / brute / active / demo
+│   │   ├── presets/            # passive / active（外加 _template.yml 写模板用）
 │   │   └── server.py           # ★ 唯一入口：拉起 Web 管理台（原 cli.py 已删除）
 │   ├── tests/                  # 263 个测试
 │   └── scripts/                # probe_source / web_smoke / m6_smoke / status / ui_check
@@ -1073,7 +1087,7 @@ python -m core                   # 后端自动托管 frontend/dist 并做 SPA �
   同一配置背靠背跑两轮能差 3 倍（实测 149.7 → 53.3 qps）。所以别拿单次基准下结论，
   池子的价值在于**推迟限速到来**，不是提高峰值。
 - `asn_enrich` 依赖第三方接口（默认 ipinfo），免费额度有限流，且会把目标 IP 发给第三方，
-  所以 `default` / `passive` 预设都显式排除了它。
+  所以 `passive` / `active` 两个预设都显式排除了它。
 - 内置 CDN 库来自 ARL（约 2023 年），部分 IP 段可能已过时；库外的 CDN 只能靠 CNAME 启发式，
   结果是通用 `"CDN"` 而非具体厂商。
 - **默认不声明 `br` 压缩**：本环境 aiohttp 3.14 + brotli 1.1.0 解不开 `br`

@@ -39,7 +39,22 @@ RECOVERED_*.py
 # ── 服务端日志（我用 Start-Process 起的本地实例会写这两个）────────
 .srv.log
 .srv.err
+# 换个名字再起一遍就会漏网（.server.log / .server.err 是 2026-10-04 实际用到的）
+*.server.log
+*.server.err
+backend/.server.log
+backend/.server.err
 nohup.out
+
+# ── 前端构建/开发的临时产物 ────────────────────────────────────────
+# Vite 的缓存目录与 dev server 日志（frontend/.gitignore 管不到它们）
+frontend/.tmp/
+*.vite.log
+*.vite.err
+
+# ── PowerShell 误产物 ──────────────────────────────────────────────
+# `> $null` 在某些调用形式下会真的在仓库根落一个名为 `$null` 的空文件
+/$null
 
 # ── 调试遗留（2026-10-01 排查 postgres.py 损坏时产生）────────────────
 # 这些是我和代理在排查过程中落下的中间产物：转录、GBK 码表、形状检查脚本。

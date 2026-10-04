@@ -28,16 +28,25 @@
         <a-divider style="margin: 4px 0 16px" />
 
         <a-collapse ghost>
-          <a-collapse-panel key="keys" header="源 API Key（需要 Key 的采集源）">
+          <a-collapse-panel key="keys" header="网络空间测绘配置">
             <div class="tk-muted hint" style="margin-bottom: 10px">
-              存在本机设置文件里，<b>不会被接口回传</b>。建任务时自动注入，
-              不必每次重填；某次任务想临时换 Key 时，仍可在「配置覆盖」里覆盖。
+              存在本机设置文件里，<b>会回显到这里</b> —— 点右侧眼睛可明文查看、复制。
+              建任务时自动注入，不必每次重填；<b>清空某一格再保存 = 删掉该 Key</b>。
+              某次任务想临时换 Key 时，仍可在「配置覆盖」里覆盖。
             </div>
             <a-empty v-if="!keyModules.length" description="当前没有需要 Key 的源" />
             <a-form-item v-for="m in keyModules" :key="m.name" :label="m.name">
+              <!--
+                用 ``a-input-password`` —— 它自带那个「眼睛」按钮，而且抽屉里
+                所有密钥类字段（访问令牌 / Webhook Token / 钉钉加签 / 飞书签名 /
+                邮箱密码）都是这个形状，源 API Key 原先是唯一一个例外。
+                Key 仍然**回显**：值就填在框里，点眼睛即可明文查看，
+                不需要像以前那样"整条重填一遍"；默认显示成圆点，
+                旁边有人时不会被直接看到。
+              -->
               <a-input-password
                 v-model:value="form.source_keys[m.name]"
-                :placeholder="isKeySet(m.name) ? '已设置（留空=不修改）' : '未设置'"
+                :placeholder="isKeySet(m.name) ? '已设置（清空并保存=删除）' : '未设置'"
                 autocomplete="off"
               />
               <!--
@@ -205,7 +214,7 @@ const keyModules = ref([])
 const form = reactive({
   max_concurrent_scans: 2,
   auth_token: '',
-  //: {模块名: 新填的 key}。留空表示"不修改"，见 save()
+  //: {模块名: 已保存的 key}。**回显自服务端**，所以清空 = 删除，见 save()
   source_keys: {},
   //: {模块名: {附加配置}}。**非密钥**，会回显 —— 所以要带出当前值。
   source_options: {},
@@ -242,7 +251,8 @@ async function onTestSource(m) {
   delete testResults[m.name]
   try {
     // 把**当前表单里**的值发过去（而不是已保存的）—— 填完先验再保存。
-    // key 留空时服务端回落到已保存的那个，与"留空=不修改"一致。
+    // key 留空（或没填）时传 null，服务端回落到已保存的那个 —— 所以
+    // "测试连接"测的永远是"保存后会用的那个 key"。
     const res = await testSource(m.name, {
       api_key: (form.source_keys[m.name] || '').trim() || null,
       options: { ...(form.source_options[m.name] || {}) },
@@ -266,7 +276,7 @@ async function load() {
     settings.value = data
     form.max_concurrent_scans = data.max_concurrent_scans || 2
     form.auth_token = ''
-    form.source_keys = {}
+    form.source_keys = data.source_keys ? JSON.parse(JSON.stringify(data.source_keys)) : {}
     // ⚠️ **两个清单都要看。** 需要 Key 的源大多带 `metered` 标记，
     // 因而不在 `modules`（已启用）里，而是在 `metered`（可勾选）里 ——
     // 只看 modules 的话，设置里会**一个填 Key 的地方都不剩**。
@@ -317,19 +327,27 @@ async function save() {
     }
     // 密钥只在用户真的填了内容时才提交，否则会把服务端已有值抹掉
     if (form.auth_token.trim()) body.auth_token = form.auth_token.trim()
-    // 源 API Key 同理：只提交这次填了内容的那些。服务端是**按模块合并**的，
-    // 所以不会把没提到的源抹掉。
+    // 源 API Key：**整块提交**（含空值），与附加配置同一套语义。
+    //
+    // 旧语义是"留空 = 不修改"，但那是在 Key **回显不了**的前提下定的 ——
+    // 输入框恒为空，留空也只能表示"没动"。现在 Key 会回显（框里有值），
+    // "清空再保存"就是一个明确的意思：删掉它。若继续只提交非空值，
+    // 用户清空后保存会发现 Key 还在。
+    //
+    // 只遍历 keyModules（服务端声明的"需要 Key 的源"），所以不会碰那些
+    // 没列在这里的源；服务端按模块合并，空串 = 清掉该项。
     const keys = {}
-    for (const [name, value] of Object.entries(form.source_keys || {})) {
-      const v = (value || '').trim()
-      if (v) keys[name] = v
+    for (const m of keyModules.value) {
+      keys[m.name] = (form.source_keys[m.name] || '').trim()
     }
     if (Object.keys(keys).length) body.source_keys = keys
     // 附加配置：**整块提交**（含空值）。
     //
-    // 与密钥不同 —— 密钥"留空 = 不修改"（因为回显不了，留空是唯一表达"没动"的
-    // 方式）；而附加配置是**能回显**的，所以"清空输入框"就是一个明确的意思：
-    // 用户想把它删掉。服务端把空串解释为"清掉该项"。
+    // 和上面源 API Key 现在是同一个语义（清空 = 删除）。差别只在"为什么"：
+    // 附加配置一直能回显，Key 是后来才改成回显的；而 ``auth_token`` 与
+    // 告警里的那几个密钥（webhook_token / *_secret / email_password）**仍然
+    // 不回显**，所以它们保留"留空 = 不修改"：框里没有值可对照，留空只能
+    // 表示"没动"。服务端把空串解释为"清掉该项"。
     const options = {}
     for (const [name, opts] of Object.entries(form.source_options || {})) {
       if (opts && Object.keys(opts).length) options[name] = { ...opts }
