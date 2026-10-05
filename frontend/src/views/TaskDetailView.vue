@@ -305,6 +305,31 @@
                   <a :href="record.url" target="_blank" rel="noreferrer" class="tk-mono">
                     {{ record.url }}
                   </a>
+                  <!--
+                    有跳转时必须标出来。``url`` 是**我们请求的**地址，而同一行的
+                    status / title / content_length 全是**落地页**的 —— 之前
+                    界面只显示 url，于是 ``http://x:2082`` 那行写着
+                    "200 / Yealink Support / 65506 字节"，可 2082 只回了个
+                    跳转，那 65506 字节来自 https://x/ 。点开必然对不上。
+                    （orig_status / redirects 是 2026-10-05 补的落库列，
+                      之前整条链路都在丢这两个信息。）
+                  -->
+                  <a-tooltip
+                    v-if="record.redirects || (record.final_url && record.final_url !== record.url)"
+                    placement="topLeft"
+                  >
+                    <a-tag color="orange" style="margin-left: 6px">
+                      {{ record.orig_status || '30x' }} 跳转
+                    </a-tag>
+                    <template #title>
+                      <div>这个地址自己返回的是 <b>{{ record.orig_status || '30x' }}</b>，
+                        内容来自下面这个地址：</div>
+                      <div style="margin-top:4px"><b>{{ record.final_url || record.url }}</b></div>
+                      <div style="margin-top:6px;opacity:.75">
+                        下方「状态 / 标题 / 长度」都是**跳转之后**那个页面的。
+                      </div>
+                    </template>
+                  </a-tooltip>
                 </template>
                 <template v-else-if="column.key === 'probe'">
                   <a-tag v-if="record.probed" :color="statusColor(record.status)">
