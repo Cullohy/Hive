@@ -76,8 +76,10 @@
         </div>
       </div>
 
-      <!-- ── 概览卡片 ── -->
-      <div class="tk-stat-grid" style="margin-bottom: 16px">
+      <!-- 概览卡片。看关系图时收起来：它占掉约 500px，而关系图真正需要的是
+           **空间**（720px 高的窗口里，卡片不收起来图只剩 200px 可看）。
+           而且图自己就带"123 个节点 · 122 条边"的计数，卡片在那一刻是冗余的。 -->
+      <div v-if="tab !== 'lineage'" class="tk-stat-grid" style="margin-bottom: 16px">
         <div v-for="card in statCards" :key="card.label" class="tk-stat">
           <div class="tk-stat-label">{{ card.label }}</div>
           <div class="tk-stat-value" :class="{ accent: card.accent }">{{ card.value }}</div>
@@ -459,6 +461,19 @@
             />
           </a-tab-pane>
 
+          <!-- 关系图。**默认不选中**：cytoscape 是按需 import 的，
+               切进来才加载；一进页面就建 350~800 个节点纯属白费。 -->
+          <a-tab-pane key="lineage" tab="关系图">
+            <div class="tk-muted" style="margin-bottom: 8px">
+              一张图看「这个资产是怎么被发现的」：种子在最上，往下每层是一次推导。点节点看那条溯源链。
+            </div>
+            <LineageGraph
+              v-if="tab === 'lineage'"
+              :scan-id="id"
+              @open-trace="(eventId) => showTrace({ id: eventId })"
+            />
+          </a-tab-pane>
+
           <a-tab-pane key="events" :tab="`事件 (${eventTotal.toLocaleString()})`">
             <div class="tk-muted" style="margin-bottom: 8px">
               点任意一行的「溯源」可以看到这个资产是**怎么被发现的**——从种子一路推到这里。
@@ -669,7 +684,7 @@ import {
   QuestionCircleOutlined,
 } from '@ant-design/icons-vue'
 import { message } from 'ant-design-vue'
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   deleteScan,
@@ -682,6 +697,7 @@ import {
   stopScan,
 } from '@/api'
 import { openProgressStream } from '@/api/stream'
+import LineageGraph from '@/components/LineageGraph.vue'
 
 const route = useRoute()
 const router = useRouter()

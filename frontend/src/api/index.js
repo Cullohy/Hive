@@ -46,6 +46,15 @@ export const getAssets = (id, limit = 2000) =>
 export const getEvents = (id, params = {}) =>
   http.get(`/api/scans/${id}/events`, { params })
 export const getTrace = (id, eventId) => http.get(`/api/scans/${id}/trace/${eventId}`)
+/**
+ * 血缘图：节点=事件，边=parent_id。默认只给结论型。
+ *
+ * ⚠️ 路径**不能**写成 `/graph` —— 那是「资产关系图」（域名→IP→端口），
+ * 两张图回答的不是同一个问题，撞名时 FastAPI 只认先注册的那个。
+ * 参见 core/web/app.py::scan_lineage 的注释。
+ */
+export const getLineage = (id, params = {}) =>
+  http.get(`/api/scans/${id}/lineage`, { params })
 export const getDiff = (id, against) =>
   http.get(`/api/scans/${id}/diff`, { params: against ? { against } : {} })
 
