@@ -2904,6 +2904,131 @@ class TestSoft404ThreeLayer(unittest.TestCase):
         real = "<html><body><h1>控制台</h1><p>共 12 个项目</p></body></html>"
         self.assertFalse(looks_like_auth_wall(real))
 
+    # ---------------------------------------------------------- 认证墙的优先级
+    def test_short_login_page_is_not_dropped_by_the_keyword_layer(self) -> None:
+        """**短**登录页不能因为命中软 404 词就被丢掉。
+
+        「抱歉，您的账号异常，请登录后重试」含软 404 词「抱歉」（单命中 +
+        正文 < ``SOFT404_SINGLE_MARKER_MAX_LEN`` 就成立），也含认证墙词「请登录」。
+        曾经关键词层排第一、无条件先 ``return True``，于是这条**真实的暴露面**
+        被当噪声丢掉 —— 而代码里紧挨着的注释写的恰好是相反的意图
+        （"认证墙不是噪声：敏感路径回登录页本身就是暴露面"）。
+
+        这条以前测不到：``test_auth_wall_is_not_noise`` 用的登录页不含任何
+        软 404 词，关键词层压根不触发，断言在第 ③ 层之前就通过了。
+        """
+        login = "<html><body><p>抱歉，您的账号异常，请登录后重试</p></body></html>"
+        prof = self._profile([self._p("abcd", 404, 4096, self.NOTFOUND_ZH)])
+        self.assertIsNotNone(
+            looks_like_soft_404(login, size=len(login)),
+            "前提：这段正文确实会被关键词层判成软 404（否则这条测不到东西）",
+        )
+        self.assertTrue(looks_like_auth_wall(login), "前提：它确实是认证墙")
+        self.assertFalse(
+            prof.is_noise(status=404, size=len(login),
+                          words=len(login.split()), token_len=4, text=login),
+            "短登录页被关键词层当噪声丢掉了 —— 那是一条真实的暴露面",
+        )
+
+    def test_404_page_containing_a_login_link_is_still_filtered(self) -> None:
+        """⚠️ **反向守卫**：认证墙让位不能变成"认证墙一律放行"。
+
+        ``AUTH_WALL_MARKERS`` 里有裸的 ``login``，而绝大多数站点的 404 页
+        页眉就有一个 Login 链接。若在认证墙那里直接 ``return False``，那个
+        站点的软 404 过滤会**整体失效**（每条响应都含 login）—— 比原来的
+        bug 更糟。区分只能靠正文骨架：404 页与基线同骨架（滤掉），
+        真登录页不同（保留）。
+
+        这条在修复之前**就会过**（关键词层同样判它噪声），所以它不是本次修复
+        的判据，而是为了挡住那个更糟的改法。
+        """
+        body = "占位内容" * 300
+        notfound = (
+            "<html><body><header><a href='/login'>Login</a></header>"
+            f"<h1>页面不存在</h1><div>{body}</div></body></html>"
+        )
+        prof = self._profile([
+            self._p("a1b2", 404, len(notfound), notfound),
+            self._p("c3d4", 404, len(notfound), notfound),
+        ])
+        self.assertTrue(looks_like_auth_wall(notfound), "前提：404 页里确实有 login")
+        self.assertTrue(
+            prof.is_noise(status=404, size=len(notfound),
+                          words=len(notfound.split()), token_len=4, text=notfound),
+            "带 Login 链接的 404 页没被滤掉 —— 认证墙让位变成了认证墙一律放行",
+        )
+
+    # ---------------------------------------------------------- simhash 整层
+    def _jitter_page(self, n: int) -> str:
+        """大小随 n 抖动的 404 模板页（nonce 长度差超过容差 8 字节）。"""
+        filler = "这是用来把错误页撑到真实体量的正文内容。" * 200
+        return ("<html><body><h1>页面不存在</h1>"
+                f'<div>{filler}<!-- {"t" * (n * 120)} --></div></body></html>')
+
+    def test_simhash_mode_filters_without_any_directory_baseline(self) -> None:
+        """``mode="simhash"`` 的画像**不登记 baselines 也要能过滤**。
+
+        ``add_baseline`` 全仓只有 ``dir_brute._ensure_dir_baseline`` 一个调用点，
+        而 ``soft404_probe`` / ``js_assets`` 都是直接 ``SoftProfile.build()`` ——
+        它们建出来的 simhash 画像里 ``baselines`` 恒为空。曾经
+        ``similar_to_baseline`` 只查 ``baselines``，于是这些画像的指纹层
+        **恒返回 False**：``describe()`` 照实写着"按正文指纹过滤 xxx"，
+        ``is_noise`` 却一条都滤不掉，几千条假命中照旧落库。
+        """
+        prof = self._profile([
+            self._p("a1b2", 404, len(self._jitter_page(1)), self._jitter_page(1)),
+            self._p("c3d4e5f6", 404, len(self._jitter_page(2)), self._jitter_page(2)),
+        ])
+        self.assertEqual(prof.mode, "simhash", "前提：这条该落在 simhash 模式")
+        self.assertEqual(prof.baselines, {}, "前提：没有登记任何同目录基线")
+        self.assertTrue(prof.simhash, "前提：校准确实立下了指纹")
+
+        cand = self._jitter_page(3)
+        self.assertTrue(
+            prof.is_noise(status=404, size=len(cand), words=len(cand.split()),
+                          token_len=4, text=cand),
+            "simhash 画像在没有任何同目录基线时一条都滤不掉 —— 整层空转",
+        )
+
+    def test_size_mode_fallback_also_uses_the_calibration_fingerprint(self) -> None:
+        """``mode="size"`` 下第 ③ 层兜底同样不能恒不可达。
+
+        校准 4 次探测恰好落在容差内（走 size 快路径），但某条候选因为多了一
+        个轮播 banner 差了几十字节 → 大小层失效 → 落到第 ③ 层。它与基线
+        骨架相同就该被滤掉。修复前这一层恒返回 False。
+        """
+        base = self._jitter_page(1)
+        prof = self._profile([
+            self._p("a1b2", 404, len(base), base),
+            self._p("c3d4", 404, len(base), base),
+        ])
+        self.assertEqual(prof.mode, "size", "前提：这条该走 size 快路径")
+        self.assertEqual(prof.baselines, {})
+
+        cand = base.replace("</div>", "<div>轮播广告位</div></div>")
+        self.assertGreater(
+            abs(len(cand) - len(base)), prof.tolerance,
+            "前提：候选的大小必须差出容差，否则大小层就判掉了，测不到第 ③ 层",
+        )
+        self.assertTrue(
+            prof.is_noise(status=404, size=len(cand), words=len(cand.split()),
+                          token_len=4, text=cand),
+            "size 模式下第 ③ 层指纹兜底恒不可达 —— nonce 抖动站点产生假命中",
+        )
+
+    def test_simhash_mode_still_keeps_a_real_hit(self) -> None:
+        """指纹层通了之后，别把**真命中**也一起滤掉（漏采比误报更贵）。"""
+        prof = self._profile([
+            self._p("a1b2", 404, len(self._jitter_page(1)), self._jitter_page(1)),
+            self._p("c3d4e5f6", 404, len(self._jitter_page(2)), self._jitter_page(2)),
+        ])
+        real = "<html><body><h1>系统维护中</h1><p>我们正在升级，稍后再试。</p></body></html>"
+        self.assertFalse(
+            prof.is_noise(status=200, size=len(real), words=len(real.split()),
+                          token_len=4, text=real),
+            "骨架完全不同的真页面被指纹层当成软 404 了",
+        )
+
     # ------------------------------------------------------------------ 三层
     def test_simhash_rescues_when_size_jitters(self) -> None:
         """**核心用例**：软 404 页带 nonce/时间戳，每次大小差上百字节。
