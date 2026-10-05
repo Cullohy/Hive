@@ -410,5 +410,95 @@ class TestGroupSyncAfterMigration(_RealDatabase):
         )
 
 
+class TestGroupAndFilterTogether(_RealDatabase):
+    """**分组与多维筛选同时给出**时，两边的值必须各归各位。
+
+    单元测试 ``TestSearchWhereParamOrder`` 只验了 SQL 字符串的拼装顺序；这里
+    **真跑一次查询**，验 asyncpg 真的接受这个参数顺序、且返回的行确实是对的那几行。
+
+    错位时的两种表现，取决于筛选落在哪一列：
+
+    * 字符串列（``name`` / ``source``）→ 筛选值被当成 ``ga.group_id`` 传进 bigint
+      比较，asyncpg 直接抛类型错
+    * **数字列（``status`` / ``port``）两边都是 int → 不报错**，
+      静默返回错组错值的结果与 total —— 这条测试要守住的就是它
+    """
+
+    async def _group_with_host(self) -> int:
+        """造一个含 HOST 的分组，返回 group_id。"""
+        scan_id = await self._scan(["example.com"])
+        await self._project(scan_id, _domain_event(HOST), _endpoint_event())
+        group = await self.storage.create_group(name="g", scopes=["example.com"])
+        added = await self.storage.sync_scan_to_group(group, scan_id)
+        self.assertEqual(added["domain"], 1, "前提：HOST 真的进了组")
+        return group
+
+    async def _search(self, group_id, value: str, *, op="contains", field="name"):
+        return await self.storage.search_assets(
+            "", types=["domains"], live=False, group_id=group_id,
+            filters=[{"field": field, "op": op, "value": value}],
+        )
+
+    async def test_matching_filter_returns_the_row(self) -> None:
+        group = await self._group_with_host()
+        out = await self._search(group, HOST)
+        self.assertIn(HOST, {r["name"] for r in out.get("domains", [])})
+
+    async def test_non_matching_filter_returns_nothing(self) -> None:
+        group = await self._group_with_host()
+        out = await self._search(group, "zzz-没有这个主机")
+        self.assertEqual(out.get("domains", []), [])
+
+    async def test_wrong_group_id_returns_nothing(self) -> None:
+        """group_id 给错必须是空集，而不是"筛选值被当成分组号"后乱筛。"""
+        group = await self._group_with_host()
+        out = await self._search(group + 9999, HOST)
+        self.assertEqual(
+            out.get("domains", []), [],
+            "不存在的分组却查出了行 —— 参数错位了",
+        )
+
+    async def test_counts_agree_with_rows(self) -> None:
+        """``search_counts`` 与 ``search_assets`` 走同一个 WHERE，总数要对得上。"""
+        group = await self._group_with_host()
+        counts = await self.storage.search_counts(
+            "", types=["domains"], live=False, group_id=group,
+            filters=[{"field": "name", "op": "contains", "value": HOST}],
+        )
+        rows = (await self._search(group, HOST)).get("domains", [])
+        self.assertEqual(int(counts["domains"]), len(rows))
+
+    async def test_numeric_field_is_not_reachable_together_with_a_group(self) -> None:
+        """钉住"**数字列错位不会静默发生**"这个前提本身。
+
+        错位的两种表现取决于筛选落在哪一列：数字列（``status`` / ``port``）
+        两边都是 int，asyncpg **不报错**，只会静默返回错组错值的结果 —— 那才是
+        最难查的形态。但它要求「可分组的资产类型」上**有**数字筛选字段，而：
+
+        * ``asset_group.category`` 只有 ``domain | ip``（schema.sql）
+        * 这两类的可筛选字段全是字符串（``name`` / ``source`` / ``addr`` /
+          ``org`` / ``country``）
+
+        所以今天走不到接口，唯一的可达形态是字符串列那支（抛类型错 → 500）。
+        **一旦有人给域名/IP 加了数字筛选字段、或让分组收 URL，这里就该变成
+        一条真 bug 测试** —— 所以把前提本身钉住。
+
+        （没配"数字筛选不带分组能用"的对照组：那个夹具造不出 url 行，
+        属于另一件事，不在本次修复范围内。）
+        """
+        from core.storage.postgres import _ASSET_FILTER_FIELDS, _NUMERIC_FILTER_FIELDS
+
+        groupable = {"domains", "ips"}  # 与 asset_group.category 一致
+        for asset_type in groupable:
+            fields = _ASSET_FILTER_FIELDS[asset_type]
+            numeric = set(fields) & _NUMERIC_FILTER_FIELDS
+            self.assertEqual(
+                numeric, set(),
+                f"{asset_type} 是可分组的类型，却有了数字筛选字段 {numeric} —— "
+                f"参数错位会从'抛类型错'退化成'静默返回错值'，"
+                f"请把上面那条测试改成真 bug 用例",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
