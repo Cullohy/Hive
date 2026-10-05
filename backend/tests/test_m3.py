@@ -975,7 +975,7 @@ class TestAdminPlane(EngineTestCase):
         return scanner, summary, calls
 
     async def _emitted(self, scan_id):
-        rows = await self.storage.events(scan_id, limit=500, event_type="DNS_NAME")
+        rows, _ = await self.storage.events(scan_id, limit=500, event_type="DNS_NAME")
         out = {}
         for e in rows:
             if e["module"] != "admin_plane":
@@ -1292,7 +1292,7 @@ class TestPermute(EngineTestCase):
         domains = {d["name"] for d in await self.storage.domains(scanner.scan_id)}
         self.assertIn("dev.www.example.com", domains)
         # 置换产出应当带上 permuted 标签, 便于事后区分来源
-        events = await self.storage.events(scanner.scan_id, limit=500)
+        events, _ = await self.storage.events(scanner.scan_id, limit=500)
         hit = next(e for e in events if e["data"] == "dev.www.example.com")
         self.assertIn('"permuted": true', hit["tags_json"] or "")
 
@@ -1560,7 +1560,7 @@ class TestCdnProjection(EngineTestCase):
             )
 
         # ① 多条 CNAME 都要留下来
-        events = await self.storage.events(scanner.scan_id, limit=500, event_type="IP_ADDRESS")
+        events, _ = await self.storage.events(scanner.scan_id, limit=500, event_type="IP_ADDRESS")
         hit = next(e for e in events if e["data"] == REAL_IP)
         tags = json.loads(hit["tags_json"] or "{}")
         self.assertEqual(tags.get("cname"), "plain.example.net", "首条仍走 cname 键")
@@ -1592,7 +1592,7 @@ class TestCdnProjection(EngineTestCase):
             scanner, _ = await self.run_scan(
                 targets=["example.com"], include=["demo_expand", "dns_resolve"]
             )
-        events = await self.storage.events(scanner.scan_id, limit=500, event_type="IP_ADDRESS")
+        events, _ = await self.storage.events(scanner.scan_id, limit=500, event_type="IP_ADDRESS")
         hit = next(e for e in events if e["data"] == REAL_IP)
         tags = json.loads(hit["tags_json"] or "{}")
         self.assertEqual(tags.get("cname"), "only.example.net")
@@ -1996,7 +1996,7 @@ class TestIpPtrModule(EngineTestCase):
         """没有 PTR 是**常态**（云主机普遍不配），不能报错也不能发事件。"""
         scanner, seen = await self._scan({})
         self.assertEqual(seen, ["203.0.113.10"], "该 IP 仍要被查一次")
-        events = await self.storage.events(scanner.scan_id, limit=200)
+        events, _ = await self.storage.events(scanner.scan_id, limit=200)
         kinds = [e["type"] for e in events]
         self.assertNotIn("DNS_NAME", kinds)
         self.assertNotIn("FINDING", kinds, "没有 PTR 不是问题，不该刷 finding")
@@ -2004,7 +2004,7 @@ class TestIpPtrModule(EngineTestCase):
     async def test_in_scope_ptr_advances_downstream(self) -> None:
         """落在目标下的 PTR → 发 DNS_NAME，走完整下游。"""
         scanner, _ = await self._scan({"203.0.113.10": ["srv.example.com."]})
-        events = await self.storage.events(scanner.scan_id, limit=200)
+        events, _ = await self.storage.events(scanner.scan_id, limit=200)
         dns = [e for e in events if e["type"] == "DNS_NAME"]
         self.assertTrue(dns, "范围内的 PTR 必须推进下游")
         self.assertEqual(dns[0]["data"], "srv.example.com")
@@ -2017,7 +2017,7 @@ class TestIpPtrModule(EngineTestCase):
         越界计数 +1，得自己猜为什么。
         """
         scanner, _ = await self._scan({"203.0.113.10": ["host.other.com."]})
-        events = await self.storage.events(scanner.scan_id, limit=200)
+        events, _ = await self.storage.events(scanner.scan_id, limit=200)
         self.assertFalse(
             [e for e in events if e["type"] == "DNS_NAME"],
             "范围外的域名绝不能推进下游",
@@ -2033,7 +2033,7 @@ class TestIpPtrModule(EngineTestCase):
         scanner, _ = await self._scan(
             {"203.0.113.10": ["ec2-1-2-3-4.compute-1.amazonaws.com"]}
         )
-        events = await self.storage.events(scanner.scan_id, limit=200)
+        events, _ = await self.storage.events(scanner.scan_id, limit=200)
         self.assertFalse([e for e in events if e["type"] == "DNS_NAME"])
         findings = [e for e in events if e["type"] == "FINDING"]
         self.assertTrue(findings)
@@ -2046,7 +2046,7 @@ class TestIpPtrModule(EngineTestCase):
         scanner, seen = await self._scan({"203.0.113.10": ["srv.example.com"]})
         self.assertEqual(seen, ["203.0.113.10"])
         # 仍然只有一个 DNS_NAME（去重后）
-        events = await self.storage.events(scanner.scan_id, limit=200)
+        events, _ = await self.storage.events(scanner.scan_id, limit=200)
         dns = [e for e in events if e["type"] == "DNS_NAME" and e["module"] == "ip_ptr"]
         self.assertEqual(len(dns), 1)
 
@@ -2130,7 +2130,7 @@ class TestZoneTransfer(EngineTestCase):
         )
 
     async def _names(self, scan_id: int) -> set[str]:
-        rows = await self.storage.events(scan_id, limit=2000, event_type="DNS_NAME")
+        rows, _ = await self.storage.events(scan_id, limit=2000, event_type="DNS_NAME")
         return {r["data"] for r in rows}
 
     async def test_successful_transfer_yields_every_in_scope_name(self) -> None:

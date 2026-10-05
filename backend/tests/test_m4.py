@@ -144,7 +144,7 @@ class TestPortScan(EngineTestCase):
                 include=["emit_ips", "port_scan"],
                 module_config={"port_scan": {"ports": "top10"}},
             )
-        events = await self.storage.events(scanner.scan_id, limit=200)
+        events, _ = await self.storage.events(scanner.scan_id, limit=200)
         opens = [e for e in events if e["type"] == "OPEN_TCP_PORT"]
         self.assertEqual([e["data"] for e in opens], [f"{REAL_IP}:8080"])
         self.assertGreaterEqual(summary["events_new"], 4)
@@ -226,7 +226,7 @@ class TestHttpProbeAndFingerprint(EngineTestCase):
                 },
             )
 
-        events = await self.storage.events(scanner.scan_id, limit=200)
+        events, _ = await self.storage.events(scanner.scan_id, limit=200)
         http_event = next(e for e in events if e["type"] == "HTTP_RESPONSE")
         stored = json.loads(http_event["tags_json"])
         self.assertNotIn("body_snippet", stored)

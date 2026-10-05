@@ -241,7 +241,7 @@ class TestUrlExtractModule(EngineTestCase):
         **默认只取 ``url_extract`` 发的** —— ``http_probe`` 自己也会为探测到的
         地址发一条 URL，混在一起会让"预算是否生效"这类断言失真。
         """
-        events = await self.storage.events(scan_id, limit=500, event_type="URL")
+        events, _ = await self.storage.events(scan_id, limit=500, event_type="URL")
         return {
             e["data"] for e in events if module is None or e["module"] == module
         }
@@ -360,7 +360,7 @@ class TestSeedAsset(unittest.TestCase):
                 )
                 scanner = Scanner(targets=[seed], preset=preset, storage=storage)
                 await scanner.scan()
-                events = await storage.events(scanner.scan_id, limit=50)
+                events, _ = await storage.events(scanner.scan_id, limit=50)
                 return [(e["type"], e["data"]) for e in events]
             finally:
                 await drop_storage(storage)
@@ -820,7 +820,7 @@ class emit_js_url(BaseModule):
             )
 
     async def _emitted(self, scan_id: int, event_type: str = "URL") -> set[str]:
-        events = await self.storage.events(scan_id, limit=1000, event_type=event_type)
+        events, _ = await self.storage.events(scan_id, limit=1000, event_type=event_type)
         return {e["data"] for e in events if e["module"] == "js_assets"}
 
     async def test_emits_urls_and_filters_scope(self) -> None:
@@ -998,7 +998,7 @@ class emit_js_url(BaseModule):
         return scanner, sent, summary
 
     async def _emitted(self, scan_id: int) -> set[str]:
-        events = await self.storage.events(scan_id, limit=1000, event_type="URL")
+        events, _ = await self.storage.events(scan_id, limit=1000, event_type="URL")
         return {e["data"] for e in events if e["module"] == "js_assets"}
 
     @staticmethod
@@ -1338,7 +1338,7 @@ class TestParentDirDerivation(EngineTestCase):
         # 所以要自己 json.loads 一下。
         import json as _json
 
-        rows = await self.storage.events(scan_id, limit=2000, event_type="URL")
+        rows, _ = await self.storage.events(scan_id, limit=2000, event_type="URL")
         out = []
         for row in rows:
             try:
@@ -1369,7 +1369,7 @@ class TestParentDirDerivation(EngineTestCase):
         # ``verified`` 存在 tags_json 里（读回来是字符串），这里只验它确实
         # 以 False 落库，而不是压根没写这个标记
         for url in parents:
-            row = await self.storage.events(
+            row, _ = await self.storage.events(
                 scanner.scan_id, limit=50, event_type="URL"
             )
             hit = [r for r in row if r["data"] == url]

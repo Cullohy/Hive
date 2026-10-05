@@ -459,20 +459,71 @@
             />
           </a-tab-pane>
 
-          <a-tab-pane key="events" :tab="`事件 (${tabCount('events', events.length)})`">
+          <a-tab-pane key="events" :tab="`事件 (${eventTotal.toLocaleString()})`">
             <div class="tk-muted" style="margin-bottom: 8px">
               点任意一行的「溯源」可以看到这个资产是**怎么被发现的**——从种子一路推到这里。
             </div>
+
+            <div class="evt-bar">
+              <a-radio-group
+                v-model:value="eventFilter.kind"
+                size="small"
+                @change="onEventFilterChange"
+              >
+                <a-radio-button value="conclusion">只看结论</a-radio-button>
+                <a-radio-button value="all">全部事件</a-radio-button>
+              </a-radio-group>
+
+              <a-select
+                v-model:value="eventFilter.type"
+                placeholder="类型"
+                size="small"
+                style="width: 150px"
+                allow-clear
+                :options="eventTypeOptions"
+                @change="onEventFilterChange"
+              />
+              <a-select
+                v-model:value="eventFilter.module"
+                placeholder="来源模块"
+                size="small"
+                style="width: 160px"
+                allow-clear
+                :options="eventModuleOptions"
+                @change="onEventFilterChange"
+              />
+              <a-input
+                :value="eventFilter.q"
+                placeholder="搜数据（子串）"
+                size="small"
+                style="width: 190px"
+                allow-clear
+                @change="(e) => onEventSearch(e.target.value)"
+              />
+              <span class="tk-muted" style="margin-left: auto; font-size: 12px">
+                显示 {{ events.length }} / 共 {{ eventTotal.toLocaleString() }} 条
+              </span>
+            </div>
+
             <a-table
               :columns="eventColumns"
               :data-source="events"
               row-key="id"
               size="small"
-              :pagination="{ pageSize: 15, showSizeChanger: false }"
+              :pagination="{
+                current: eventPage,
+                pageSize: eventPageSize,
+                total: eventTotal,
+                showSizeChanger: true,
+                pageSizeOptions: ['20', '50', '100', '200'],
+                showTotal: (t) => `共 ${t.toLocaleString()} 条`,
+                size: 'small',
+              }"
+              @change="(p) => onEventPageChange(p.current, p.pageSize)"
             >
               <template #bodyCell="{ column, record }">
                 <template v-if="column.key === 'type'">
-                  <a-tag>{{ record.type }}</a-tag>
+                  <a-tag :color="eventTypeColor(record.type)">{{ record.type }}</a-tag>
                   <a-tag v-if="record.kind" color="orange">{{ record.kind }}</a-tag>
                 </template>
                 <template v-else-if="column.key === 'data'">
@@ -530,19 +581,36 @@
       </div>
     </a-spin>
 
-    <!-- 溯源链 -->
-    <a-modal v-model:open="traceOpen" title="事件溯源链" :footer="null" width="720">
+    <!-- 溯源链：一条**路径**（每个事件只有一个 parent），所以画成链而不是通用图 ——
+         不需要引 d3/cytoscape 之类的依赖，手写 CSS 就够。
+         ``trace`` 是后端沿 parent_id 回溯出来的，**顺序是从当前事件倒着回到种子**
+         （postgres.py::trace 先 append 当前行再跳 parent），所以渲染时要反过来，
+         让「种子」在顶部、点开的那条在底部 —— 与阅读方向一致。 -->
+    <a-modal v-model:open="traceOpen" title="发现链：这个资产是怎么被挖出来的" :footer="null" width="760">
       <div v-if="trace.length" class="trace">
-        <div v-for="(node, index) in trace" :key="node.id" class="trace-node">
-          <div class="trace-index">{{ index + 1 }}</div>
-          <div class="trace-body">
-            <div class="trace-head">
-              <a-tag>{{ node.type }}</a-tag>
-              <a-tag v-if="node.kind" color="orange">{{ node.kind }}</a-tag>
-              <span class="tk-muted trace-module">{{ node.module }}</span>
-            </div>
-            <div class="tk-mono">{{ node.data }}</div>
-            <div class="tk-muted trace-time">{{ node.created_at }}</div>
+        <div
+          v-for="(node, i) in traceTopDown"
+          :key="node.id"
+          class="trace-node"
+          :class="{ 'trace-leaf': i === 0 }"
+        >
+          <div class="trace-head">
+            <a-tag :color="eventTypeColor(node.type)">{{ node.type }}</a-tag>
+            <a-tag v-if="node.kind" color="orange">{{ node.kind }}</a-tag>
+            <span class="tk-muted trace-module">{{ node.module }}</span>
+            <span v-if="i === 0" class="trace-leaf-tag">你点的那条</span>
+            <span v-else-if="node.type === 'SEED'" class="trace-leaf-tag">种子</span>
+          </div>
+          <div class="tk-mono trace-data" :title="node.data">{{ node.data }}</div>
+          <div class="tk-muted trace-time">
+            深度 {{ node.scope_distance ?? '-' }} · {{ node.created_at }}
+          </div>
+          <!-- 转换标注：这一步「变成了什么」是最有信息量的一行，编号列表看不出来 -->
+          <div v-if="i < traceTopDown.length - 1" class="trace-edge">
+            <span class="trace-edge-line"></span>
+            <span class="trace-edge-label">
+              ↓ {{ traceTopDown[i + 1].type }} 产生
+            </span>
           </div>
         </div>
       </div>
@@ -633,6 +701,13 @@ const id = Number(route.query.id)
 const scan = ref({})
 const assets = ref({})
 const events = ref([])
+//: 事件流是**服务端分页**的：只拿当前页，筛选条件一变就重新取。
+//: 以前一次拉 300 条、不给总数、还不说截断了 —— 标题写 779、表格 300 行。
+const eventTotal = ref(0)
+const eventPage = ref(1)
+const eventPageSize = ref(50)
+const eventFilter = reactive({ kind: 'conclusion', type: '', module: '', q: '' })
+let eventSearchTimer = null
 // 每源运行统计。后端在 scan 载荷里带上（live 走 manager.to_dict，
 // 历史扫描走 _historical_scan），所以不用额外请求。
 const sourceStats = ref([])
@@ -849,17 +924,113 @@ function categoryLabel(slug) {
   return CATEGORY_LABELS[slug] || slug
 }
 
+// ---------------------------------------------------------------- 事件流（服务端分页）
+
+/** 溯源链按阅读方向翻转：后端是「当前事件 -> 父 -> … -> 种子」，
+ *  渲染时要反过来，让种子在顶部、点开的那条在底部。 */
+const traceTopDown = computed(() => [...trace.value].reverse())
+
+/** 取当前页。筛选/页码变化时重新调。 */
+async function loadEventPage() {
+  const f = eventFilter
+  return getEvents(id, {
+    limit: eventPageSize.value,
+    offset: (eventPage.value - 1) * eventPageSize.value,
+    kind: f.kind,
+    // 空串不要发：后端会当成"筛一个空类型"
+    ...(f.type ? { type: f.type } : {}),
+    ...(f.module ? { module: f.module } : {}),
+    ...(f.q ? { q: f.q } : {}),
+  })
+}
+
+function applyEventPage(page) {
+  events.value = page?.items || []
+  eventTotal.value = page?.total || 0
+}
+
+async function reloadEvents() {
+  try {
+    applyEventPage(await loadEventPage())
+  } catch (e) {
+    message.error(e.message)
+  }
+}
+
+/** 筛选一变就回到第 1 页 —— 停在第 7 页看第 1 页的结果只会让人以为筛坏了。 */
+async function onEventFilterChange() {
+  eventPage.value = 1
+  await reloadEvents()
+}
+
+/** 搜索框防抖：每敲一个字就发一次请求会打满后端。 */
+function onEventSearch(v) {
+  eventFilter.q = v
+  clearTimeout(eventSearchTimer)
+  eventSearchTimer = setTimeout(onEventFilterChange, 400)
+}
+
+function onEventPageChange(p, size) {
+  eventPage.value = p
+  if (size !== eventPageSize.value) {
+    eventPageSize.value = size
+    eventPage.value = 1
+  }
+  reloadEvents()
+}
+
+// ---------------------------------------------------------------- 事件流
+
+//: 事件类型 -> 颜色。扫一眼就能区分"新域名"和"新证书"，
+//: 不用逐行读那列等宽字体。
+const EVENT_TYPE_COLOR = {
+  SEED: 'default',
+  DNS_NAME: 'blue',
+  IP_ADDRESS: 'cyan',
+  OPEN_TCP_PORT: 'geekblue',
+  URL: 'default',
+  HTTP_RESPONSE: 'default',
+  SSL_CERTIFICATE: 'purple',
+  TECHNOLOGY: 'magenta',
+  FINDING: 'red',
+}
+function eventTypeColor(t) {
+  return EVENT_TYPE_COLOR[t] || 'default'
+}
+
+const eventTypeOptions = [
+  { value: 'DNS_NAME', label: 'DNS_NAME · 新域名' },
+  { value: 'IP_ADDRESS', label: 'IP_ADDRESS · 新 IP' },
+  { value: 'OPEN_TCP_PORT', label: 'OPEN_TCP_PORT · 新端口' },
+  { value: 'SSL_CERTIFICATE', label: 'SSL_CERTIFICATE · 证书' },
+  { value: 'TECHNOLOGY', label: 'TECHNOLOGY · 技术栈' },
+  { value: 'FINDING', label: 'FINDING · 结论' },
+  { value: 'URL', label: 'URL（过程）' },
+  { value: 'HTTP_RESPONSE', label: 'HTTP_RESPONSE（过程）' },
+]
+
+//: 来源模块下拉。**取自这次扫描实际产出过事件的模块**，不是写死一张清单 ——
+//: 写死的清单会漏掉新加的模块，界面上就出现"有事件但下拉里选不到"。
+const eventModuleOptions = computed(() => {
+  const seen = new Set()
+  for (const e of events.value) if (e.module) seen.add(e.module)
+  if (!seen.size) {
+    for (const s of sourceStats.value) if (s.source) seen.add(s.source)
+  }
+  return [...seen].sort().map((m) => ({ value: m, label: m }))
+})
+
 async function loadAll() {
   loading.value = true
   try {
-    const [detail, asset, eventList] = await Promise.all([
+    const [detail, asset, eventPage] = await Promise.all([
       getScan(id),
       getAssets(id),
-      getEvents(id, 300),
+      loadEventPage(),
     ])
     scan.value = detail
     assets.value = asset
-    events.value = eventList
+    applyEventPage(eventPage)
     sourceStats.value = detail.source_stats || []
     busy.value = ['running', 'finalizing'].includes(detail.status)
     progress.value = detail.progress || {}
@@ -1153,41 +1324,89 @@ onUnmounted(() => {
   font-variant-numeric: tabular-nums;
   font-weight: 500;
 }
+/* ── 发现链：一条**路径**（每个事件只有一个 parent），所以画成链而不是通用 DAG ──
+   不引第三方图库：数据本身就是一条线性链，手写 CSS 足够，还不用动
+   package.json。边上的「↓ XXX 产生」才是这张图真正要看的东西 —— 编号列表
+   看不出"这一步变成了什么"。 */
+.trace {
+  padding: 4px 2px 8px;
+  max-height: 66vh;
+  overflow: auto;
+}
 .trace-node {
-  display: flex;
-  gap: 12px;
-  padding: 10px 0;
-  border-bottom: 1px dashed var(--tk-border);
+  position: relative;
+  padding: 10px 12px;
+  border: 1px solid var(--tk-border);
+  border-radius: 8px;
+  background: var(--tk-bg-subtle, rgba(0, 0, 0, 0.03));
 }
-.trace-node:last-child {
-  border-bottom: none;
-}
-.trace-index {
-  width: 24px;
-  height: 24px;
-  flex-shrink: 0;
-  border-radius: 50%;
-  background: var(--tk-accent);
-  color: #fff;
-  font-size: 12px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-.trace-body {
-  min-width: 0;
-  flex: 1;
+/* 用户点开的那条：描边加重，一眼知道自己在看哪个 */
+.trace-node.trace-leaf {
+  border-color: var(--tk-accent);
+  box-shadow: 0 0 0 1px var(--tk-accent) inset;
 }
 .trace-head {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 4px;
+  gap: 6px;
+  flex-wrap: wrap;
 }
-.trace-module {
+.trace-leaf-tag {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--tk-accent);
+  border: 1px solid var(--tk-accent);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.trace-data {
+  margin-top: 4px;
   font-size: 12px;
+  word-break: break-all;
 }
 .trace-time {
+  font-size: 11px;
+  margin-top: 2px;
+}
+/* 边：竖线 + 转换标注 */
+.trace-edge {
+  position: relative;
+  height: 30px;
+  margin-left: 14px;
+  border-left: 2px solid var(--tk-border);
+}
+.trace-edge-line {
+  position: absolute;
+  left: -2px;
+  bottom: 0;
+  width: 10px;
+  height: 10px;
+  border-left: 2px solid var(--tk-border);
+  border-bottom: 2px solid var(--tk-border);
+  transform: rotate(-45deg);
+}
+.trace-edge-label {
+  position: absolute;
+  left: 12px;
+  top: 7px;
+  font-size: 11px;
+  color: var(--tk-text-muted, #888);
+  white-space: nowrap;
+}
+
+/* 事件流筛选栏 */
+.evt-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+/* `.trace-index` / `.trace-body` 随编号列表一起去掉了（图形版没有编号圈）。
+   ⚠️ 旧版的 `.trace-head` / `.trace-time` 也一并删了：它们留在新块**之后**，
+   同优先级后写的赢，会把新版的 `align-items: center` + `flex-wrap: wrap`
+   盖掉 —— 叶节点标签靠 `margin-left: auto` 右对齐，没有 wrap 时模块名一长就溢出。 */
+.trace-module {
   font-size: 12px;
 }
 .diff-title {

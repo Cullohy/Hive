@@ -39,8 +39,12 @@ export const deleteScan = (id) => http.delete(`/api/scans/${id}`)
 // 导出走存储层，不受这里影响）。
 export const getAssets = (id, limit = 2000) =>
   http.get(`/api/scans/${id}/assets`, { params: { limit } })
-export const getEvents = (id, limit = 300, type) =>
-  http.get(`/api/scans/${id}/events`, { params: { limit, ...(type ? { event_type: type } : {}) } })
+/**
+ * 事件列表。后端已做分页/筛选/倒序，返回 `{items, total}`。
+ * ⚠️ `kind` 默认 `conclusion`（只看结论型），要看全的传 `all`。
+ */
+export const getEvents = (id, params = {}) =>
+  http.get(`/api/scans/${id}/events`, { params })
 export const getTrace = (id, eventId) => http.get(`/api/scans/${id}/trace/${eventId}`)
 export const getDiff = (id, against) =>
   http.get(`/api/scans/${id}/diff`, { params: against ? { against } : {} })

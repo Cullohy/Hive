@@ -14,92 +14,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shutil
-import time
 import unittest
-import uuid
-from pathlib import Path
 
-from fastapi.testclient import TestClient
-
-from .pgutil import DSN, _drop_schema, ensure_database, new_schema
-from core.web.app import create_app
-
-TEST_TMP_ROOT = Path(__file__).resolve().parents[1] / ".testtmp"
-
-OFFLINE_PRESET = """
-name: offline
-description: 只跑离线演示源, 不联网
-include:
-  - demo_expand
-settings:
-  max_events: 1000
-"""
+from .base import WebTestCase
 
 
 # --------------------------------------------------------------------- 纯单元
 
 # --------------------------------------------------------------------- API
-
-class WebTestCase(unittest.TestCase):
-    def setUp(self) -> None:
-        TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
-        self.root = TEST_TMP_ROOT / f"w{uuid.uuid4().hex[:10]}"
-        self.root.mkdir(parents=True, exist_ok=True)
-        # 存储换成 PostgreSQL 之后没有"库文件"了：这个 schema 名就是隔离单位，
-        # 每个测试一个，tearDown 里删掉。
-        self.schema = new_schema()
-        self.settings_path = self.root / "web_settings.json"
-        self.preset_path = self.root / "offline.yml"
-        self.preset_path.write_text(OFFLINE_PRESET, encoding="utf-8")
-
-        asyncio.run(ensure_database())
-        app = create_app(
-            dsn=DSN,
-            schema=self.schema,
-            settings_path=self.settings_path,
-        )
-        self.client = TestClient(app)
-        self.client.__enter__()
-
-    def tearDown(self) -> None:
-        self.client.__exit__(None, None, None)
-        asyncio.run(_drop_schema(self.schema))
-        shutil.rmtree(self.root, ignore_errors=True)
-
-    # ------------------------------------------------------------------ 辅助
-    def start(
-        self,
-        targets: list[str],
-        preset: str | None = None,
-        name: str | None = "测试任务",
-    ) -> dict:
-        """下发一次扫描。
-
-        ``name`` 默认给一个 —— 名称是**必填**的（见 ``TestScanName``），
-        但绝大多数用例不关心它，不该每处都手写一遍。
-        """
-        body: dict = {
-            "targets": targets,
-            "preset": preset or str(self.preset_path),
-            "overrides": [],
-        }
-        # ``name=None`` 是**故意不发这个字段**，用来测"缺名称应当被拒"
-        if name is not None:
-            body["name"] = name
-        resp = self.client.post("/api/scans", json=body)
-        self.assertEqual(resp.status_code, 201, resp.text)
-        return resp.json()
-
-    def wait_done(self, scan_id: int, timeout: float = 30.0) -> dict:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            data = self.client.get(f"/api/scans/{scan_id}").json()
-            if data.get("status") not in ("running", "finalizing"):
-                return data
-            time.sleep(0.2)
-        raise AssertionError(f"扫描 #{scan_id} 未在 {timeout}s 内结束")
-
 
 class TestScanName(WebTestCase):
     """任务名称：**必填**，且三条读路径都要带出来。
@@ -589,7 +511,12 @@ class TestScanLifecycle(WebTestCase):
         scan_id = self.start(["example.com"])["scan_id"]
         self.wait_done(scan_id)
 
-        events = self.client.get(f"/api/scans/{scan_id}/events").json()
+        # ⚠️ 响应从「数组」变成 ``{"items": [...], "total": N}`` ——
+        #    因为要能分页、也才能在界面上说清"显示 N / 共 M"。
+        #    ``kind=all`` 是为了把 SEED 那条也拿进来（默认只给结论型）。
+        events = self.client.get(
+            f"/api/scans/{scan_id}/events", params={"kind": "all", "limit": 200}
+        ).json()["items"]
         self.assertGreater(len(events), 0)
         seed = next(e for e in events if e["type"] == "SEED")
         child = next(e for e in events if e["type"] == "DNS_NAME")
@@ -604,8 +531,8 @@ class TestScanLifecycle(WebTestCase):
         scan_id = self.start(["example.com"])["scan_id"]
         self.wait_done(scan_id)
         events = self.client.get(
-            f"/api/scans/{scan_id}/events", params={"type": "DNS_NAME"}
-        ).json()
+            f"/api/scans/{scan_id}/events", params={"type": "DNS_NAME", "limit": 200}
+        ).json()["items"]
         self.assertTrue(events)
         self.assertTrue(all(e["type"] == "DNS_NAME" for e in events))
 

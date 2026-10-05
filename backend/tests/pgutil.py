@@ -97,7 +97,7 @@ async def _acquire_run_lock() -> None:
             "两个进程会互删对方的 schema，把对方打成一片外键违规，\n"
             "而且报错完全看不出真实原因。\n"
             "  处理: 等那个进程跑完；或给它换一个库:\n"
-            "    $env:RECON_TEST_DB = 'recon_test2'"
+            "    $env:RECON_TEST_DB = 'recon_test2'   # 不存在会自动建"
         )
     _lock_conn = conn
 
@@ -107,7 +107,16 @@ async def ensure_database() -> None:
     global _db_ready
     if _db_ready:
         return
-    await _acquire_run_lock()
+
+    # ⚠️ **建库必须在拿锁之前**。
+    # advisory lock 是按库隔离的，所以要拿锁就得先能连上目标库 —— 而
+    # 第一次用某个新库名时那个库还不存在，连不上，报的是
+    # "connection was closed in the middle of operation"，看不出真实原因。
+    #
+    # 后果很实在：错误提示里推荐的那条逃生命令
+    # ``$env:RECON_TEST_DB = 'recon_test2'`` **第一次必然失败**，
+    # 只有那个库已经存在才生效 —— 也就是说"被另一个进程占着"这条
+    # 提示给出的唯一解法，第一次用是不管用的。
     try:
         admin = await asyncpg.connect(_ADMIN_DSN)
     except Exception as e:  # noqa: BLE001
@@ -122,12 +131,19 @@ async def ensure_database() -> None:
             # **排序规则必须与生产一致（C / UTF8 / template0）** ——
             # 测试库用平台默认 locale 的话，ORDER BY 与索引行为和生产不同，
             # 测出来的东西不能代表生产。详见 storage/bootstrap.py 的模块文档。
-            await admin.execute(
-                f'CREATE DATABASE "{DB_NAME}" '
-                f"ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0"
-            )
+            try:
+                await admin.execute(
+                    f'CREATE DATABASE "{DB_NAME}" '
+                    f"ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0"
+                )
+            except asyncpg.DuplicateDatabaseError:
+                # 两个进程同时建同一个库。有一个成了就够了，不是错误。
+                pass
     finally:
         await admin.close()
+
+    # 库在了，现在才拿得到锁。锁住了才有资格去删 schema。
+    await _acquire_run_lock()
 
     # 上一次跑挂掉会留下 schema。不清的话它们会一直堆着，
     # 而且残留的 pg_trgm 索引还会挡住"把扩展挪到 public"这类修复。

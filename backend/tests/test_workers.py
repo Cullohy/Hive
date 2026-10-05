@@ -265,7 +265,7 @@ class TestMultiWorker(EngineTestCase):
         )
 
     async def _seen_urls(self, scan_id: int) -> set[str]:
-        events = await self.storage.events(scan_id, limit=2000, event_type="URL")
+        events, _ = await self.storage.events(scan_id, limit=2000, event_type="URL")
         return {e["data"] for e in events if e["module"] == "emit_many"}
 
     async def test_single_worker_is_the_baseline(self) -> None:

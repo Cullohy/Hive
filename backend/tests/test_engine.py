@@ -220,7 +220,7 @@ class TestEventChain(EngineTestCase):
         scanner, _ = await self.run_scan(
             targets=["example.com"], include=["chain_a", "chain_b"]
         )
-        events = await self.storage.events(scanner.scan_id, limit=50)
+        events, _ = await self.storage.events(scanner.scan_id, limit=50)
         ip_event = next(e for e in events if e["type"] == "IP_ADDRESS")
 
         chain = await self.storage.trace(scanner.scan_id, ip_event["id"])
@@ -229,6 +229,43 @@ class TestEventChain(EngineTestCase):
         self.assertIn("DNS_NAME", types)
         self.assertEqual(types[-1], "SEED")
         self.assertEqual(chain[-1]["data"], "example.com")
+
+    async def test_events_default_order_is_emission_order(self) -> None:
+        """存储层 ``events()`` 默认**升序**（= 发射顺序），倒序要显式要。
+
+        ⚠️ 这条钉的是一个踩过的坑：事件流界面要"最新进展在第一页"，于是曾经把
+        ``ORDER BY id DESC`` 设成了存储层的**默认值**。结果 ``test_urls.py`` 里
+        ``_parents()`` 按行顺序建表、断言"浅路径排在深路径前面"，整个顺序反过来，
+        两条测试红了 —— 而那两条测的是 ``url_extract`` 的**发射顺序**，
+        跟事件显示顺序毫无关系。
+
+        显示偏好渗进数据层默认值，代价是每个顺序敏感的调用方都悄悄拿到反的，
+        而且报错地点离原因十万八千里。
+        """
+        self.add_module_file("chain", CHAIN)
+        scanner, _ = await self.run_scan(
+            targets=["example.com"], include=["chain_a", "chain_b"]
+        )
+        asc, _ = await self.storage.events(scanner.scan_id, limit=50)
+        desc, _ = await self.storage.events(scanner.scan_id, limit=50, order="desc")
+
+        self.assertEqual(len(asc), len(desc))
+        self.assertGreater(len(asc), 1, "样本太少，钉不住顺序")
+        ids_asc = [e["id"] for e in asc]
+        self.assertEqual(ids_asc, sorted(ids_asc), "默认不是升序（= 发射顺序）")
+        self.assertEqual([e["id"] for e in desc], sorted(ids_asc, reverse=True),
+                         "order='desc' 没把顺序反过来")
+
+    async def test_events_rejects_unknown_order(self) -> None:
+        """``order`` 走白名单 —— 它是被拼进 SQL 的，不能当注入面开着。"""
+        self.add_module_file("chain", CHAIN)
+        scanner, _ = await self.run_scan(
+            targets=["example.com"], include=["chain_a", "chain_b"]
+        )
+        rows, _ = await self.storage.events(
+            scanner.scan_id, limit=50, order="id; DROP TABLE event"
+        )
+        self.assertTrue(rows, "非法 order 应当退回默认，而不是报错或返回空")
 
 
 class TestGates(EngineTestCase):
@@ -952,7 +989,7 @@ class TestPipelineDepth(EngineTestCase):
             targets=["example.com"],
             include=["hop1", "hop2", "hop3", "hop4", "hop5", "hop6"],
         )
-        events = await self.storage.events(scanner.scan_id, limit=200)
+        events, _ = await self.storage.events(scanner.scan_id, limit=200)
         by_data = {e["data"]: e for e in events}
         # 前 4 跳全是非递归派生 -> 距离 0
         for data in ("1.2.3.4", "1.2.3.4:80", "http://example.com/",

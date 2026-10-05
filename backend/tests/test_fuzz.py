@@ -383,7 +383,7 @@ class TestDirBrute(EngineTestCase):
             )
 
     async def _urls(self, scan_id: int) -> set[str]:
-        events = await self.storage.events(scan_id, limit=2000, event_type="URL")
+        events, _ = await self.storage.events(scan_id, limit=2000, event_type="URL")
         return {e["data"] for e in events if e["module"] == "dir_brute"}
 
     async def _findings(self, scan_id: int) -> list[str]:
@@ -486,7 +486,7 @@ class TestDirBrute(EngineTestCase):
             return self._resp(url, 200, 7777)
 
         scanner, _ = await self._scan(responder)
-        events = await self.storage.events(
+        events, _ = await self.storage.events(
             scanner.scan_id, limit=2000, event_type="HTTP_RESPONSE"
         )
         mine = [e for e in events if e["module"] == "dir_brute"]
@@ -1672,7 +1672,7 @@ class TestBusyHint(EngineTestCase):
         )
         await asyncio.wait_for(scanner.scan(), timeout=30)
         self.assertEqual(scanner.progress()["busy"], {})
-        urls = await self.storage.events(
+        urls, _ = await self.storage.events(
             scanner.scan_id, limit=100, event_type="URL",
         )
         self.assertTrue(urls, "模块自己的活没干完就完了，那是另一个 bug")
@@ -2515,7 +2515,7 @@ class TestRootFallbackAndServerErrors(EngineTestCase):
             )
 
     async def _urls(self, scan_id: int) -> set[str]:
-        events = await self.storage.events(scan_id, limit=500, event_type="URL")
+        events, _ = await self.storage.events(scan_id, limit=500, event_type="URL")
         return {e["data"] for e in events if e["module"] == "dir_brute"}
 
     # ------------------------------------------------------------------ ③
@@ -3106,7 +3106,7 @@ class TestAuthStatusAndBypass(EngineTestCase):
             )
 
     async def _urls(self, scan_id: int) -> set[str]:
-        events = await self.storage.events(scan_id, limit=500, event_type="URL")
+        events, _ = await self.storage.events(scan_id, limit=500, event_type="URL")
         return {e["data"] for e in events if e["module"] == "dir_brute"}
 
     # ------------------------------------------------------------------ ①
