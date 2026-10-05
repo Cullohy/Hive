@@ -482,11 +482,10 @@ domains/
 │   ├── standalone/     单独模块（3）demo_expand · seed_asset · shadow_asset
 │   └── _lib/           dns_query.py · dnsgen.py
 ├── resolve/            DNS 解析 + IP 富化   4 个模块 + _lib/（resolver · resolver_pool）
-├── port/               端口扫描            1 个模块 + _lib/（ports）
 ├── fingerprint/        指纹 / CDN / WAF    1 个模块 + _lib/（rules · library · waf · importers）
-└── web_hunter/         HTTP 面             7 个模块 + _lib/（soft404 · techdicts · bypass
-                        探活→抽链接→挖 JS→    · extract · discovery · jsassets · tls
-                        目录爆破→证书→截图      · webprofile）
+└── web_hunter/         HTTP 面             8 个模块 + _lib/（ports · soft404 · techdicts
+                        端口→探活→抽链接→     · bypass · extract · discovery · jsassets
+                        挖 JS→爆破→证书→截图   · tls · webprofile）
 ```
 
 | 位置 | 个数 | 内容 |
@@ -495,9 +494,16 @@ domains/
 | `domains/subdomain/active/` | 4 | `dns_brute` / `dns_permute` / `wildcard_detect` / `admin_plane` |
 | `domains/subdomain/standalone/` | 3 | `demo_expand`（离线演示源）· `seed_asset`（把种子本身产出为资产）· `shadow_asset` |
 | `domains/resolve/` | 4 | `dns_resolve` + `zone_transfer` + `ip_ptr` + `asn_enrich` |
-| `domains/port/` | 1 | `port_scan` |
 | `domains/fingerprint/` | 1 | `fingerprint`（WAF 识别内联进 `dir_brute` / `js_assets`，判据仍走 `fingerprint/_lib/waf.py`） |
-| `domains/web_hunter/` | 7 | `http_probe`（探活）+ `url_extract`（抽链接，零流量）+ `js_assets`（捞 JS 里的 URL 与主机名）+ `soft404_probe`（软 404 画像）+ `dir_brute`（目录爆破 + 403 熔断）+ `tls_cert` + `screenshot` |
+| `domains/web_hunter/` | 8 | `port_scan`（TCP connect 扫端口）+ `http_probe`（探活）+ `url_extract`（抽链接，零流量）+ `js_assets`（捞 JS 里的 URL 与主机名）+ `soft404_probe`（软 404 画像）+ `dir_brute`（目录爆破 + 403 熔断）+ `tls_cert` + `screenshot` |
+
+> **2026-10-05：`port/` 并入 `web_hunter/`。** 先前单列的理由是"端口扫描是
+> TCP 层、产物是 `OPEN_TCP_PORT`，不是 HTTP 面"——这个理由站不住：域的划分标准
+> 是"一类问题"而**不是"一个模块一个文件夹"**（`resolve/` 1641 行、
+> `fingerprint/` 2874 行**都只有 1 个模块**）；而 `OPEN_TCP_PORT` 是
+> `http_probe` 与 `tls_cert` 的**唯一输入**、消费方全在本域内、没有跨域调用。
+> 事件链上 TCP 与 HTTP 的分界线画在 `port_scan` **之后**更准。
+> `port_scan` 自己的 `flags`（`active, loud`）与内网闸门都没动，扫描行为零变化。
 
 ### 这套划分对应整条流水线
 
@@ -536,8 +542,8 @@ domains/
 
 | 文件 | 有可运行的 `BaseModule` 子类吗 | 结果 |
 |---|---|---|
-| `domains/port/port_scan.py` | 有（`port_scan`） | 模块 |
-| `domains/port/_lib/ports.py` | 没有 | 库，被忽略 |
+| `domains/web_hunter/port_scan.py` | 有（`port_scan`） | 模块 |
+| `domains/web_hunter/_lib/ports.py` | 没有 | 库，被忽略 |
 | `domains/subdomain/_lib/dns_query.py` | 有，但标了 `abstract = True` | 基类，被忽略 |
 
 **给别的模块继承的基类必须标 `abstract = True`**，否则它自己也会被当成模块跑起来
@@ -863,13 +869,12 @@ D:\Search\recon\                 ← 仓库根（项目名 recon）
 │   │   │   ├── resolve/        #   DNS 解析 + IP 富化（4）dns_resolve / zone_transfer
 │   │   │   │                   #     / ip_ptr / asn_enrich
 │   │   │   │   └── _lib/       #     resolver.py · resolver_pool.py（★ 见 §10.5）
-│   │   │   ├── port/           #   端口扫描（1）port_scan
-│   │   │   │   └── _lib/       #     ports.py
 │   │   │   ├── fingerprint/    #   指纹 / CDN / WAF（1）fingerprint
-│   │   │   └── web_hunter/     #   HTTP 面（7）http_probe · url_extract · js_assets
-│   │   │                       #     · soft404_probe · dir_brute · tls_cert · screenshot
-│   │   │                       #     _lib/：soft404 · techdicts · bypass · extract
-│   │   │                       #     · discovery · jsassets · tls · webprofile
+│   │   │   └── web_hunter/     #   HTTP 面（8）port_scan · http_probe · url_extract
+│   │   │                       #     · js_assets · soft404_probe · dir_brute
+│   │   │                       #     · tls_cert · screenshot
+│   │   │                       #     _lib/：ports · soft404 · techdicts · bypass
+│   │   │                       #     · extract · discovery · jsassets · tls · webprofile
 │   │   ├── services/           # **跨域通用**的能力，仅此四类
 │   │   │   ├── http.py         #   异步 HTTP —— 被动源/探活/截图都在用
 │   │   │   ├── diff.py         #   两次扫描的资产差异对比
@@ -971,7 +976,7 @@ frontend_dist()    # 前端构建产物（可用 RECON_FRONTEND_DIR 覆盖）
 | `app/utils/cdn.py` | CDN 判定顺序 + gslb/dns/cache 启发式 | `backend/core/util/cdn.py` |
 | `app/utils/domain.py` | 域名校验与禁止域名语义（另修了 BOM 问题） | `backend/core/util/domain.py` |
 | `app/utils/ip.py::not_in_black_ips` | 黑名单 IP 的语义 | `backend/core/util/net.py`（默认值反过来） |
-| `app/services/portScan.py` | 端口集 + "开放端口异常多"的经验值（>600） | `backend/core/util/net.py` / `backend/core/domains/port/port_scan.py` |
+| `app/services/portScan.py` | 端口集 + "开放端口异常多"的经验值（>600） | `backend/core/util/net.py` / `backend/core/domains/web_hunter/port_scan.py` |
 | `app/services/probeHTTP.py` | "https 活着就别单独记 http"、弱状态码清单 | `backend/core/domains/web_hunter/http_probe.py` |
 | `app/utils/cert.py` | 证书字段清单（subject/issuer/validity/fingerprint） | `backend/core/domains/web_hunter/_lib/tls.py`（改用 cryptography） |
 | `dicts/*` | domain_2w / altdnsdict / cdn_info / 端口集 | `backend/core/resources/` |

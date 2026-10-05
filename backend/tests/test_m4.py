@@ -17,7 +17,7 @@ from unittest import mock
 
 from core.engine.preset import Preset
 from core.services.http import FetchResult, HTTPClient
-from core.domains.port._lib.ports import ConnectScanner
+from core.domains.web_hunter._lib.ports import ConnectScanner
 from core.domains.resolve._lib.resolver import AsyncResolverPool
 from core.domains.web_hunter._lib.tls import CertInfo
 from core.util.net import parse_ports, scan_allowed

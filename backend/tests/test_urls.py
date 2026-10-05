@@ -214,7 +214,7 @@ class TestUrlExtractModule(EngineTestCase):
         )
 
     async def _scan(self, **cfg):
-        from core.domains.port._lib.ports import ConnectScanner
+        from core.domains.web_hunter._lib.ports import ConnectScanner
         from core.services.http import HTTPClient
 
         self.add_module_file("emit_ips", EMIT_IPS)

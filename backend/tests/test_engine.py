@@ -820,13 +820,16 @@ class TestModuleDiscovery(unittest.TestCase):
                     "passive_subdomaincenter", "passive_urlscan", "passive_wayback",
                 ]),
                 "resolve": ["asn_enrich", "dns_resolve", "ip_ptr", "zone_transfer"],
-                "port": ["port_scan"],
                 "fingerprint": ["fingerprint"],
                 # 2026-10-04：原 probe/ + urls/ + fuzz/ 三个域合并成 web_hunter/。
-                # 模块名与 flags 一个没动，只是同域了。
+                # 2026-10-05：port_scan 也并进来（OPEN_TCP_PORT 是 http_probe 与
+                # tls_cert 的唯一输入，消费方全在本域内；原先"TCP 层 vs HTTP 层"
+                # 那条理由不成立 —— 域的划分标准是"一类问题"，不是"一行代码"，
+                # resolve/ 与 fingerprint/ 也都是 1 个模块）。
+                # 模块名与 flags 一律没动，只是同域了。
                 "web_hunter": sorted([
                     "http_probe", "screenshot", "soft404_probe", "tls_cert",
-                    "js_assets", "url_extract", "dir_brute",
+                    "js_assets", "url_extract", "dir_brute", "port_scan",
                 ]),
             },
         )
