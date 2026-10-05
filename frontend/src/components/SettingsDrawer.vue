@@ -11,6 +11,32 @@
           <a-input-number v-model:value="form.max_concurrent_scans" :min="1" :max="16" />
         </a-form-item>
 
+        <a-form-item label="出站代理">
+          <a-radio-group v-model:value="form.proxy_mode" style="margin-bottom: 8px">
+            <a-radio value="env">跟随环境</a-radio>
+            <a-radio value="direct">强制直连</a-radio>
+            <a-radio value="custom">指定代理</a-radio>
+          </a-radio-group>
+          <a-input
+            v-if="form.proxy_mode === 'custom'"
+            v-model:value="form.proxy"
+            placeholder="http://127.0.0.1:7897"
+          />
+          <div v-if="effectiveProxy" class="tk-muted hint" style="margin-top: 6px">
+            当前实际走：<b>{{ effectiveProxy }}</b>
+            <span v-if="proxyFromEnv">（来自环境变量 {{ proxyFromEnv }}）</span>
+          </div>
+          <div v-else class="tk-muted hint" style="margin-top: 6px">
+            当前实际走：<b>直连</b>
+          </div>
+        </a-form-item>
+        <div class="tk-muted hint" style="margin: -6px 0 12px">
+          「跟随环境」会读 <code>RECON_PROXY</code> → <code>HTTPS_PROXY</code> →
+          <code>HTTP_PROXY</code>。⚠️ 代理进程关掉后，出站会静悄悄断掉 ——
+          任务表现为"卡住、界面像死了"，日志里一条错都没有。所以代理不用时
+          请显式选「强制直连」，别留在「跟随环境」。
+        </div>
+
         <a-divider style="margin: 4px 0 16px" />
 
         <a-collapse ghost>
@@ -219,7 +245,15 @@ const form = reactive({
     email_to: '',
     min_changes: 1,
   },
+  //: 出站代理三态：env=跟随环境 / direct=强制直连 / custom=用 form.proxy
+  proxy_mode: 'env',
+  proxy: '',
 })
+
+//: 服务端算出来的**实际**走法（跟着环境变量算，所以可能是"你没配但环境里有"）。
+//: 显示它是因为出站被甩去一个关掉的代理时，界面其它地方一点痕迹都没有。
+const effectiveProxy = ref('')
+const proxyFromEnv = ref('')
 
 //: 某个源是否已经配过 Key。服务端只回传**模块名列表**，不回传值。
 function isKeySet(name) {
@@ -281,6 +315,13 @@ async function load() {
       feishu_secret: '',
       email_password: '',
     })
+    // 代理是**非密钥**，服务端会把当前三态和"实际走哪条"一起回传。
+    // `proxy_effective` 是跟着环境变量算出来的 —— 可能出现"我没配但环境里有
+    // 一个已经关掉的代理"（实测踩过：任务卡住 24 分钟、界面毫无痕迹）。
+    form.proxy_mode = data.proxy_mode || 'env'
+    form.proxy = data.proxy || ''
+    effectiveProxy.value = data.proxy_effective || ''
+    proxyFromEnv.value = data.proxy_from_env || ''
   } catch (e) {
     message.error(e.message)
   } finally {
@@ -308,6 +349,10 @@ async function save() {
         email_to: (form.notify.email_to || '').trim(),
         min_changes: Number(form.notify.min_changes) || 1,
       },
+      // 代理：**每次都提交**（三态是显式的，不靠"没提交=不变"）。
+      // 服务端据此把 env/direct/custom 落到"None / 空串 / 地址"。
+      proxy_mode: form.proxy_mode,
+      proxy: (form.proxy || '').trim(),
     }
     // 源 API Key：**整块提交**（含空值），与附加配置同一套语义。
     //
