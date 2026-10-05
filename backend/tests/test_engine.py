@@ -1085,5 +1085,83 @@ class TestFinalizeAlwaysFinishesTheScan(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["scan_id"], 54)
 
 
+class TestCleanupSurvivesRepeatedCancel(EngineTestCase):
+    """模块清理**必须**跑到，哪怕扫描在 finally 里又被取消一次。
+
+    ``stop()`` 只要求 ``status == "running"``，而 ``Scanner.scan()`` 的 finally
+    里 ``await asyncio.gather(...)`` 让出控制权时状态还没改成 stopped ——
+    这个窗口里第二次 ``cancel()`` 会让 ``CancelledError`` 直接穿过 finally，
+    ``_cleanup_modules()`` 永不执行。``setup()`` 拉起的 Chromium（screenshot
+    模块）于是留在系统里，多轮累积。
+
+    ⚠️ 这条测试需要一个**真挂住**的模块：``dispatcher`` / ``workers`` 全是
+    ``None`` 时 gather 整个被跳过，那里根本没有 await 点可供第二次 cancel
+    打断 —— 我第一版直接往 ``scanner.modules`` 里塞对象，测试全绿却什么
+    都没测到（变异验证当场揭穿了）。
+    """
+
+    async def test_cleanup_runs_even_when_cancelled_again(self) -> None:
+        import asyncio
+
+        trace = self.root / "trace.txt"
+        self.add_module_file("blocker", f'''
+            import asyncio
+
+            from core.engine.event import EventType
+            from core.engine.module import BaseModule
+
+
+            def _t(msg):
+                with open(r"{trace}", "a", encoding="utf-8") as fh:
+                    fh.write(msg + "\\n")
+
+
+            class blocker(BaseModule):
+                watched_events = (EventType.SEED,)
+                produced_events = (EventType.DNS_NAME,)
+                flags = ("passive", "safe")
+
+                async def setup_deps(self):
+                    _t("setup")
+                    return True
+
+                async def cleanup(self):
+                    _t("cleanup")
+
+                async def handle_event(self, event):
+                    # 挂住，让 worker 一直活着 -> gather 真的会被 await。
+                    # 取消**故意**慢一点：真实的模块（Playwright 拆卸、连接池
+                    # 关闭）收敛要花时间，那个窗口正是 bug 所在 —— 收得太快，
+                    # 第二次 cancel 到达时 finally 早就做完了，测不到东西。
+                    try:
+                        await asyncio.sleep(3600)
+                    except asyncio.CancelledError:
+                        await asyncio.sleep(0.4)
+                        raise
+        ''')
+
+        preset = Preset(
+            name="t", include=["blocker"], module_dirs=[str(self.module_dir)],
+        )
+        scanner = Scanner(
+            targets=["example.com"], preset=preset, storage=self.storage,
+        )
+        task = asyncio.create_task(scanner.scan())
+        await asyncio.sleep(0.3)      # 让 setup + worker 真的起来
+        task.cancel()                  # 第一次
+        await asyncio.sleep(0.05)     # 让它进到 finally 的 gather
+        task.cancel()                  # 第二次：正打在 gather 上
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.05)     # shield 里的清理 task 需要跑完
+
+        seen = trace.read_text(encoding="utf-8").split() if trace.exists() else []
+        self.assertIn("setup", seen, f"前提：模块真的 setup 过了，实际 {seen}")
+        self.assertIn(
+            "cleanup", seen,
+            f"模块清理没有执行：{seen} —— Chromium 会留在系统里",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

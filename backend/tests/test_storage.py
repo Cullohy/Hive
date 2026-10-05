@@ -22,11 +22,14 @@ from core.storage.pg import (
     convert_placeholders,
 )
 from core.storage.postgres import (
+    _ASSET_FILTER_FIELDS,
     _LIVE_COUNT_SQL,
     _LIVE_SQL,
+    _NUMERIC_FILTER_FIELDS,
     _SEARCH_SPECS,
     SEARCH_KEYS,
     PostgresStorage,
+    _build_filter_where,
     _live_clause,
     _search_where,
 )
@@ -600,6 +603,58 @@ class TestDefaultConfig(unittest.TestCase):
         self.assertIsNotNone(app)
 
 
+class TestFilterOpAppliesToColumnType(unittest.TestCase):
+    """筛选操作符**能不能用在这类列上**要判，不能只判"认不认识这个 op"。
+
+    ``contains`` 展开成 ``{col} ILIKE ?``。用在 int 列上时 asyncpg 会直接抛
+    ``DataError``（"can't adapt type 'int' for ILIKE"）→ 接口 500。数字列本来
+    也没有"子串"语义（``status=2`` 不是"含 2"），所以只能丢弃。
+    """
+
+    def test_contains_on_a_numeric_column_is_dropped(self) -> None:
+        for op in ("contains", "not_contains"):
+            with self.subTest(op=op):
+                sql, params = _build_filter_where(
+                    "urls", [{"field": "status", "op": op, "value": "2"}]
+                )
+                self.assertEqual((sql, params), ("", []),
+                                 f"status 的 {op} 应当被丢弃，不能生成 ILIKE")
+
+    def test_numeric_comparison_still_works(self) -> None:
+        for op in ("eq", "ne", "gt", "gte", "lt", "lte"):
+            with self.subTest(op=op):
+                sql, params = _build_filter_where(
+                    "urls", [{"field": "status", "op": op, "value": "200"}]
+                )
+                self.assertTrue(sql, f"status 的 {op} 是合法的，不该被丢")
+                self.assertEqual(params, [200])
+                self.assertNotIn("ILIKE", sql)
+
+    def test_string_column_keeps_contains(self) -> None:
+        sql, params = _build_filter_where(
+            "urls", [{"field": "url", "op": "contains", "value": "admin"}]
+        )
+        self.assertIn("ILIKE", sql)
+        self.assertEqual(params, ["%admin%"])
+
+    def test_every_op_is_safe_on_every_numeric_field(self) -> None:
+        """逐个操作符 × 逐个数字列扫一遍 —— 不留"忘了哪一个"的缝。"""
+        from core.storage.postgres import _FILTER_OPS, _NUMERIC_FILTER_FIELDS
+
+        asset_for = {"status": "urls", "port": "ports"}
+        for field in _NUMERIC_FILTER_FIELDS:
+            for op in _FILTER_OPS:
+                with self.subTest(field=field, op=op):
+                    sql, params = _build_filter_where(
+                        asset_for[field], [{"field": field, "op": op, "value": "2"}]
+                    )
+                    if sql and params and isinstance(params[0], int):
+                        self.assertNotIn(
+                            "ILIKE", sql,
+                            f"{field} 的 {op} 展开成 ILIKE 却传了 int → 会 500",
+                        )
+
+
 class TestRealDatabase(unittest.IsolatedAsyncioTestCase):
     """真库往返：只测方言适配里最容易错的那几条。"""
 
@@ -736,6 +791,131 @@ class TestRealDatabase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(row[0], 0)
 
+
+
+
+    # ------------------------------------------------------------ 查询里的字面量
+    async def test_events_query_escapes_like_wildcards(self) -> None:
+        """事件流搜索框里输入 ``%`` **不能变成"匹配全部"**。
+
+        ``_like()`` 转义 ``%`` 与 ``_`` 并要求 SQL 带上 ``ESCAPE '\\'``；
+        ``search_assets`` / ``search_flat`` 都走它，只有 ``events()`` 以前直接
+        ``f"%{query}%"`` 拼进去 —— 搜一个 ``%`` 会把所有事件都捞出来。
+        """
+        from core.engine.event import Event, EventType
+
+        sid = await self.storage.create_scan(targets=["example.com"], preset="t")
+        await self.storage.save_event(
+            sid, Event(type=EventType.DNS_NAME, data="cpu 100%", module="m")
+        )
+        await self.storage.save_event(
+            sid, Event(type=EventType.DNS_NAME, data="cpu 100X", module="m")
+        )
+        await self.storage.save_event(
+            sid, Event(type=EventType.DNS_NAME, data="host a_b", module="m")
+        )
+        await self.storage.save_event(
+            sid, Event(type=EventType.DNS_NAME, data="host aXb", module="m")
+        )
+
+        pct, total = await self.storage.events(sid, limit=50, query="100%")
+        self.assertEqual([r["data"] for r in pct], ["cpu 100%"],
+                         "'%' 被当成了通配符")
+        self.assertEqual(total, 1, "total 也必须跟着过滤，不能报全量")
+
+        under, _ = await self.storage.events(sid, limit=50, query="a_b")
+        self.assertEqual([r["data"] for r in under], ["host a_b"],
+                         "'_' 被当成了单字符通配符")
+
+    async def test_host_detail_findings_count_is_not_the_list_length(self) -> None:
+        """详情面板的"发现"数必须是**真实总数**，不是截断后的列表长度。
+
+        ``target LIKE '%name%'`` 会把子域的证书 / WAF 结论一起捞进来，几十条
+        很常见。曾经 ``counts["findings"] = len(findings)`` 而列表固定
+        ``LIMIT 50`` —— 于是面板写 50、概览写 312，用户以为还有 262 条没加载。
+        这正是 ``global_stats`` 注释里写的"计数与列表必须一致"。
+        """
+        from core.engine.event import Event, EventType
+
+        HOST = "cnt.example.com"
+        total = 60
+        sid = await self.storage.create_scan(targets=["example.com"], preset="t")
+        await self.storage.project(
+            sid, Event(type=EventType.DNS_NAME, data=HOST, module="m", tags={})
+        )
+        await self._insert_finding(
+            f"INSERT INTO finding (scan_id, kind, target, detail, severity, created_at)"
+            f" VALUES ({sid}, 'cdn', '{HOST}', 'd{{i}}', 'info', '2026-01-01')",
+            total,
+        )
+
+        data = await self.storage.host_detail(HOST)
+        self.assertEqual(len(data["findings"]), 50, "列表应当仍然截断到 50")
+        self.assertEqual(data["counts"]["findings_shown"], 50)
+        self.assertEqual(
+            data["counts"]["findings"], total,
+            f"计数用的是截断后的列表长度：面板说 50、实际 {total}",
+        )
+
+    async def _insert_finding(self, sql_tmpl: str, times: int) -> None:
+        """把一条**无参** INSERT 模板跑 N 遍（``{i}`` 逐行替换）。
+
+        ``finding`` 上有 ``uq_finding(scan_id, kind, target, detail)``，所以
+        每行的 detail 必须不同，否则第二条就撞唯一约束。
+        """
+        for i in range(times):
+            await self.storage.conn.execute(sql_tmpl.format(i=i))
+        await self.storage.conn.commit()
+
+    async def test_update_returns_false_when_nothing_matched(self) -> None:
+        """传一个已被删掉的 id 时，接口**不能**回"保存成功"。
+
+        ``delete_monitor`` / ``delete_group`` 早就用 ``bool(rowcount)`` 判成败，
+        两个 ``update_*`` 却无条件 ``return True`` —— 改动静默丢弃。
+        """
+        mid = await self.storage.create_monitor(
+            name="m1", targets=["example.com"], preset="passive",
+        )
+        self.assertTrue(await self.storage.update_monitor(mid, name="改名了"))
+        self.assertEqual(
+            (await self.storage.get_monitor(mid))["name"], "改名了",
+            "前提：正常路径要真的写进去",
+        )
+        self.assertFalse(
+            await self.storage.update_monitor(mid + 9999, name="改了不存在的"),
+            "更新 0 行却返回 True —— 改动被静默丢弃",
+        )
+
+        gid = await self.storage.create_group(name="g1", scopes=["example.com"])
+        self.assertTrue(await self.storage.update_group(gid, description="d"))
+        self.assertFalse(
+            await self.storage.update_group(gid + 9999, description="x"),
+            "更新 0 行却返回 True",
+        )
+
+    async def test_screenshot_failure_is_logged(self) -> None:
+        """截图写失败**要留线索**。
+
+        ``rowcount == 0`` 那条分支有 warning，而连接断了 / 权限不足 / 语句
+        超时全被压成同一个 ``False``，调用方当成"还没有端点行"于是不再重试，
+        事后查日志一条线索都没有。
+        """
+        from unittest import mock
+
+        real = self.storage._conn
+        self.storage._conn = mock.AsyncMock()
+        self.storage._conn.execute.side_effect = RuntimeError("connection reset")
+        try:
+            with self.assertLogs("recon.storage", level="WARNING") as caught:
+                ok = await self.storage.save_screenshot(1, "http://x/", b"png")
+        finally:
+            self.storage._conn = real
+
+        self.assertFalse(ok)
+        self.assertTrue(
+            any("connection reset" in line for line in caught.output),
+            f"异常被吞掉且没有日志：{caught.output}",
+        )
 
 class TestEndpointClusters(unittest.IsolatedAsyncioTestCase):
     """同款系统聚类（favicon 哈希 / 标题）—— 供应链横向最省力的杠杆。

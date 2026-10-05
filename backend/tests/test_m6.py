@@ -15,6 +15,7 @@ import hashlib
 import json
 import shutil
 import threading
+import time
 import unittest
 import uuid
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -26,9 +27,11 @@ from core.services.diff import ChangeSet, diff_scans
 from core.services.export import SHEET_KEYS, collect_assets, to_csv, to_json, to_xlsx
 from core.services.notify import (
     DingTalkNotifier,
+    EmailNotifier,
     FeishuNotifier,
     NotifyConfig,
     NotifyHub,
+    _judge,
     dingtalk_sign,
     feishu_sign,
 )
@@ -1196,6 +1199,182 @@ class TestFinalizingHoldsConcurrencySlot(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(tasks[0].done(), "running 应被 cancel")
         self.assertTrue(tasks[1].done(), "finalizing 也必须被 cancel")
         self.assertFalse(tasks[2].done(), "终态的 task 不该被动")
+
+
+class TestDeliveryConfirmation(unittest.IsolatedAsyncioTestCase):
+    """**"送到了"必须有依据**，判不出来就说判不出来。
+
+    审计发现：投递结果有三条宽松出口，出口网关 / 公司代理 / 验证码拦截返回的
+    「200 + HTML 登录页」会被判成**已送达**。而 ``broadcast`` 只在失败时记
+    日志 —— 报成"送到了"就一个字都不留，这条变更告警静默丢失。
+    """
+
+    def test_judge_rejects_non_dict_payload(self) -> None:
+        for payload in ("<html>登录</html>", ["a"], None, 200, ""):
+            with self.subTest(payload=payload):
+                ok, detail = _judge(payload)
+                self.assertFalse(ok, f"{payload!r} 被判成送达了")
+                self.assertTrue(detail, "判不出来必须给出原因")
+
+    def test_judge_rejects_payload_without_a_verdict_field(self) -> None:
+        ok, detail = _judge({"html": "<html>请登录</html>", "title": "拦截"})
+        self.assertFalse(ok, "没有任何判据字段却判成送达")
+        self.assertIn("判据字段", detail)
+
+    def test_judge_still_accepts_a_real_verdict(self) -> None:
+        for payload, ok in [
+            ({"errcode": 0}, True), ({"errcode": 40001}, False),
+            ({"code": 0}, True), ({"code": 1}, False),
+            ({"StatusCode": 0}, True), ({"status": "success"}, True),
+            ({"status": "error"}, False),
+        ]:
+            with self.subTest(payload=payload):
+                self.assertIs(_judge(payload)[0], ok)
+
+    async def _webhook(self) -> tuple[bool, str]:
+        """只配一个通用 webhook 渠道，跑一次 broadcast。"""
+        hub = NotifyHub(NotifyConfig(enabled=True, webhook_url="http://x"))
+        try:
+            results = await hub.broadcast("t", "x")
+        finally:
+            await hub.aclose()
+        return bool(results[0]["ok"]), results[0]["detail"]
+
+    def _patch_response(self, status: int, content_type: str, body_raises: bool = True):
+        """把 HTTPClient.request 换掉 —— **测试绝不能出网**。
+
+        （曾经这条用例没打桩，带着假 token 真发到钉钉，拿到
+        ``errcode=300005 token is not exist`` 才发现。）
+        """
+        class Resp:
+            def __init__(self) -> None:
+                self.status_code = status
+                self.headers = {"content-type": content_type}
+
+            def json(self):
+                if body_raises:
+                    raise ValueError("not json")
+                return {"errcode": 0}
+
+            async def aclose(self):
+                return None
+
+        async def fake_request(self, method, url, **kwargs):
+            return Resp()
+
+        return mock.patch("core.services.http.HTTPClient.request", fake_request)
+
+    def _patch_webhook_response(self, status: int, content_type: str) -> None:
+        self._patcher = self._patch_response(status, content_type).start()
+        self.addCleanup(mock.patch.stopall)
+
+    async def test_generic_webhook_html_response_is_not_delivered(self) -> None:
+        """200 + HTML —— 那是代理/网关的登录页，请求压根没到接收方。"""
+        self._patch_webhook_response(200, "text/html; charset=utf-8")
+        ok, detail = await self._webhook()
+        self.assertFalse(ok, "HTML 响应被判成已送达")
+        self.assertIn("HTML", detail)
+
+    async def test_generic_webhook_json_response_is_delivered(self) -> None:
+        self._patch_webhook_response(200, "application/json")
+        ok, _ = await self._webhook()
+        self.assertTrue(ok, "2xx + 非 HTML 仍应判为送达")
+
+    async def test_generic_webhook_error_status_is_not_delivered(self) -> None:
+        self._patch_webhook_response(502, "application/json")
+        ok, detail = await self._webhook()
+        self.assertFalse(ok)
+        self.assertIn("502", detail)
+
+    async def test_unparseable_body_is_not_delivered_even_on_200(self) -> None:
+        """``resp.json()`` 抛异常时，**不能**退回"看状态码"。
+
+        走到那里说明正文没读到或不是 JSON：可能是响应体中途断了（对方根本没
+        收到完整请求），也可能是拦截页。
+        """
+        hub = NotifyHub(NotifyConfig(
+            enabled=True, dingtalk_access_token="t", dingtalk_secret="s",
+        ))
+        with self._patch_response(200, "text/html"):
+            try:
+                results = await hub.broadcast("t", "x")
+            finally:
+                await hub.aclose()
+        ding = next(r for r in results if r["channel"] == "dingtalk")
+        self.assertFalse(
+            ding["ok"],
+            f"返回体解析失败却按状态码报了送达：{ding}",
+        )
+        self.assertIn("无法解析", ding["detail"])
+
+    async def test_email_has_a_total_timeout(self) -> None:
+        """``smtplib`` 的 ``timeout=15`` 是**每个 socket 操作**的上限。
+
+        connect + login + send 三段最坏 ~45 秒，而 ``SMTP()`` 构造时的 DNS
+        解析不受它约束。足够多的监控同时告警就能把默认 executor 抽干。
+        """
+        notifier = EmailNotifier("h", 25, "u", "p", "a@b.c")
+        self.assertGreater(EmailNotifier.SEND_TIMEOUT, 15,
+                           "总超时必须大于单次 socket 超时，否则没有意义")
+
+        original = notifier._send_sync
+
+        def slow(title, text):
+            time.sleep(5)
+            return original(title, text)
+
+        notifier._send_sync = slow
+        old_timeout = EmailNotifier.SEND_TIMEOUT
+        EmailNotifier.SEND_TIMEOUT = 0.2
+        try:
+            ok, detail = await notifier.send("t", "x")
+        finally:
+            EmailNotifier.SEND_TIMEOUT = old_timeout
+
+        self.assertFalse(ok, "超过总超时却报成功")
+        self.assertIn("未完成", detail)
+
+
+class TestAdmissionAndCleanup(DiffTestCase):
+    """两处「时序」问题：并发闸门的 TOCTOU 与重复 cancel 跳过清理。"""
+
+    async def _manager(self, max_concurrent: int) -> ScanManager:
+        return ScanManager(self.storage, max_concurrent=max_concurrent,
+                           stop_grace=0.05)
+
+    async def test_concurrent_starts_cannot_exceed_max(self) -> None:
+        """并发下发时，**实际跑起来的条数**不能超过 ``max_concurrent``。
+
+        曾经「并发检查」与「写进 ``self._scans``」之间隔着 ``create_scan``
+        （DB 往返）与 ``load_modules``（读盘）两个 await —— 典型的 TOCTOU。
+        三个请求一起进来时，它们都在对方登记之前通过了检查，
+        ``max_concurrent=1`` 于是真跑出 3 条。
+        """
+        mgr = await self._manager(1)
+        preset = str(self.preset_file())
+
+        async def one(i: int):
+            try:
+                return await mgr.start(
+                    targets=["example.com"], name=f"n{i}", preset_name=preset,
+                )
+            except RuntimeError:
+                return None
+
+        results = await asyncio.gather(*(one(i) for i in range(3)))
+        started = [r for r in results if r is not None]
+
+        self.assertEqual(
+            len(started), 1,
+            f"max_concurrent=1 却启动了 {len(started)} 条 —— 检查与登记之间有缝",
+        )
+        self.assertEqual(mgr.running_count, 1)
+
+        for rec in started:
+            rec.task.cancel()
+        await asyncio.gather(
+            *(r.task for r in started if r.task), return_exceptions=True
+        )
 
 
 if __name__ == "__main__":
