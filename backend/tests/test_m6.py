@@ -33,7 +33,7 @@ from core.services.notify import (
     feishu_sign,
 )
 from .pgutil import drop_storage, make_storage
-from core.web.manager import ScanManager
+from core.web.manager import ManagedScan, ScanManager
 from core.web.scheduler import MonitorScheduler
 
 TEST_TMP_ROOT = Path(__file__).resolve().parents[1] / ".testtmp"
@@ -1026,6 +1026,176 @@ class TestEnvironmentGuards(unittest.TestCase):
             got, _ = mimetypes.guess_type("x" + ext)
             self.assertEqual(got, expected, f"{ext} 的 MIME 没有被纠正")
         self.assertIsInstance(core._MIME_FIXES, list)
+
+
+class TestNotifyFlagCoercion(unittest.TestCase):
+    """告警开关**认得 "false" 这一类写法**。
+
+    ## 这是一条会外发数据的闸门
+
+    ``SettingsRequest.notify`` 声明成 ``dict[str, Any]``，Pydantic 不做任何
+    转换，**字符串原样送到** ``NotifyConfig.apply``。而：
+
+        bool("false")  ->  True        # 非空字符串一律真
+
+    于是用户关掉告警，实际照发 —— 内网域名 / URL 被推到外部钉钉 / 飞书 / 企微。
+    这与 ``util/coerce.py`` 模块文档里记的那个"安全闸门反转"是同一个形状，
+    当时全仓 32 处都改成了 ``as_bool``，唯独这里漏了。
+    """
+
+    def _cfg(self) -> NotifyConfig:
+        return NotifyConfig(enabled=True, webhook_url="http://x")
+
+    def test_apply_string_false_turns_it_off(self) -> None:
+        cfg = self._cfg()
+        cfg.apply({"enabled": "false"})
+        self.assertFalse(cfg.enabled, '"false" 被当成了真 —— 告警关不掉')
+
+    def test_apply_string_true_turns_it_on(self) -> None:
+        cfg = NotifyConfig(enabled=False, webhook_url="http://x")
+        cfg.apply({"enabled": "true"})
+        self.assertTrue(cfg.enabled)
+
+    def test_apply_recognises_the_usual_spellings(self) -> None:
+        for value, expected in [
+            ("false", False), ("False", False), ("FALSE", False),
+            ("0", False), ("off", False), ("no", False), ("否", False), ("关", False),
+            ("", False),
+            ("true", True), ("1", True), ("on", True), ("yes", True),
+            ("是", True), ("开", True),
+        ]:
+            with self.subTest(value=value):
+                cfg = self._cfg()
+                cfg.apply({"enabled": value})
+                self.assertIs(cfg.enabled, expected, f"{value!r} 判成了 {cfg.enabled}")
+
+    def test_apply_real_bool_is_untouched(self) -> None:
+        for value in (True, False):
+            with self.subTest(value=value):
+                cfg = self._cfg()
+                cfg.apply({"enabled": value})
+                self.assertIs(cfg.enabled, value)
+
+    def test_unrecognised_keeps_old_value_and_warns(self) -> None:
+        """认不出来时保持原值**并记一条告警**。
+
+        纯静默地保持旧值，症状就是"界面上把开关关掉，它纹丝不动"且毫无线索。
+        """
+        cfg = self._cfg()
+        with self.assertLogs("recon.notify", level="WARNING") as caught:
+            cfg.apply({"enabled": "flase"})
+        self.assertTrue(cfg.enabled)
+        self.assertTrue(
+            any("enabled" in line for line in caught.output),
+            f"没有告警日志，用户无从知道为什么开关没反应：{caught.output}",
+        )
+
+    def test_from_dict_reads_string_false(self) -> None:
+        """手改 ``settings.json`` 写成 ``"false"``（带引号）同样要认得。"""
+        cfg = NotifyConfig.from_dict({"enabled": "false", "webhook_url": "http://x"})
+        self.assertFalse(cfg.enabled)
+
+    def test_disabled_config_really_blocks_broadcast(self) -> None:
+        """端到端：关掉之后 broadcast 必须是空操作，不能只是"看起来关了"。"""
+        async def go() -> list:
+            hub = NotifyHub(self._cfg())
+            hub.config.apply({"enabled": "false"})
+            try:
+                return await hub.broadcast("t", "x")
+            finally:
+                await hub.aclose()
+
+        self.assertEqual(asyncio.run(go()), [])
+
+
+class _FakeRecord:
+    """``running_count`` / ``stop`` / ``shutdown`` 只碰这几个属性。"""
+
+    def __init__(self, status: str, task: "asyncio.Task | None" = None) -> None:
+        self.status = status
+        self.task = task
+        self.actor = "test"
+        self.targets = ["example.com"]
+        self.mode = "passive"
+        self.elapsed = 0.0
+        self.scan_id = 1
+
+
+class TestFinalizingHoldsConcurrencySlot(unittest.IsolatedAsyncioTestCase):
+    """``finalizing`` 阶段的扫描**仍然占着并发额度**。
+
+    ``finalizing`` 是"扫描本体已结束、正在做变更对比与告警推送"这段。
+    曾经 ``running_count`` 只数 ``running``，于是这段时间里额度被提前释放 ——
+    而 ``manager.py`` 自己的注释写过"一旦被改成非 running，这条僵尸任务就不再
+    占并发额度"，``finalizing`` 正是为了避免调用方读到半成品才加的状态，
+    却把同一个洞重新引了回来。后果是 ``max_concurrent=2`` 实际能跑 3 条，
+    对目标的并发发包翻倍。
+    """
+
+    def _manager(self) -> ScanManager:
+        mgr = ScanManager(mock.MagicMock(), max_concurrent=2, stop_grace=0.05)
+        mgr._scans = {
+            1: _FakeRecord("running"),
+            2: _FakeRecord("finalizing"),
+            3: _FakeRecord("finished"),
+        }
+        return mgr
+
+    def test_finalizing_is_counted(self) -> None:
+        self.assertEqual(self._manager().running_count, 2,
+                         "running + finalizing 都该占额度，终态不占")
+
+    def test_terminal_states_are_not_counted(self) -> None:
+        mgr = ScanManager(mock.MagicMock(), max_concurrent=2)
+        for status in ("finished", "error", "stopped"):
+            with self.subTest(status=status):
+                mgr._scans = {1: _FakeRecord(status)}
+                self.assertEqual(mgr.running_count, 0)
+
+    def test_occupying_is_exactly_the_non_terminal_set(self) -> None:
+        """别让 OCCUPYING 悄悄和 TERMINAL 对不上：占额度的必须是**非终态**。"""
+        self.assertEqual(set(ManagedScan.OCCUPYING), {"running", "finalizing"})
+        self.assertFalse(
+            set(ManagedScan.OCCUPYING) & set(ManagedScan.TERMINAL),
+            "终态不该占并发额度",
+        )
+
+    async def test_concurrency_gate_rejects_while_finalizing(self) -> None:
+        """额度被占满时，即使在收尾也要挡住新任务。"""
+        mgr = ScanManager(mock.MagicMock(), max_concurrent=2, stop_grace=0.05)
+        mgr._scans = {1: _FakeRecord("running"), 2: _FakeRecord("finalizing")}
+        with self.assertRaises(RuntimeError):
+            await mgr.start(targets=["example.com"], name="第三个")
+
+    async def test_stop_works_on_a_finalizing_scan(self) -> None:
+        """收尾中的扫描也要能停 —— 它在推告警，正是用户想停的东西。
+
+        曾经用 ``status != "running"`` 把这个状态挡在外面，于是点"停止"返回
+        False、界面毫无反应，而任务还在往外发。
+        """
+        mgr = ScanManager(mock.MagicMock(), max_concurrent=2, stop_grace=0.05)
+        mgr.storage.record_audit = mock.AsyncMock()
+        task = asyncio.create_task(asyncio.sleep(30))
+        await asyncio.sleep(0)  # 让它真正起来
+        mgr._scans = {7: _FakeRecord("finalizing", task)}
+
+        self.assertTrue(await mgr.stop(7), "finalizing 的扫描必须能停")
+        self.assertTrue(task.cancelled() or task.done())
+
+    async def test_shutdown_cancels_finalizing_tasks(self) -> None:
+        """关服时收尾中的扫描也要被 cancel + await，不能带着在途推送退出。"""
+        mgr = ScanManager(mock.MagicMock(), max_concurrent=2, stop_grace=0.5)
+        tasks = [asyncio.create_task(asyncio.sleep(30)) for _ in range(3)]
+        await asyncio.sleep(0)
+        mgr._scans = {
+            1: _FakeRecord("running", tasks[0]),
+            2: _FakeRecord("finalizing", tasks[1]),   # 以前会被漏掉
+            3: _FakeRecord("finished", tasks[2]),    # 终态不该动
+        }
+        await mgr.shutdown()
+        self.assertTrue(tasks[0].done(), "running 应被 cancel")
+        self.assertTrue(tasks[1].done(), "finalizing 也必须被 cancel")
+        self.assertFalse(tasks[2].done(), "终态的 task 不该被动")
 
 
 if __name__ == "__main__":

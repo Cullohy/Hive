@@ -28,9 +28,192 @@ from core.storage.postgres import (
     SEARCH_KEYS,
     PostgresStorage,
     _live_clause,
+    _search_where,
 )
 
 from .pgutil import DSN, drop_storage, ensure_database, make_storage, new_schema
+
+
+#: 「scan_id 用测试自己的默认值」的哨兵 —— 显式传 ``None`` 表示"真的没有 scan_id"
+_USE_SENTINEL = object()
+
+
+class TestSearchWhereParamOrder(unittest.TestCase):
+    """**参数顺序必须等于占位符在 SQL 文本里出现的顺序。**
+
+    曾经把「多维筛选」的 ``params.extend`` 写在「分组过滤」的
+    ``params.append(group_id)`` 前面，而 return 里的串是
+    ``{group_clause}{filter_clause}`` —— 文本里 group 在前、参数里 filter 在前。
+
+    **条数是对的**，所以那些"钉住条数"的测试（``test_search_spec_live_needs_a
+    _scan_id`` 之类）全绿；错的是值落在哪个占位符上。后果分两种：
+
+    * 字符串列 → asyncpg 抛类型错，接口 500（**能看见**，算幸运）
+    * 数字列（``status`` / ``port``）两边都是 int → **不报错**，
+      静默返回错组错值的结果与 total，界面上只是"数字有点怪"
+
+    所以这里不看条数，改看**每个 ``?`` 前面那段文本说的是谁、拿到的是谁**。
+    """
+
+    #: 用来定位的哨兵值：一眼能认出是它，就说明没落到该去的占位符上
+    PATTERN = "%needle%"
+    SCAN_ID = 7
+    GROUP_ID = 4242
+
+    @staticmethod
+    def _fragments(sql: str) -> list[str]:
+        """按 ``?`` 切成 n+1 段。第 i 段是**第 i 个** ``?`` 之前的那段文本，
+        也就是那个 ``?`` 对应 ``params[i]``。"""
+        return sql.split("?")
+
+    def _where(
+        self,
+        filters: list[dict] | None = None,
+        group_id: int | None = None,
+        asset_type: str = "domains",
+        live: bool = True,
+    ) -> tuple[str, list, list[str]]:
+        """返回 (原始 SQL, 参数序列, 按 ? 切开的片段)。
+
+        **原始 SQL 必须原样带回** —— 把片段 join 起来会连 ``?`` 一起拼没，
+        条数校验就成了 0 != N 的假失败。
+        """
+        sql, params = _search_where(
+            _SEARCH_SPECS[asset_type],
+            self.PATTERN, self.SCAN_ID, live, asset_type, filters, group_id,
+        )
+        return sql, params, self._fragments(sql)
+
+    def _index_of(self, frags: list[str], needle: str) -> int:
+        """找出**唯一**带 ``needle`` 的那个 ``?`` 的下标。
+
+        只接受"恰好命中一次"——像 ``t.name ILIKE`` 那种在搜索主句与筛选条件里
+        都会出现的写法，匹配到第一个只会验到搜索主句，等于什么都没验。
+        """
+        hits = [i for i, frag in enumerate(frags) if needle in frag]
+        if len(hits) != 1:
+            self.fail(
+                f"期望 {needle!r} 在 SQL 里恰好出现一次，实际 {len(hits)} 次"
+                f"（下标 {hits}）——换个唯一的锚点，或这个片段已经变了"
+            )
+        return hits[0]
+
+    def _expected_params(
+        self, spec, filter_params: list, group_id: int | None,
+        live: bool, scan_id: int | None,
+    ) -> list:
+        """按 return 那个串的顺序，把六段拼成应有的参数序列。
+
+        筛选那一段是**调用方写死的期望值**，不是调 ``_build_filter_where``
+        算出来的 —— 那样就成了拿被测对象证明自己。
+        """
+        expected = [self.PATTERN] * len(spec.columns)        # ① 每个可搜列
+        if scan_id is not None:
+            expected.append(scan_id)                         # ② scope
+            if live and spec.live:
+                expected.extend([scan_id] * spec.live_params)  # ③ live
+        if group_id is not None and spec.seen is not None:    # ④ 分组
+            expected.append(group_id)
+        expected.extend(filter_params)                       # ⑤ 多维筛选
+        expected.extend(spec.exclude_kinds)                  # ⑥ 噪声 kind
+        return expected
+
+    def _assert_params(
+        self, sql: str, params: list, spec, filter_params: list,
+        group_id: int | None, live: bool = True,
+        scan_id: int | None = _USE_SENTINEL,
+    ) -> None:
+        if scan_id is _USE_SENTINEL:
+            scan_id = self.SCAN_ID
+        self.assertEqual(
+            params,
+            self._expected_params(spec, filter_params, group_id, live, scan_id),
+            "参数序列与占位符顺序不一致（条数对但值错位时，这里会直接列出顺序）",
+        )
+        self.assertEqual(sql.count("?"), len(params), "占位符条数与参数条数不一致")
+
+    # ---------------------------------------------------------------- 钉住值
+
+    def test_group_id_lands_in_the_group_placeholder(self) -> None:
+        """``ga.group_id = ?`` 拿到的必须是 group_id 本身。"""
+        _sql, params, frags = self._where(
+            filters=[{"field": "name", "op": "contains", "value": "admin"}],
+            group_id=self.GROUP_ID,
+        )
+        idx = self._index_of(frags, "ga.group_id")
+        self.assertEqual(
+            params[idx], self.GROUP_ID,
+            f"ga.group_id 拿到的是 {params[idx]!r}；参数顺序与占位符顺序错位了",
+        )
+
+    def test_string_filter_and_group_never_swap(self) -> None:
+        sql, params, frags = self._where(
+            filters=[{"field": "name", "op": "contains", "value": "admin"}],
+            group_id=self.GROUP_ID,
+        )
+        self.assertEqual(params[self._index_of(frags, "ga.group_id")], self.GROUP_ID)
+        self._assert_params(
+            sql, params, _SEARCH_SPECS["domains"], ["%admin%"], self.GROUP_ID,
+        )
+
+    def test_numeric_filter_is_not_silently_swapped(self) -> None:
+        """数字列这条是**静默**的那个：两边都是 int，asyncpg 不会拦。
+
+        所以除了查 ``ga.group_id``，还要把整条参数序列钉死。
+        """
+        sql, params = _search_where(
+            _SEARCH_SPECS["urls"], self.PATTERN, self.SCAN_ID, True, "urls",
+            [{"field": "status", "op": "eq", "value": "200"}], self.GROUP_ID,
+        )
+        frags = self._fragments(sql)
+        self.assertEqual(params[self._index_of(frags, "ga.group_id")], self.GROUP_ID)
+        self._assert_params(sql, params, _SEARCH_SPECS["urls"], [200], self.GROUP_ID)
+
+    def test_two_filters_and_group_keep_their_slots(self) -> None:
+        sql, params, frags = self._where(
+            filters=[
+                {"field": "name", "op": "contains", "value": "alpha"},
+                {"field": "source", "op": "eq", "value": "shodan"},
+            ],
+            group_id=self.GROUP_ID,
+        )
+        self.assertEqual(params[self._index_of(frags, "ga.group_id")], self.GROUP_ID)
+        self._assert_params(
+            sql, params, _SEARCH_SPECS["domains"], ["%alpha%", "shodan"], self.GROUP_ID,
+        )
+
+    def test_group_only_still_works(self) -> None:
+        """只给 group_id（前端常见：进分组页只看这一组）。"""
+        sql, params = _search_where(
+            _SEARCH_SPECS["domains"], self.PATTERN, self.SCAN_ID, True, "domains",
+            None, self.GROUP_ID,
+        )
+        frags = self._fragments(sql)
+        self.assertEqual(params[self._index_of(frags, "ga.group_id")], self.GROUP_ID)
+        self._assert_params(sql, params, _SEARCH_SPECS["domains"], [], self.GROUP_ID)
+
+    def test_no_group_no_filters_is_unchanged(self) -> None:
+        """两个都不给时退化成最简形式（组不追加、筛选不追加）。"""
+        sql, params = _search_where(
+            _SEARCH_SPECS["domains"], self.PATTERN, self.SCAN_ID, True, "domains",
+            None, None,
+        )
+        self.assertNotIn("asset_group_asset", sql)
+        self._assert_params(sql, params, _SEARCH_SPECS["domains"], [], None)
+
+    def test_global_search_without_scan_id(self) -> None:
+        """``scan_id=None`` 的跨扫描检索：scope 与 live 都不追加参数。"""
+        sql, params = _search_where(
+            _SEARCH_SPECS["domains"], self.PATTERN, None, True, "domains",
+            [{"field": "name", "op": "contains", "value": "admin"}], self.GROUP_ID,
+        )
+        frags = self._fragments(sql)
+        self.assertEqual(params[self._index_of(frags, "ga.group_id")], self.GROUP_ID)
+        self._assert_params(
+            sql, params, _SEARCH_SPECS["domains"], ["%admin%"], self.GROUP_ID,
+            scan_id=None,
+        )
+        self.assertNotIn(self.SCAN_ID, params, "没有 scan_id 时不该出现它")
 
 
 class TestPlaceholderConversion(unittest.TestCase):

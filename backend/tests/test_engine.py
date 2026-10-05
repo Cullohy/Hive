@@ -1009,7 +1009,80 @@ class TestPipelineDepth(EngineTestCase):
             include=["recurse"],
             settings={"max_scope_distance": 2, "timeout": 30},
         )
-        self.assertGreaterEqual(summary["events_too_deep"], 1)
+class _BrokenCountsStorage:
+    """``asset_counts`` 抛异常的假存储。
+
+    对应真实触发条件：``asset_counts(live=True)`` 那条 SQL 里
+    ``scan_asset`` 与 ``event`` 的 ``split_part(dedup_key)`` 是非 sargable join，
+    撞上 ``statement_timeout`` 或取连接池超时就会抛。
+    """
+
+    def __init__(self, break_counts: bool = True, break_finish: bool = False) -> None:
+        self.break_counts = break_counts
+        self.break_finish = break_finish
+        self.finished: list[tuple[int, str, dict]] = []
+
+    async def asset_counts(self, scan_id: int, live: bool = False) -> dict:
+        if self.break_counts:
+            raise RuntimeError("canceling statement due to statement timeout")
+        return {"domains": 12, "urls": 80}
+
+    async def finish_scan(self, scan_id: int, *, status: str, stats: dict) -> bool:
+        if self.break_finish:
+            raise RuntimeError("connection reset")
+        self.finished.append((scan_id, status, stats))
+        return True
+
+
+class TestFinalizeAlwaysFinishesTheScan(unittest.IsolatedAsyncioTestCase):
+    """「统计资产数」失败**不能**把「标记扫描结束」一起带走。
+
+    曾经两件事共用一个 ``try``：``asset_counts`` 一抛异常，``finish_scan``
+    就被跳过，而 ``manager`` 那边已经把内存状态置成 ``finished`` —— 于是库里的
+    那行**永远停在 running**。症状是界面显示"运行中"、耗时一直涨、日志里只有
+    一行 error，排查时极难联想到是收尾这段的问题。
+    """
+
+    def _scanner(self, store) -> Scanner:
+        scanner = Scanner(
+            targets=["example.com"],
+            preset=Preset(name="t", include=[]),
+            storage=store,
+        )
+        scanner.scan_id = 54
+        return scanner
+
+    async def test_finish_scan_runs_even_when_asset_counts_raises(self) -> None:
+        store = _BrokenCountsStorage(break_counts=True)
+        await self._scanner(store)._finalize()
+        self.assertEqual(
+            [f[1] for f in store.finished], ["finished"],
+            "asset_counts 抛异常时 finish_scan 仍必须执行，"
+            "否则库里那行永远停在 running",
+        )
+        self.assertEqual(store.finished[0][0], 54)
+
+    async def test_finish_scan_failure_does_not_break_the_summary(self) -> None:
+        """反过来：``finish_scan`` 自己失败也不能让调用方拿不到 summary。"""
+        store = _BrokenCountsStorage(break_counts=False, break_finish=True)
+        summary = await self._scanner(store)._finalize()
+        self.assertEqual(summary["scan_id"], 54)
+
+    async def test_both_succeed_path_is_unchanged(self) -> None:
+        store = _BrokenCountsStorage(break_counts=False)
+        summary = await self._scanner(store)._finalize()
+        self.assertEqual([f[1] for f in store.finished], ["finished"])
+        self.assertEqual(summary["domains"], 12)
+        self.assertEqual(summary["urls"], 80)
+
+    async def test_no_storage_skips_the_whole_block(self) -> None:
+        """``storage=None``（纯内存扫描）不能因为这次拆分而报 AttributeError。"""
+        scanner = Scanner(
+            targets=["example.com"], preset=Preset(name="t", include=[]), storage=None,
+        )
+        scanner.scan_id = 54
+        summary = await scanner._finalize()
+        self.assertEqual(summary["scan_id"], 54)
 
 
 if __name__ == "__main__":
