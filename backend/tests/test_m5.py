@@ -116,6 +116,70 @@ class TestScanName(WebTestCase):
         self.assertEqual(record["name"], "月度巡检")
 
 
+class TestGroupListWithRows(WebTestCase):
+    """``GET /api/groups`` 在**列表非空**时不能报 500。
+
+    ## 这条是被真实 bug 逼出来的
+
+    列表端点会逐个分组去取它关联的任务（``list_group_scans``），调用处写成了
+    ``await _group_dict(...)`` —— 而 ``_group_dict`` 是**同步**函数，于是
+
+        TypeError: object dict can't be used in 'await' expression
+
+    **它只在列表非空时才炸**：分组数为 0 时 for 循环体一次都不执行。所以上一轮
+    的端到端验证偏偏是"建组 → 逐项校验 → 删掉 → 再查列表（此时已空）"，
+    7/7 全绿却一步都没走到这条路径 —— 而它恰好是打开「资产分组」页面时
+    必走的那一步。
+
+    所以这里**先建组、再查列表**，而且要断言行里带着 ``scans``（前端「包含的
+    任务」那一列全靠它）。
+    """
+
+    def _make_group(self, name: str, scan_ids: list[int]) -> dict:
+        resp = self.client.post(
+            "/api/groups",
+            json={"name": name, "description": "回归", "scan_ids": scan_ids},
+        )
+        self.assertIn(resp.status_code, (200, 201), resp.text)
+        return resp.json()
+
+    def test_empty_list_is_200(self) -> None:
+        resp = self.client.get("/api/groups")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertIsInstance(resp.json(), list)
+
+    def test_list_with_rows_returns_200_and_carries_scans(self) -> None:
+        record = self.start(["example.com"], name="分组列表用的扫描")
+        gid = self._make_group("非空列表回归", [record["scan_id"]])["id"]
+
+        resp = self.client.get("/api/groups")
+        self.assertEqual(
+            resp.status_code, 200,
+            f"非空列表报错了（多半是 ``_group_dict`` 被当成协程 await）：{resp.text}",
+        )
+        rows = resp.json()
+        self.assertTrue(any(r["id"] == gid for r in rows), f"新建的分组不在列表里：{rows}")
+
+        row = next(r for r in rows if r["id"] == gid)
+        self.assertIn(
+            "scans", row,
+            "行里没有 scans 字段 —— 前端「包含的任务」那一列会是空的",
+        )
+        self.assertEqual([s["scan_id"] for s in row["scans"]], [record["scan_id"]])
+
+    def test_detail_with_rows_returns_200(self) -> None:
+        """抽屉打开时走的是详情端点，也要一起覆盖。"""
+        record = self.start(["example.com"], name="分组详情用的扫描")
+        gid = self._make_group("详情回归", [record["scan_id"]])["id"]
+
+        resp = self.client.get(f"/api/groups/{gid}")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual([s["scan_id"] for s in resp.json()["scans"]], [record["scan_id"]])
+
+        assets = self.client.get(f"/api/groups/{gid}/assets?limit=5")
+        self.assertEqual(assets.status_code, 200, assets.text)
+
+
 class TestScanRequestStrictness(WebTestCase):
     """``ScanRequest`` 拒绝未知字段。
 

@@ -70,7 +70,7 @@
           style="margin-left: 10px"
           size="middle"
           :allow-clear="true"
-          :placeholder="['首见起', '首见止']"
+          :placeholder="['起始日期', '结束日期']"
           :presets="rangePresets"
           @change="onRangeChange"
         />

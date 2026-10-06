@@ -163,15 +163,34 @@ a:hover {
  * 当时没验证就写了这段注释。
  *
  * 真正需要覆盖的是下面两类**没有主题 token 管**的色块：
- *   1. .ant-picker-active-bar —— 聚焦时贴着输入框下沿的那条横条，
- *      用 colorPrimary 填充、聚焦时 opacity:1。它不受 --tk-* 变量管，
- *      是「点一下就冒出一条颜色」的主要来源。
+ *   1. .ant-picker-active-bar —— 聚焦时贴着输入框下沿的那条横条。
+ *      antd 用 colorPrimary 填充、聚焦时 opacity:1，不受 --tk-* 变量管。
+ *      **2026-10-06 起整个 display:none 掉了** —— 它不带信息（选中结果已经
+ *      写在输入框里了），详见下面那条规则自己的注释。
  *   2. 面板里单元格的选中/区间/hover 底色。
+ *
+ * **② 整块面板在 2026-10-06 改成了灰阶**（选中格深灰 + 白字、today 框与
+ * 区间底色用中浅灰）。原先整套跟着主色 #c2410c 走，在一屏灰白的表格里显得很跳。
+ * 下面每条规则自己写的是哪个 token，这里只记"为什么"。
+ *
+ * ⚠️ **输入框聚焦态的外框（.ant-picker-focused）仍然是主色**，不在这次范围内 ——
+ *    它标的是"焦点在这个控件上"，是有信息的，且不在面板里。
  * 都**显式**定死，不依赖 antd 的推导算法 —— 算法一改这里也不会跑偏。
  */
+/* 选中日期后贴着输入框下沿的那条横条 —— **2026-10-06 起整个去掉**。
+ *
+ * 它是 antd「焦点在哪个输入框」的指示条：选了起始日就画在起始那一段下面。
+ * 先是主色橙红（在一排灰白输入框里像划了一道红线），改成灰的之后更确认了一件事：
+ * **这条线本来就不带信息**。焦点在哪个输入框，看光标在哪、看的��"结束日期"
+ * 这个占位符有没有被替换掉，都不需要靠一条线来说；选中结果已经明明白白写在
+ * 输入框里了（"2026-10-06"）。所以与其挑一个不刺眼的颜色，不如直接不画。
+ *
+ * 用 ``display: none`` 而不是 ``opacity: 0`` / ``background: transparent``：
+ * 前两者这条元素仍然在文档流里被布局与测量，留着一条"看不见但占位"的元素
+ * 只会给下一个人添麻烦（曾经就因为"看不见但还在"的东西反复排查过）。
+ */
 .ant-picker-active-bar {
-  background: var(--tk-accent) !important;
-  height: 2px !important;
+  display: none !important;
 }
 
 /* 聚焦态边框：antd 默认是 primary 色的 2px 光晕，这里压成一条实线 */
@@ -239,23 +258,39 @@ a:hover {
   border: none !important;
 }
 
-/* 区间中段：底色带在 ::before 上，必须改伪元素。 */
+/* 区间中段：底色带在 ::before 上，必须改伪元素。
+ * 2026-10-06 起整块面板改灰阶（见下面选中格那条的总说明）。 */
 .ant-picker-cell-in-range::before,
 .ant-picker-cell-range-start:not(.ant-picker-cell-range-start-single)::before,
 .ant-picker-cell-range-end:not(.ant-picker-cell-range-end-single)::before {
-  background: var(--tk-accent-soft) !important;
+  background: var(--tk-surface-3) !important;
 }
 
-/* today 标记：把 dashed 整个换掉。
- * 用 border 的简写一次写全 style/width/color —— 分开写 color 时
- * style 会沿用 antd 的 dashed。圆角 2px 对应 antd 的 borderRadiusSM
- * （本仓 --tk-* 里没有 radius 变量，别引一个不存在的）。 */
+/* today：**灰色实心块**（2026-10-06）。
+ *
+ * 原来是 antd 那个虚线框，我们之前把它换成了实线**描边** —— 但描边在选中区里
+ * 很容易和"选中"混起来：截图里 6（今天）是空心框、7-8（选中）是实心块，两个
+ * 都是"打了个标记"，读起来要靠"空心 vs 实心"这个二级区别。
+ *
+ * 改成灰填充之后层级才分得开：
+ *   深灰实心 = 已选中（--tk-text）
+ *   中灰实心 = 今天      （--tk-text-secondary）
+ *   浅灰      = 悬停 / 区间底色
+ * 颜色本身就是"选中 / 今天"两个维度，不用再靠空心实心去分。
+ *
+ * ⚠️ 那些 :not() 守卫是**必须**的：antd 会给"今天且被选中"的格子同时打
+ * ``today`` 与 ``selected`` 两个 class，没有守卫的话这条规则可能盖掉选中态。
+ * 靠 :not() 排除掉之后，两种颜色靠 class 集合本身区分，与规则先后无关。
+ */
 .ant-picker-cell-today .ant-picker-cell-inner::before {
-  border: 1px solid var(--tk-accent) !important;
-  border-radius: 2px !important;
+  border: none !important;
+}
+.ant-picker-cell-today:not(.ant-picker-cell-in-range):not(.ant-picker-cell-selected):not(.ant-picker-cell-range-start):not(.ant-picker-cell-range-end) .ant-picker-cell-inner {
+  background: var(--tk-text-secondary) !important;
+  color: #fff !important;
 }
 
-/* 选区两端 + 选中格：实心主色 + 白字。
+/* 选区两端 + 选中格：实心**深灰** + 白字。
  *
  * ⚠️ 这里**不能只写 .ant-picker-cell-selected**。2026-10-06 实测 antd 4.2.6
  * 给区间两端打的 class 并不对称：
@@ -267,14 +302,14 @@ a:hover {
 .ant-picker-cell-selected .ant-picker-cell-inner,
 .ant-picker-cell-range-start .ant-picker-cell-inner,
 .ant-picker-cell-range-end .ant-picker-cell-inner {
-  background: var(--tk-accent) !important;
+  background: var(--tk-text) !important;
   color: #fff !important;
 }
 /* 两端格子的 ::before 只画半个格子（antd 用 inset 50% 做半圆头），
- * 给它主色，两端才是完整的实心圆角块。 */
+ * 给它同一个深灰，两端才是完整的实心圆角块。 */
 .ant-picker-cell-range-start:not(.ant-picker-cell-range-start-single)::before,
 .ant-picker-cell-range-end:not(.ant-picker-cell-range-end-single)::before {
-  background: var(--tk-accent) !important;
+  background: var(--tk-text) !important;
 }
 /* 两端已是实心深色，today 的边框圈叠在上面是多余的 —— 整个去掉。
  * antd 的 today 选择器是 `.in-view.today .inner::before`，这里更具体，盖得住。 */
@@ -315,15 +350,15 @@ a:hover {
   color: var(--tk-text-muted) !important;
   background: transparent !important;
 }
-/* hover：淡橙。选区两端 hover 时保持实心 + 白字（antd 默认会把端点变浅，
+/* hover：浅灰。选区两端 hover 时保持实心 + 白字（antd 默认会把端点变浅，
  * 视觉上就「松开」了）。 */
 .ant-picker-cell:hover:not(.ant-picker-cell-range-start):not(.ant-picker-cell-range-end):not(.ant-picker-cell-selected) .ant-picker-cell-inner {
-  background: var(--tk-accent-soft-2) !important;
+  background: var(--tk-border) !important;
 }
 .ant-picker-cell-range-start:hover .ant-picker-cell-inner,
 .ant-picker-cell-range-end:hover .ant-picker-cell-inner,
 .ant-picker-cell-selected:hover .ant-picker-cell-inner {
-  background: var(--tk-accent-hover) !important;
+  background: var(--tk-text-secondary) !important;
   color: #fff !important;
 }
 .ant-picker-header,
@@ -333,29 +368,29 @@ a:hover {
 .ant-picker-now-btn {
   color: var(--tk-text-secondary) !important;
 }
-/* today / now 按钮：antd hover 时给一整块 primary 底色，
- * 换算成 #c2410c 是一块很扎眼的实心橙红块。改成与单元格一致的淡橙。 */
+/* today / now 按钮：antd hover 时给一整块 primary 底色。整块橙红很扎眼，
+ * 与单元格 hover 一致改成浅灰 + 深灰字。 */
 .ant-picker-today-btn:hover,
 .ant-picker-now-btn:hover,
 .ant-picker-footer-link:hover {
-  background: var(--tk-accent-soft-2) !important;
-  color: var(--tk-accent) !important;
+  background: var(--tk-border) !important;
+  color: var(--tk-text) !important;
 }
 .ant-picker-header-view:hover {
-  color: var(--tk-accent) !important;
+  color: var(--tk-text) !important;
 }
 .ant-picker-content th {
   color: var(--tk-text-secondary) !important;
 }
 
 /* presets 面板（我们传了 今天/近7天/近30天/近90天）。
- * antd 给选中项的是整块 primary 底 + 白字，与全站橙红风格冲突。 */
+ * antd 给选中项的是整块 primary 底 + 白字 —— 面板都改灰了，这里跟着改深灰。 */
 .ant-picker-presets > li.ant-picker-presets-selected {
-  background: var(--tk-accent) !important;
+  background: var(--tk-text) !important;
   color: #fff !important;
 }
 .ant-picker-presets > li:hover {
-  background: var(--tk-accent-soft) !important;
+  background: var(--tk-surface-3) !important;
 }
 
 /* 滚动条收细，和 ARL 一致 */

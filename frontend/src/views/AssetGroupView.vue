@@ -48,7 +48,7 @@
             <span class="tk-mono">
               合计 <b>{{ assetTotalOf(record) }}</b>
               <span v-if="record.domain_count" class="tk-muted">
-                （域名 {{ record.domain_count }} · IP {{ record.ip_count || 0 }}）</span>
+                （域名 {{ record.domain_count }} / IP {{ record.ip_count || 0 }}）</span>
             </span>
           </template>
 
