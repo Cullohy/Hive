@@ -67,26 +67,6 @@
           <template #prefix><SearchOutlined class="tk-muted" /></template>
         </a-input>
       </div>
-
-      <!-- 生效条件 chip -->
-      <div
-        v-if="aliveFilter || statusFilter || groupId || rangeLabel"
-        class="chip-row"
-      >
-        <span class="chip-label">条件</span>
-        <a-tag v-if="rangeLabel" color="cyan" closable @close="clearRange">
-          首见:{{ rangeLabel }}
-        </a-tag>
-        <a-tag v-if="groupId" color="purple" closable @close="groupId = null">
-          分组:{{ currentGroupName }}
-        </a-tag>
-        <a-tag v-if="aliveFilter" color="blue" closable @close="aliveFilter = ''">
-          {{ aliveFilter === 'alive' ? '仅存活' : '仅未探活' }}
-        </a-tag>
-        <a-tag v-if="statusFilter" color="green" closable @close="statusFilter = null">
-          状态码={{ statusFilter }}
-        </a-tag>
-      </div>
     </div>
 
     <!-- ── 资产表 ── -->
@@ -412,18 +392,6 @@ function onRangeChange() {
   currentPage.value = 1
   loadPage()
 }
-
-function clearRange() {
-  dateRange.value = null
-  onRangeChange()
-}
-
-/** 这一行的「首见」在不在当前时间段里 —— 用来在结果上方显示一行摘要。 */
-const rangeLabel = computed(() => {
-  const r = dateRange.value
-  if (!r || !r[0] || !r[1]) return ''
-  return `${r[0].format('YYYY-MM-DD')} ~ ${r[1].format('YYYY-MM-DD')}`
-})
 
 //: 2026-10-06 删掉了「仅探活」勾选框。它**从来没被发到后端** —— `liveOnly`
 //: 全文件只出现在「绑定到勾选框 / ref 初始化 / resetAll 重置」三处；
@@ -806,18 +774,6 @@ function onPageChange(page, size) {
 }
 .search-bar :deep(.ant-input-affix-wrapper) {
   width: 100%;
-}
-.chip-row {
-  display: flex;
-  gap: 6px;
-  align-items: center;
-  flex-wrap: wrap;
-  margin-top: 10px;
-}
-.chip-label {
-  font-size: 12px;
-  color: var(--tk-muted);
-  font-weight: 500;
 }
 .grow { flex: 1; }
 .result-head {
