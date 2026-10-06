@@ -1,5 +1,5 @@
 <template>
-  <a-config-provider :theme="theme">
+  <a-config-provider :theme="theme" :locale="zhCN">
     <a-layout class="app-layout">
       <!-- 侧边栏：固定定位，不随内容滚动（与 ARL 一致） -->
       <a-layout-sider
@@ -80,6 +80,14 @@ import {
 
 import { getHealth } from '@/api'
 import SettingsDrawer from '@/components/SettingsDrawer.vue'
+//: ant-design-vue 的默认语言是 en_US：日期选择器会显示英文月份、Su/Mo/Tu
+//: 星期缩写、Now / Today，以及 "Start date" / "End date" 提示。
+//: 没有 locale 时这套文案**静默**是英文的（没有任何报错），所以必须显式给。
+//:
+//: 注意它只管**格式串**（「2026年」「今天」「确定」）。月份表和星期头走的是
+//: dayjs，要靠 main.js 里的 `import 'dayjs/locale/zh-cn'` 才变中文 —— 只加
+//: 这一行会看到「2026年」是中文、月份却是 Oct 的半吊子状态。
+import zhCN from 'ant-design-vue/es/locale/zh_CN'
 
 const theme = {
   token: {

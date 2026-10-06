@@ -155,6 +155,51 @@ a:hover {
   background-color: var(--tk-accent) !important;
 }
 
+/* 日期选择器：全站**唯一**没有主题覆盖的 antd 组件。
+ *
+ * antd 的浅色调是从 colorPrimary 用颜色算法推导的，`#c2410c` 推出来偏黄 ——
+ * 区间选中和 hover 那两块底色就与全站橙红对不上（点开面板时最显眼）。
+ * 这里把关键的几处**显式**定死，不依赖推导结果：推导算法一改这里也不会跑偏。
+ */
+.ant-picker-dropdown .ant-picker-panel {
+  background: var(--tk-surface);
+}
+.ant-picker-cell-selected .ant-picker-cell-inner,
+.ant-picker-cell-range-start .ant-picker-cell-inner,
+.ant-picker-cell-range-end .ant-picker-cell-inner {
+  background: var(--tk-accent) !important;
+  color: #fff !important;
+}
+/* 区间中段。不写的话用 antd 推导的浅色调（偏黄） */
+.ant-picker-cell-in-range:not(.ant-picker-cell-range-start):not(.ant-picker-cell-range-end) {
+  background: var(--tk-accent-soft) !important;
+}
+.ant-picker-cell:not(.ant-picker-cell-in-view) .ant-picker-cell-inner,
+.ant-picker-cell-disabled .ant-picker-cell-inner {
+  color: var(--tk-text-muted) !important;
+  background: transparent !important;
+}
+.ant-picker-cell:hover .ant-picker-cell-inner,
+.ant-picker-cell-in-view.ant-picker-cell-selected:hover .ant-picker-cell-inner {
+  background: var(--tk-accent-soft-2) !important;
+}
+.ant-picker-cell-in-view.ant-picker-cell-selected:hover .ant-picker-cell-inner {
+  color: #fff !important;
+}
+.ant-picker-header,
+.ant-picker-header-view,
+.ant-picker-footer,
+.ant-picker-today-btn,
+.ant-picker-now-btn {
+  color: var(--tk-text-secondary) !important;
+}
+.ant-picker-header-view:hover {
+  color: var(--tk-accent) !important;
+}
+.ant-picker-content th {
+  color: var(--tk-text-secondary) !important;
+}
+
 /* 滚动条收细，和 ARL 一致 */
 ::-webkit-scrollbar {
   width: 6px;

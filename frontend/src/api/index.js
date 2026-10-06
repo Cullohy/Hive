@@ -99,15 +99,26 @@ export const searchAssets = (q, type = 'all', limit = 50, scanId, filters = null
 // ── 单表分页检索（资产管理页那张合并表）────────────────────────────
 // 与 searchAssets 的区别：这里在数据库里 UNION ALL 后统一排序再切页，
 // 拿得到真实的总命中数（searchAssets 那种"每类各取 N 条"拿不到）。
-export const searchAssetsFlat = (q, { type = 'all', limit = 50, offset = 0, filters = null, groupId = null } = {}) =>
+// live: 后端默认 true（只看探活确认过的）。资产管理页**显式传 false** ——
+// 它要展示整个资产库，探活状态交给页面上的「仅存活 / 仅未探活」下拉去筛。
+// 不显式传就等于把行为挂在后端默认值上，改默认值时这边会静默变行为。
+// since / until: 「首见时间」闭区间（ISO 串）。都不给 = 不按时间筛。
+export const searchAssetsFlat = (
+  q,
+  { type = 'all', limit = 50, offset = 0, filters = null, groupId = null,
+    since = null, until = null, live = true } = {},
+) =>
   http.get('/api/search/flat', {
     params: {
       q,
       type,
       limit,
       offset,
+      live,
       ...(groupId ? { group_id: groupId } : {}),
       ...(filters && filters.length ? { filters: JSON.stringify(filters) } : {}),
+      ...(since ? { since } : {}),
+      ...(until ? { until } : {}),
     },
   })
 

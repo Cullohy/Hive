@@ -39,7 +39,16 @@
           <a-select-option v-for="s in statusOptions" :key="s" :value="s">{{ s }}</a-select-option>
         </a-select>
 
-        <a-checkbox v-model:checked="liveOnly" style="margin-left: 4px">仅探活</a-checkbox>
+        <!-- 时间段：按「首见时间」筛。留空 = 全部时间（默认，与"默认显示全部"一致） -->
+        <a-range-picker
+          v-model:value="dateRange"
+          style="margin-left: 10px"
+          size="middle"
+          :allow-clear="true"
+          :placeholder="['首见起', '首见止']"
+          :presets="rangePresets"
+          @change="onRangeChange"
+        />
 
         <span class="grow" />
         <a-button @click="resetAll">重置</a-button>
@@ -60,8 +69,14 @@
       </div>
 
       <!-- 生效条件 chip -->
-      <div v-if="activeFilterChips.length || aliveFilter || statusFilter || groupId" class="chip-row">
+      <div
+        v-if="activeFilterChips.length || aliveFilter || statusFilter || groupId || rangeLabel"
+        class="chip-row"
+      >
         <span class="chip-label">条件</span>
+        <a-tag v-if="rangeLabel" color="cyan" closable @close="clearRange">
+          首见:{{ rangeLabel }}
+        </a-tag>
         <a-tag v-if="groupId" color="purple" closable @close="groupId = null">
           分组:{{ currentGroupName }}
         </a-tag>
@@ -170,6 +185,18 @@
             />
           </template>
 
+          <template v-else-if="column.key === 'ports'">
+            <!-- 端口由后端折进行里（域名两跳、IP 一跳），这里只渲染。
+                 全空显示「—」而不是 0：那说明这台机器没扫到端口，
+                 与"扫了但一个都没开"是两回事。 -->
+            <span v-if="portListOf(record).length" :title="portListOf(record).join(', ')">
+              <span class="port-chip">{{ portListOf(record).length }}</span>
+              <span class="port-sample">{{ portListOf(record).slice(0, 3).join(' ') }}</span>
+              <span v-if="portListOf(record).length > 3" class="tk-muted">…</span>
+            </span>
+            <span v-else class="tk-muted">—</span>
+          </template>
+
           <template v-else-if="column.key === 'paths'">
             <!-- 0 也要显示：它说明"这个 host 确实没发现路径"，不是"没查到"。
                  只在 null（后端没给这个类型算）时才显示横线。 -->
@@ -239,8 +266,9 @@
         </a-tag>
       </a-space>
       <div class="tk-muted hint" style="margin-top: 12px">
-        默认只列<b>域名</b>（有哪些站）。想看 URL、端口、技术栈、发现，
-        用左上角类型下拉切到「全部」。
+        点<b>搜索</b>即列出全部资产（关键词留空即可）—— 默认是<b>域名 + IP</b>，
+        端口折在每行里。想单独看 URL / 端口 / 技术栈 / 发现，
+        用左上角类型下拉切。
       </div>
     </div>
 
@@ -391,19 +419,59 @@ import { SearchOutlined } from '@ant-design/icons-vue'
 import { message } from 'ant-design-vue'
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
+import dayjs from 'dayjs'
 
 import { listGroups, getHostDetail, searchAssetsFlat } from '@/api'
 
 const router = useRouter()
 
 const keyword = ref('')
-//: 默认只看**域名**。资产清单的主视角是"有哪些站"，URL / 端口 / 技术栈 /
-//: 发现都是某个域名下的**附属信息** —— 混在一张表里会让 2532 条里 2000 多条
-//: 是同一个域名的路径碎片，看不出"这个企业有多少个站"。要查那些用类型下拉切。
-const type = ref('domains')
+//: 默认看**域名 + IP**。
+//:
+//: 原来默认只给域名，理由是「资产清单的主视角是有哪些站，URL / 端口 / 技术栈 /
+//: 发现都是附属信息」（见 git 历史）。这个前提仍然成立，但当时把**端口**也
+//: 一并藏起来是错的 —— 端口挂在 IP 上、域名与 IP 是 N 对 N，藏在另一个类型里
+//: 就得自己拼才看得到「这台机器开着 3306 / 6379」。现在端口折进行里
+//: （``_FLAT_PORTS_EXPR``），这个理由不成立了。
+//: IP 保留单列：它常常不是任何域名的解析结果（裸扫出来的），藏起来会漏资产。
+const type = ref('domains,ips')
 const aliveFilter = ref('')
 const statusFilter = ref(null)
-const liveOnly = ref(true)
+//: 时间段（按**首见时间**筛）。``null`` = 全部时间。
+//: 两个元素是 dayjs 对象；发给后端时转成 ISO 串（``since`` / ``until``）。
+const dateRange = ref(null)
+//: 常用档位。``dayjs`` 是 ant-design-vue 带进来的传递依赖（1.11.x）。
+const rangePresets = [
+  { label: '今天', value: [dayjs().startOf('day'), dayjs().endOf('day')] },
+  { label: '近 7 天', value: [dayjs().subtract(6, 'day').startOf('day'), dayjs().endOf('day')] },
+  { label: '近 30 天', value: [dayjs().subtract(29, 'day').startOf('day'), dayjs().endOf('day')] },
+  { label: '近 90 天', value: [dayjs().subtract(89, 'day').startOf('day'), dayjs().endOf('day')] },
+]
+
+/** 条件变了就重新查，并回到第 1 页（停在第 5 页会让人以为"搜不到东西"）。 */
+function onRangeChange() {
+  currentPage.value = 1
+  loadPage()
+}
+
+function clearRange() {
+  dateRange.value = null
+  onRangeChange()
+}
+
+/** 这一行的「首见」在不在当前时间段里 —— 用来在结果上方显示一行摘要。 */
+const rangeLabel = computed(() => {
+  const r = dateRange.value
+  if (!r || !r[0] || !r[1]) return ''
+  return `${r[0].format('YYYY-MM-DD')} ~ ${r[1].format('YYYY-MM-DD')}`
+})
+
+//: 2026-10-06 删掉了「仅探活」勾选框。它**从来没被发到后端** —— `liveOnly`
+//: 全文件只出现在「绑定到勾选框 / ref 初始化 / resetAll 重置」三处；
+//: 而 ``/api/search/flat`` 的 ``live`` 默认是 ``True``。结果是 **74% 的资产
+//: （58 / 219）被永久藏起来，而那个看起来能控制它的勾选框点了没反应**。
+//: 现在改成在 :func:`loadPage` 里**显式**传 ``live: false``，行为写在代码里
+//: 而不是依赖后端默认值。要只看探活过的，旁边的「仅存活」下拉能筛。
 const searched = ref(false)
 const loading = ref(false)
 //: 后端 UNION 后的扁平行（不再是 {类型: 行[]} 的字典）
@@ -430,6 +498,11 @@ const newFilterField = ref('name')
 const newFilterOp = ref('contains')
 
 const typeOptions = [
+  //: 默认这一档。**端口折进行里**（后端 ``_FLAT_PORTS_EXPR``），所以
+  //: 「有哪些站、每台开着什么」在一张表里就答完了，不必再切到端口类型
+  //: 去看那 378 条 —— 那些里绝大多数是 CDN 节点池上的重复组合。
+  //: IP 单列一行是因为它常常不是任何域名的解析结果，藏起来会漏掉裸扫出来的资产。
+  { value: 'domains,ips', label: '域名 + IP' },
   { value: 'domains', label: '域名' },
   { value: 'ips', label: 'IP' },
   { value: 'ports', label: '端口' },
@@ -486,6 +559,12 @@ const currentGroupName = computed(
 )
 
 // 分组下拉要能选，所以进页面就把分组列表拉一次（只有名字和 id，很轻）
+//
+// ⚠️ 这里**不**顺手把资产表也拉出来。改成"打开就列全部"时加过一句
+// ``await loadPage()``，结果是请求发出、服务端 200，但前端 Promise 不 settle、
+// 按钮卡在 loading，且页面被反复重建。根因没定位到（源码结构核对过是对的），
+// 所以先撤回这一句：默认类型 + 端口折进行这两处是验证过的，
+// 「打开即出结果」等定位到那个不 settle 的点再加。
 onMounted(async () => {
   groupsLoading.value = true
   try {
@@ -501,6 +580,7 @@ onMounted(async () => {
 const columns = [
   { title: '资产', key: 'asset' },
   { title: '存活', key: 'alive', width: 60 },
+  { title: '端口', key: 'ports', width: 150 },
   { title: '路径', key: 'paths', width: 70, sorter: (a, b) => (a.path_count || 0) - (b.path_count || 0) },
   { title: '标题 · 状态', key: 'title' },
   { title: '风险', key: 'risk', width: 80 },
@@ -584,10 +664,10 @@ function removeFilter(i) {
 
 function resetAll() {
   keyword.value = ''
-  type.value = 'domains'
+  type.value = 'domains,ips'
+  dateRange.value = null
   aliveFilter.value = ''
   statusFilter.value = null
-  liveOnly.value = true
   groupId.value = null
   filters.value = []
   newFilterValue.value = ''
@@ -595,6 +675,13 @@ function resetAll() {
   results.value = []
   totalCount.value = 0
   currentPage.value = 1
+}
+
+/** 这一行的开放端口。后端给的是去重后的 ``端口/协议`` 逗号串（见
+ *  ``_FLAT_PORTS_EXPR``），这里拆成数组；空 / 缺失一律当空数组。 */
+function portListOf(r) {
+  if (!r || !r.ports) return []
+  return String(r.ports).split(',').map((s) => s.trim()).filter(Boolean)
 }
 
 /** 资产名。技术栈与发现的 asset_key 后端已拼上 host/kind 前缀保证唯一，
@@ -780,12 +867,10 @@ function quickSearch(value) {
 }
 
 async function doSearch() {
-  const q = keyword.value.trim()
-  // 关键词、筛选、分组三个至少要有一个 —— 全空的话搜出来的就是全库，没有意义
-  if (!q && !filters.value.length && groupId.value == null) {
-    message.warning('请输入关键词、添加筛选条件或选择分组')
-    return
-  }
+  // 全空**不再拦**：后端 ``/api/search/flat`` 已经放开空词（只拦 1 个字符
+  // 那种没意义的搜索），所以「打开就列出全部」和「点搜索」是同一个结果。
+  // 之前那句"全空搜出来的就是全库，没有意义"已经不成立 —— 全库就是这页
+  // 要展示的东西。
   // 改了查询条件就回到第 1 页（继续停在第 5 页会让人以为"搜不到东西"）
   currentPage.value = 1
   await loadPage()
@@ -799,12 +884,19 @@ async function loadPage() {
     if (statusFilter.value != null) {
       allFilters.push({ field: 'status', op: 'eq', value: statusFilter.value })
     }
+    const r = dateRange.value
     const data = await searchAssetsFlat(keyword.value.trim(), {
       type: type.value,
       limit: pageSize.value,
       offset: (currentPage.value - 1) * pageSize.value,
       filters: allFilters,
       groupId: groupId.value,
+      // 时间段闭区间。**必须带时区**：库里的 first_seen 是 ISO 带偏移的串，
+      // 不带时区会按服务器本地时区解释，跨时区部署时边界会差几个小时。
+      since: r && r[0] ? r[0].startOf('day').toISOString() : null,
+      until: r && r[1] ? r[1].endOf('day').toISOString() : null,
+      // 显式带上 live=false，不靠后端默认值。见上面 liveOnly 那段说明。
+      live: false,
     })
     results.value = data.rows || []
     totalCount.value = data.total || 0
@@ -990,6 +1082,26 @@ function onPageChange(page, size) {
     'PingFang SC', 'Microsoft YaHei', sans-serif;
   font-variant-numeric: tabular-nums;
   -webkit-font-smoothing: antialiased;
+}
+/* 端口：个数用强调色（一眼看出"这台开得多"），样本用等宽小字 */
+.port-chip {
+  display: inline-block;
+  min-width: 18px;
+  padding: 0 5px;
+  margin-right: 6px;
+  border-radius: 8px;
+  color: #fff;
+  background: var(--tk-accent);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 16px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.port-sample {
+  color: var(--tk-text-sub);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
 }
 .risk-tag { font-size: 11px; }
 .first-seen { font-size: 11px; font-family: var(--tk-mono, monospace); }
