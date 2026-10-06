@@ -70,7 +70,7 @@
 
       <!-- 生效条件 chip -->
       <div
-        v-if="activeFilterChips.length || aliveFilter || statusFilter || groupId || rangeLabel"
+        v-if="aliveFilter || statusFilter || groupId || rangeLabel"
         class="chip-row"
       >
         <span class="chip-label">条件</span>
@@ -80,53 +80,12 @@
         <a-tag v-if="groupId" color="purple" closable @close="groupId = null">
           分组:{{ currentGroupName }}
         </a-tag>
-        <a-tag
-          v-for="(chip, i) in activeFilterChips"
-          :key="i"
-          color="orange"
-          closable
-          @close="removeFilter(i)"
-        >{{ chip.label }}</a-tag>
         <a-tag v-if="aliveFilter" color="blue" closable @close="aliveFilter = ''">
           {{ aliveFilter === 'alive' ? '仅存活' : '仅未探活' }}
         </a-tag>
         <a-tag v-if="statusFilter" color="green" closable @close="statusFilter = null">
           状态码={{ statusFilter }}
         </a-tag>
-        <a-button
-          v-if="activeFilterChips.length > 1"
-          type="link"
-          size="small"
-          style="padding: 0"
-          @click="filters = []"
-        >清除全部</a-button>
-      </div>
-
-      <!-- 条件构建行 -->
-      <div class="build-row">
-        <span class="chip-label">条件</span>
-        <a-input
-          v-model:value="newFilterValue"
-          placeholder="值 或 title:「xxx」"
-          style="width: 190px"
-          size="small"
-          @press-enter="addFilter"
-        />
-        <a-select v-model:value="newFilterField" style="width: 130px" size="small">
-          <a-select-option v-for="f in fieldOptions" :key="f.value" :value="f.value">
-            {{ f.label }}
-          </a-select-option>
-        </a-select>
-        <a-select v-model:value="newFilterOp" style="width: 110px" size="small">
-          <a-select-option v-for="o in opOptions" :key="o.value" :value="o.value">
-            {{ o.label }}
-          </a-select-option>
-        </a-select>
-        <a-button size="small" @click="addFilter">加入</a-button>
-        <span class="grow" />
-        <span class="tk-muted build-hint">
-          字段: title / host / server / status / source / kind / org / port
-        </span>
       </div>
     </div>
 
@@ -492,11 +451,6 @@ const detailLoading = ref(false)
 const detail = ref(null)
 const detailHost = ref('')
 
-const filters = ref([])
-const newFilterValue = ref('')
-const newFilterField = ref('name')
-const newFilterOp = ref('contains')
-
 const typeOptions = [
   //: 默认这一档。**端口折进行里**（后端 ``_FLAT_PORTS_EXPR``），所以
   //: 「有哪些站、每台开着什么」在一张表里就答完了，不必再切到端口类型
@@ -510,46 +464,6 @@ const typeOptions = [
   { value: 'technologies', label: '技术栈' },
   { value: 'findings', label: '发现' },
 ]
-
-const fieldOptions = [
-  { value: 'name', label: '域名' },
-  { value: 'url', label: 'URL' },
-  { value: 'host', label: '主机' },
-  { value: 'title', label: '标题' },
-  { value: 'server', label: 'Server' },
-  { value: 'source', label: '来源' },
-  { value: 'status', label: '状态码' },
-  { value: 'kind', label: '类型' },
-  { value: 'org', label: '归属' },
-  { value: 'protocol', label: '协议' },
-  { value: 'port', label: '端口' },
-  { value: 'evidence', label: '证据' },
-  { value: 'detail', label: '详情' },
-]
-
-const opOptions = [
-  { value: 'contains', label: '包含' },
-  { value: 'not_contains', label: '不包含' },
-  { value: 'eq', label: '等于' },
-  { value: 'ne', label: '不等于' },
-  { value: 'gt', label: '大于' },
-  { value: 'gte', label: '大于等于' },
-  { value: 'lt', label: '小于' },
-  { value: 'lte', label: '小于等于' },
-  { value: 'exists', label: '存在' },
-  { value: 'not_exists', label: '不存在' },
-]
-
-const FIELD_NAMES = {
-  name: '域名', url: 'URL', host: '主机', title: '标题',
-  server: 'Server', source: '来源', status: '状态码', kind: '类型',
-  org: '归属', protocol: '协议', port: '端口', evidence: '证据', detail: '详情',
-}
-const OP_NAMES = {
-  contains: '包含', not_contains: '不包含', eq: '=', ne: '!=',
-  gt: '>', gte: '>=', lt: '<', lte: '<=',
-  exists: '存在', not_exists: '不存在',
-}
 
 const statusOptions = [200, 301, 302, 401, 403, 404, 500, 502, 503]
 const samples = ['qq.com', 'nginx', 'admin', '403', 'cdn']
@@ -620,47 +534,14 @@ const pageBreakdown = computed(() => {
   return out
 })
 
-const describeFilter = (f) =>
-  f.op === 'exists' || f.op === 'not_exists'
-    ? `${OP_NAMES[f.op]} ${FIELD_NAMES[f.field] || f.field}`
-    : `${OP_NAMES[f.op] || f.op} ${FIELD_NAMES[f.field] || f.field}:"${f.value}"`
-
-const activeFilterChips = computed(() => filters.value.map((f) => ({ label: describeFilter(f) })))
-
 const displayQuery = computed(() => {
   const parts = []
   if (groupId.value) parts.push(`分组:${currentGroupName.value}`)
   parts.push(keyword.value.trim() || '全部')
-  for (const f of filters.value) parts.push(describeFilter(f))
   return parts.filter(Boolean).join(' · ')
 })
 
-const keywordPlaceholder = computed(() =>
-  filters.value.length ? displayQuery.value : '输入域名、IP、URL、标题、技术名（至少 2 个字符）',
-)
-
-function addFilter() {
-  const v = newFilterValue.value.trim()
-  if (!v) {
-    message.warning('请输入筛选值')
-    return
-  }
-  const m = v.match(/^(\w+):["「]?(.+?)["」]?$/)
-  if (m) {
-    if (!FIELD_NAMES[m[1]]) {
-      message.warning(`未知字段 ${m[1]}`)
-      return
-    }
-    filters.value.push({ field: m[1], op: newFilterOp.value, value: m[2] })
-  } else {
-    filters.value.push({ field: newFilterField.value, op: newFilterOp.value, value: v })
-  }
-  newFilterValue.value = ''
-}
-
-function removeFilter(i) {
-  filters.value.splice(i, 1)
-}
+const keywordPlaceholder = '输入域名、IP、URL、标题、技术名（至少 2 个字符）'
 
 function resetAll() {
   keyword.value = ''
@@ -669,8 +550,6 @@ function resetAll() {
   aliveFilter.value = ''
   statusFilter.value = null
   groupId.value = null
-  filters.value = []
-  newFilterValue.value = ''
   searched.value = false
   results.value = []
   totalCount.value = 0
@@ -880,16 +759,19 @@ async function doSearch() {
 async function loadPage() {
   loading.value = true
   try {
-    const allFilters = [...filters.value]
+    // 状态码筛选走 filters 传给后端（search_flat 只认这一种结构化条件）。
+    // 原来这里是 `[...filters.value]` 再 push —— 那个 filters 由「条件构建行」
+    // 产生，该行已按要求删掉，现在只有状态码这一条来源。
+    const cond = []
     if (statusFilter.value != null) {
-      allFilters.push({ field: 'status', op: 'eq', value: statusFilter.value })
+      cond.push({ field: 'status', op: 'eq', value: statusFilter.value })
     }
     const r = dateRange.value
     const data = await searchAssetsFlat(keyword.value.trim(), {
       type: type.value,
       limit: pageSize.value,
       offset: (currentPage.value - 1) * pageSize.value,
-      filters: allFilters,
+      filters: cond,
       groupId: groupId.value,
       // 时间段闭区间。**必须带时区**：库里的 first_seen 是 ISO 带偏移的串，
       // 不带时区会按服务器本地时区解释，跨时区部署时边界会差几个小时。
@@ -936,18 +818,6 @@ function onPageChange(page, size) {
   font-size: 12px;
   color: var(--tk-muted);
   font-weight: 500;
-}
-.build-row {
-  display: flex;
-  gap: 6px;
-  align-items: center;
-  flex-wrap: wrap;
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid var(--tk-border);
-}
-.build-hint {
-  font-size: 11px;
 }
 .grow { flex: 1; }
 .result-head {
