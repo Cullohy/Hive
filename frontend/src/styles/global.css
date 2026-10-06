@@ -155,12 +155,37 @@ a:hover {
   background-color: var(--tk-accent) !important;
 }
 
-/* 日期选择器：全站**唯一**没有主题覆盖的 antd 组件。
+/* 日期选择器主题覆盖。
  *
- * antd 的浅色调是从 colorPrimary 用颜色算法推导的，`#c2410c` 推出来偏黄 ——
- * 区间选中和 hover 那两块底色就与全站橙红对不上（点开面板时最显眼）。
- * 这里把关键的几处**显式**定死，不依赖推导结果：推导算法一改这里也不会跑偏。
+ * 更正一处此前的错误结论：曾写「antd 的浅色调是从 colorPrimary 推导的，
+ * #c2410c 推出来偏黄」。**这是错的** —— 用 TinyColor 实测 colorPrimary1..9
+ * 全部落在色相 17-18°（橙红），与主色同色系，没有一档进黄色区间(40-70°)。
+ * 当时没验证就写了这段注释。
+ *
+ * 真正需要覆盖的是下面两类**没有主题 token 管**的色块：
+ *   1. .ant-picker-active-bar —— 聚焦时贴着输入框下沿的那条横条，
+ *      用 colorPrimary 填充、聚焦时 opacity:1。它不受 --tk-* 变量管，
+ *      是「点一下就冒出一条颜色」的主要来源。
+ *   2. 面板里单元格的选中/区间/hover 底色。
+ * 都**显式**定死，不依赖 antd 的推导算法 —— 算法一改这里也不会跑偏。
  */
+.ant-picker-active-bar {
+  background: var(--tk-accent) !important;
+  height: 2px !important;
+}
+
+/* 聚焦态边框：antd 默认是 primary 色的 2px 光晕，这里压成一条实线 */
+.ant-picker-focused,
+.ant-picker-input-active .ant-picker-input > input {
+  border-color: var(--tk-accent) !important;
+  box-shadow: none !important;
+}
+
+.ant-picker:hover,
+.ant-picker-focused {
+  border-color: var(--tk-accent) !important;
+}
+
 .ant-picker-dropdown .ant-picker-panel {
   background: var(--tk-surface);
 }
@@ -170,7 +195,7 @@ a:hover {
   background: var(--tk-accent) !important;
   color: #fff !important;
 }
-/* 区间中段。不写的话用 antd 推导的浅色调（偏黄） */
+/* 区间中段。用 --tk-accent-soft（主色 10% 透明度），不写就落到 antd 的推导值 */
 .ant-picker-cell-in-range:not(.ant-picker-cell-range-start):not(.ant-picker-cell-range-end) {
   background: var(--tk-accent-soft) !important;
 }
@@ -193,11 +218,29 @@ a:hover {
 .ant-picker-now-btn {
   color: var(--tk-text-secondary) !important;
 }
+/* today / now 按钮：antd hover 时给一整块 primary 底色，
+ * 换算成 #c2410c 是一块很扎眼的实心橙红块。改成与单元格一致的淡橙。 */
+.ant-picker-today-btn:hover,
+.ant-picker-now-btn:hover,
+.ant-picker-footer-link:hover {
+  background: var(--tk-accent-soft-2) !important;
+  color: var(--tk-accent) !important;
+}
 .ant-picker-header-view:hover {
   color: var(--tk-accent) !important;
 }
 .ant-picker-content th {
   color: var(--tk-text-secondary) !important;
+}
+
+/* presets 面板（我们传了 今天/近7天/近30天/近90天）。
+ * antd 给选中项的是整块 primary 底 + 白字，与全站橙红风格冲突。 */
+.ant-picker-presets > li.ant-picker-presets-selected {
+  background: var(--tk-accent) !important;
+  color: #fff !important;
+}
+.ant-picker-presets > li:hover {
+  background: var(--tk-accent-soft) !important;
 }
 
 /* 滚动条收细，和 ARL 一致 */
