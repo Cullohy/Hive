@@ -189,27 +189,58 @@ a:hover {
 .ant-picker-dropdown .ant-picker-panel {
   background: var(--tk-surface);
 }
+/* 选区两端 + 选中格：实心主色 + 白字。
+ *
+ * ⚠️ 这里**不能只写 .ant-picker-cell-selected**。2026-10-06 实测 antd 4.2.6
+ * 给区间两端打的 class 并不对称：
+ *   range-start -> "ant-picker-cell-range-start ant-picker-cell-selected"
+ *   range-end   -> "ant-picker-cell-range-end"            <- 没有 selected
+ * 只认 selected 的话，**结束日永远是空的**，选区看起来在倒数第二天断掉
+ * （用户截图里 10-06 就是个空心框）。所以两端都显式列出来。
+ *
+ * 区间**中段**不覆盖：antd 自己画的 in-range 底色是连贯的一整条，
+ * 用逐格 background 反而会在格子之间留缝（试过，很难看）。中段只改色相。
+ */
 .ant-picker-cell-selected .ant-picker-cell-inner,
 .ant-picker-cell-range-start .ant-picker-cell-inner,
 .ant-picker-cell-range-end .ant-picker-cell-inner {
   background: var(--tk-accent) !important;
   color: #fff !important;
 }
-/* 区间中段。用 --tk-accent-soft（主色 10% 透明度），不写就落到 antd 的推导值 */
-.ant-picker-cell-in-range:not(.ant-picker-cell-range-start):not(.ant-picker-cell-range-end) {
+/* 区间中段：antd 把 in-range 的底色画在 **td** 上（.ant-picker-cell），
+ * 而且是一条连贯的背景条。所以这条必须改 td 的 background —— 改
+ * .ant-picker-cell-inner 的话底色带会整个消失（试过：整块选区不见了）。 */
+.ant-picker-cell-in-range {
   background: var(--tk-accent-soft) !important;
 }
-.ant-picker-cell:not(.ant-picker-cell-in-view) .ant-picker-cell-inner,
+/* 非本月/非本年的占位格（上一月尾、下月头）：淡灰无底色。
+ * 必须排开选区相关 class —— 跨面板时左面板里也会画出 10-01..10-06 那几格，
+ * 它们没有 in-view，但仍属于选区，被这条刷成白底就会「选区断了」。 */
+.ant-picker-cell:not(.ant-picker-cell-in-view):not(.ant-picker-cell-range-start):not(.ant-picker-cell-range-end):not(.ant-picker-cell-in-range) {
+  background: transparent !important;
+}
+.ant-picker-cell:not(.ant-picker-cell-in-view):not(.ant-picker-cell-range-start):not(.ant-picker-cell-range-end):not(.ant-picker-cell-in-range) .ant-picker-cell-inner,
 .ant-picker-cell-disabled .ant-picker-cell-inner {
   color: var(--tk-text-muted) !important;
   background: transparent !important;
 }
-.ant-picker-cell:hover .ant-picker-cell-inner,
-.ant-picker-cell-in-view.ant-picker-cell-selected:hover .ant-picker-cell-inner {
+/* hover：淡橙。选区两端 hover 时保持实心 + 白字（antd 默认会把端点变浅，
+ * 视觉上就「松开」了）。 */
+.ant-picker-cell:hover:not(.ant-picker-cell-range-start):not(.ant-picker-cell-range-end):not(.ant-picker-cell-selected) .ant-picker-cell-inner {
   background: var(--tk-accent-soft-2) !important;
 }
-.ant-picker-cell-in-view.ant-picker-cell-selected:hover .ant-picker-cell-inner {
+.ant-picker-cell-range-start:hover .ant-picker-cell-inner,
+.ant-picker-cell-range-end:hover .ant-picker-cell-inner,
+.ant-picker-cell-selected:hover .ant-picker-cell-inner {
+  background: var(--tk-accent-hover) !important;
   color: #fff !important;
+}
+/* today 标记：antd 给的是一圈虚线边框，横在选区上像一道表格线。
+ * 改成实心主色。圆角 2px 对应 antd 的 borderRadiusSM —— 本仓
+ * --tk-* 里只有颜色/尺寸/布局，没有 radius 变量，别引一个不存在的。 */
+.ant-picker-cell-today .ant-picker-cell-inner::before {
+  border-color: var(--tk-accent) !important;
+  border-radius: 2px !important;
 }
 .ant-picker-header,
 .ant-picker-header-view,

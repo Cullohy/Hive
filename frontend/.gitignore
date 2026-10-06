@@ -3,4 +3,9 @@ dist/
 *.local
 .DS_Store
 .esbuild-tmp/
+# 组件复现页（2026-10-06 起）。排查「antd 组件被 global.css 覆盖后样式错乱」
+# 这类问题时，浏览器点不开弹层，只能另起一个把组件强制 open 的页面来看真实
+# 渲染。放这里而不是 backend/.testtmp/：它要在 frontend root 里才能被 vite
+# 解析出 node_modules。配 vite.config.mjs 独立起 dev server（端口 5199）。
+repro/
 
