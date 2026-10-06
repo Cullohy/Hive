@@ -3,13 +3,6 @@
     <!-- ── 筛选栏 ── -->
     <div class="tk-card">
       <div class="filter-row">
-        <a-select v-model:value="type" style="width: 160px" size="middle">
-          <a-select-option v-for="t in typeOptions" :key="t.value" :value="t.value">
-            {{ t.label }}
-          </a-select-option>
-          <a-select-option value="all">全部（含路径与技术栈）</a-select-option>
-        </a-select>
-
         <a-select
           v-model:value="groupId"
           style="width: 170px"
@@ -23,20 +16,52 @@
           </a-select-option>
         </a-select>
 
-        <a-select v-model:value="aliveFilter" style="width: 130px" size="middle">
-          <a-select-option value="">全部状态</a-select-option>
-          <a-select-option value="alive">仅存活</a-select-option>
-          <a-select-option value="dead">仅未探活</a-select-option>
-        </a-select>
-
+        <!--
+          任务筛选：名称模糊、id / 短码精确。
+          用 show-search + 自己的 filter-option，而不是 filter-option 回调，
+          是为了在**每次输入时**都能同时匹配三种形态（见 scanOptions 的注释）。
+        -->
         <a-select
-          v-model:value="statusFilter"
-          style="width: 140px"
+          v-model:value="scanId"
+          style="width: 260px"
           size="middle"
           allow-clear
-          placeholder="状态码"
+          show-search
+          placeholder="按任务筛选"
+          :loading="scansLoading"
+          :filter-option="false"
+          :not-found-content="scansLoading ? '加载中…' : '没有匹配的任务'"
+          @search="onScanSearch"
+          @change="onScanChange"
+          @dropdown-visible-change="onScanDropdown"
         >
-          <a-select-option v-for="s in statusOptions" :key="s" :value="s">{{ s }}</a-select-option>
+          <!--
+            ⚠️ ``#optionLabel`` 是**必需的**：antd 4.2.6 选中后默认把 option 的
+            默认插槽内容拿来显示（``index.js`` 里 ``optionLabelRender: slots.optionLabel``），
+            而下面每个 option 是**两行**的 div。塞进选择框后只有一行高度，
+            第二行（TaskId）会被裁掉 —— 截图里就是名称被截断成
+            "亿联网络技术股份有限公司…" 而那行短码整个看不见。
+            这个插槽让「下拉里怎么排版」与「选中后显示什么」互不影响。
+          -->
+          <template #optionLabel="{ value }">
+            <span class="scan-selected">
+              <span class="scan-selected-name">{{ scanSelectedName(value) }}</span>
+              <span class="scan-selected-id">任务ID：{{ scanCodeOf(value) }}</span>
+            </span>
+          </template>
+          <a-select-option v-for="o in scanOptions" :key="o.value" :value="o.value">
+            <div class="scan-option">
+              <!--
+                两行：**第一行任务名，第二行灰色「任务ID：<短码>」**。
+                之前第二行塞了 ``#55 · passive · yealink.com.cn``（内部主键+预设+目标），
+                三样挤一起反而看不出重点；而 TaskId 短码才是用户在任务列表
+                「TaskId」列里看到的那个标识，两处对得上才有用。
+                光秃一个 ``2BH0R2JM`` 看不出是什么，所以带个「任务ID：」前缀。
+              -->
+              <span class="scan-option-label">{{ o.name || o.label }}</span>
+              <span class="scan-option-desc">任务ID：{{ o.code }}</span>
+            </div>
+          </a-select-option>
         </a-select>
 
         <!-- 时间段：按「首见时间」筛。留空 = 全部时间（默认，与"默认显示全部"一致） -->
@@ -115,12 +140,18 @@
           </template>
 
           <template v-else-if="column.key === 'alive'">
-            <!-- 只给存活标记，状态码挪到「标题 · 状态」列 ——
-                 状态码放在这里等于把同一份信息显示两遍。 -->
+            <!-- 只给一个健康标记，状态码挪到「标题 · 状态」列 ——
+                 状态码放在这里等于把同一份信息显示两遍。
+
+                 绿 = 响应正常（status < 400）；灰 = 其余两种完全不同的情形：
+                 「响应了但 4xx/5xx」与「压根没有 Web 响应」。tooltip 分开说，
+                 别让灰点一律读成"站点挂了"。 -->
             <span
               class="alive-dot"
               :class="record.status != null && record.status < 400 ? 'on' : 'off'"
-              :title="record.status != null ? `HTTP ${record.status}` : '未探活'"
+              :title="record.status == null
+                ? '无 Web 响应（没探到 http 服务）'
+                : `HTTP ${record.status}${record.status >= 400 ? '（异常）' : ''}`"
             />
           </template>
 
@@ -196,20 +227,21 @@
       </div>
     </div>
 
-    <!-- ── 空态 ── -->
-    <div v-else class="tk-card">
-      <div class="tk-card-title">试试搜这些</div>
-      <a-space wrap>
-        <a-tag v-for="s in samples" :key="s" class="sample" @click="quickSearch(s)">
-          {{ s }}
-        </a-tag>
-      </a-space>
-      <div class="tk-muted hint" style="margin-top: 12px">
-        点<b>搜索</b>即列出全部资产（关键词留空即可）—— 默认是<b>域名 + IP</b>，
-        端口折在每行里。想单独看 URL / 端口 / 技术栈 / 发现，
-        用左上角类型下拉切。
-      </div>
-    </div>
+    <!--
+      2026-10-06 删掉了「未搜索」时的空态卡片（原来写"试试搜这些" + 一排
+      示例 tag + 使用提示）。
+
+      删的理由：
+        · 那条提示已经**过期** —— 它写着"想单独看 URL / 端口 / 技术栈 / 发现，
+          用左上角类型下拉切"，而那个类型下拉同日已删（见 TYPE_LABELS 处）。
+          留着会让人去找一个不存在的控件。
+        · 示例 tag 的点击只是填关键词 + 触发搜索，示例本身（qq.com / nginx /
+          admin / 403 / cdn）也没有信息量 —— 输什么都能搜，不如直接搜。
+
+      顺带说明**没有**改成"打开页面就自动加载全部资产"：代码里记着试过，
+      加了 ``await loadPage()`` 之后请求发出、服务端 200，但前端 Promise 不
+      settle、按钮卡在 loading，根因当时没定位到。要做这个得先解决那条。
+    -->
 
     <!-- ── 详情抽屉（放在 v-if/v-else 链之外，否则会打断配对）── -->
     <a-drawer
@@ -360,22 +392,29 @@ import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import dayjs from 'dayjs'
 
-import { listGroups, getHostDetail, searchAssetsFlat } from '@/api'
+import { listGroups, getHostDetail, searchAssetsFlat, listScans } from '@/api'
 
 const router = useRouter()
 
 const keyword = ref('')
-//: 默认看**域名 + IP**。
+//: 查询类型固定为 ``ASSET_TYPE``（见下面 TYPE_LABELS 处那段说明），
+//: 不再是响应式的 —— 2026-10-06 删掉了「资产类型」下拉。
+//
+//: 2026-10-06 同时删掉了 ``aliveFilter``（「仅存活 / 仅未探活」下拉）。删的理由：
 //:
-//: 原来默认只给域名，理由是「资产清单的主视角是有哪些站，URL / 端口 / 技术栈 /
-//: 发现都是附属信息」（见 git 历史）。这个前提仍然成立，但当时把**端口**也
-//: 一并藏起来是错的 —— 端口挂在 IP 上、域名与 IP 是 N 对 N，藏在另一个类型里
-//: 就得自己拼才看得到「这台机器开着 3306 / 6379」。现在端口折进行里
-//: （``_FLAT_PORTS_EXPR``），这个理由不成立了。
-//: IP 保留单列：它常常不是任何域名的解析结果（裸扫出来的），藏起来会漏资产。
-const type = ref('domains,ips')
-const aliveFilter = ref('')
-const statusFilter = ref(null)
+//: 1. **它本来就没在正常工作。** 它是**纯前端**过滤 ``results.value`` —— 也就是
+//:    当前这一页的 50 条；而分页的 ``total`` 来自服务端。于是选「仅存活」后标题仍
+//:    写"匹配 N 条"，表格却可能整页空掉并显示"没有匹配的资产"，而那些资产其实
+//:    就在别的页上。
+//: 2. **名字与实际筛的东西对不上。** 它按 ``status != null``（有没有 HTTP 响应）
+//:    筛，而那一列的圆点按 ``status < 400`` 染绿 —— 两套标准。真库里 121 个域名
+//:    选「仅存活」会收进 31 条，其中 **14 条圆点是灰的**（45%）。
+//: 3. **「未探活」这个叫法不准。** 那 90 个「未探活」的域名里有 36% 其实**开着
+//:    端口**，只是端口不是 web 服务。它真正表达的是"这台机器有没有 Web 响应"。
+//:
+//: 那一列**保留**（列名改成「健康」，含义=status<400 染绿），要按这个维度筛的
+//: 时候走搜索词或右侧详情面板。⚠️ 若要恢复成筛选器，**必须下推给后端**
+//: （``/api/search/flat`` 的 ``live`` 口径走 ``scan_asset``），别再在前端过滤。
 //: 时间段（按**首见时间**筛）。``null`` = 全部时间。
 //: 两个元素是 dayjs 对象；发给后端时转成 ISO 串（``since`` / ``until``）。
 const dateRange = ref(null)
@@ -398,7 +437,9 @@ function onRangeChange() {
 //: 而 ``/api/search/flat`` 的 ``live`` 默认是 ``True``。结果是 **74% 的资产
 //: （58 / 219）被永久藏起来，而那个看起来能控制它的勾选框点了没反应**。
 //: 现在改成在 :func:`loadPage` 里**显式**传 ``live: false``，行为写在代码里
-//: 而不是依赖后端默认值。要只看探活过的，旁边的「仅存活」下拉能筛。
+//: 而不是依赖后端默认值。
+//: （原文这里写着"旁边的「仅存活」下拉能筛"—— 那个下拉同日也删了，理由见上面
+//:  ``aliveFilter`` 那段。要按这个维度筛必须下推后端的 ``live`` 参数。）
 const searched = ref(false)
 const loading = ref(false)
 //: 后端 UNION 后的扁平行（不再是 {类型: 行[]} 的字典）
@@ -410,8 +451,127 @@ const pageSize = ref(50)
 
 // 分组过滤
 const groups = ref([])
-const groupsLoading = ref(false)
+//: 初始就是 true —— 列表在 onMounted 里拉，在那之前下拉应该显示加载中。
+//: 写 false 再在 onMounted 里补 true 的话，挂载到请求发出之间有一帧是
+//: 「加载中=false 但还是空列表」，下拉会闪一下空。
+const groupsLoading = ref(true)
 const groupId = ref(null)
+
+// ── 任务（扫描）过滤 ──────────────────────────────────────────────────
+//
+// 需求是「按任务名称**或**任务 id 筛」。这两者性质不同，所以分两层：
+//   · **最终筛选条件只有一个 `scanId`** —— 后端 `/api/search/flat` 的
+//     `scan_id` 参数走 `scan_asset` 的「这次扫描看到过」口径（不是
+//     `t.scan_id`，那个只是"谁最先发现的"，见 postgres.py::_seen_clause）。
+//   · **用户输入的是自由文本**：任务名称模糊匹配、id/短码精确匹配。
+//     所以先在本地把输入解析成 scanId，再交给后端。
+//
+// 为什么不把「任务名称」直接丢给后端做 SQL 模糊匹配：scan 表没有参与
+// UNION 的那套检索列，走名字筛就得在每个分支里 join scan 表，代价大且
+// 破坏"一个资产可能在多次扫描里出现"的语义。任务列表本来就常驻内存量级，
+// 本地解析更快、也更容易把「名称 / id / 短码」三种输入统一处理。
+const scanId = ref(null)
+const scans = ref([])
+const scansLoading = ref(false)
+const scanKeyword = ref('')
+
+/**
+ * 任务在**选中后**显示的那一行文本。
+ *
+ * 用的是 **TaskId 短码**（`2BH0R2JM` 这种，见后端 `util/ids.py::task_code`），
+ * 不是 `#55` 那个内部自增主键 —— 任务列表那一列标题就叫「TaskId」、显示的
+ * 就是短码，用户在这两处看到的是同一个东西才对得上。
+ *
+ * 短码**兜底**到 `#id`：老数据理论上可能没有，但真出现了也不能显示成空白。
+ */
+function scanLabel(s) {
+  const code = (s.task_code || '').trim()
+  const id = `#${s.scan_id}`
+  const main = code || id
+  const name = (s.name || '').trim()
+  const target = (s.targets || []).join(', ')
+  return name || target ? `${name || target}（${main}）` : main
+}
+
+/**
+ * 选中后那一行的**名称部分**（TaskId 由 :func:`scanCodeOf` 单独渲染，
+ * 固定在末尾不被名称挤掉）。
+ *
+ * 任务可能已被删（`/api/scans` 列表里找不到），那时连名称都没有 —— 返回空串，
+ * 只留 TaskId，别显示成"（2BH0R2JM）"这种括号开头的怪东西。
+ */
+function scanSelectedName(value) {
+  const s = scans.value.find((x) => x.scan_id === value)
+  if (!s) return ''
+  return (s.name || '').trim() || (s.targets || []).join(', ') || ''
+}
+
+/**
+ * 某个 scan_id 的 **TaskId 短码**（`2BH0R2JM` 这种）。
+ *
+ * 短码才是对外的任务标识 —— 任务列表那一列标题就是「TaskId」、显示的就是它。
+ * 拿内部自增主键当 TaskId 展示会让用户在两个页面看到两个不同的"id"而对不上。
+ * 理论上老数据可能没有短码，兜底成 ``#id``，总比空白强。
+ */
+function scanCodeOf(value) {
+  const s = scans.value.find((x) => x.scan_id === value)
+  return (s?.task_code || '').trim() || `#${value}`
+}
+
+/** 下拉里按输入过滤：名称、id、短码、目标任一命中即可。 */
+const scanOptions = computed(() => {
+  const kw = scanKeyword.value.trim().toLowerCase()
+  const all = scans.value.map((s) => ({
+    value: s.scan_id,
+    // 选中后显示的那一行（名称 + TaskId），见 scanLabel
+    label: scanLabel(s),
+    // 下拉里第一行：纯名称/目标，不带 id —— 第二行单独显示 TaskId
+    name: (s.name || '').trim() || (s.targets || []).join(', ') || '',
+    // 下拉里第二行：TaskId 短码
+    code: (s.task_code || '').trim() || `#${s.scan_id}`,
+  }))
+  if (!kw) return all.slice(0, 60)
+  return all
+    .filter(
+      (o) =>
+        o.label.toLowerCase().includes(kw) ||   // 名称 + TaskId
+        o.code.toLowerCase().includes(kw) ||    // TaskId 短码
+        String(o.value).includes(kw),           // 内部主键，仍然能按数字搜
+    )
+    .slice(0, 60)
+})
+
+/** 拉任务列表。轻量：只要 id/name/preset/targets/task_code。 */
+async function loadScans() {
+  if (scans.value.length || scansLoading.value) return
+  scansLoading.value = true
+  try {
+    const data = await listScans(300)
+    scans.value = Array.isArray(data) ? data : []
+  } catch {
+    // 任务列表拉不到不该让整页不可用 —— 筛选少一个维度而已
+    scans.value = []
+  } finally {
+    scansLoading.value = false
+  }
+}
+
+/** 打开下拉才拉列表：这一页默认不关心任务，进来时不必付这个请求。 */
+function onScanDropdown(open) {
+  if (open) loadScans()
+}
+
+/** 输入即筛（名称 / id / 短码 / 目标任一命中）。 */
+function onScanSearch(text) {
+  scanKeyword.value = text || ''
+}
+
+/** 选中任务后回到第 1 页再查 —— 停在第 5 页会像"这个任务没资产"。 */
+function onScanChange() {
+  scanKeyword.value = ''
+  currentPage.value = 1
+  loadPage()
+}
 
 // 详情抽屉
 const detailOpen = ref(false)
@@ -419,22 +579,46 @@ const detailLoading = ref(false)
 const detail = ref(null)
 const detailHost = ref('')
 
-const typeOptions = [
-  //: 默认这一档。**端口折进行里**（后端 ``_FLAT_PORTS_EXPR``），所以
-  //: 「有哪些站、每台开着什么」在一张表里就答完了，不必再切到端口类型
-  //: 去看那 378 条 —— 那些里绝大多数是 CDN 节点池上的重复组合。
-  //: IP 单列一行是因为它常常不是任何域名的解析结果，藏起来会漏掉裸扫出来的资产。
-  { value: 'domains,ips', label: '域名 + IP' },
-  { value: 'domains', label: '域名' },
-  { value: 'ips', label: 'IP' },
-  { value: 'ports', label: '端口' },
-  { value: 'urls', label: 'URL' },
-  { value: 'technologies', label: '技术栈' },
-  { value: 'findings', label: '发现' },
-]
+//: 2026-10-06 删掉了「资产类型」下拉（原 ``type`` ref + ``typeOptions`` 数组）。
+//: 固定只查**域名 + IP**。
+//:
+//: 为什么这两类就够：
+//:   · **端口折进行里**（后端 ``_FLAT_PORTS_EXPR``），所以「有哪些站、这台机器
+//:     开着什么」在一张表里就答完了 —— 单列成行的端口里绝大多数是 CDN 节点池
+//:     上的重复组合，会把域名淹没。
+//:   · **IP 必须单列**，它常常不是任何域名的解析结果（裸扫出来的），藏起来
+//:     就会漏资产。
+//: URL / 技术栈 / 发现改从**搜索词**或右侧详情面板看，不必占一个常驻下拉。
+//:
+//: ⚠️ ``TYPE_LABELS`` **要留着** —— 它不再是下拉选项，而是**显示用的类型名映射**，
+//: 仍被两处消费：结果头的分页统计（``assetLabel(key)``）与资产行的类型副标题。
+//: 整个删掉会让这两处退化成显示英文枚举值。
+const ASSET_TYPE = 'domains,ips'
 
-const statusOptions = [200, 301, 302, 401, 403, 404, 500, 502, 503]
-const samples = ['qq.com', 'nginx', 'admin', '403', 'cdn']
+const TYPE_LABELS = {
+  domains: '域名',
+  ips: 'IP',
+  ports: '端口',
+  urls: 'URL',
+  technologies: '技术栈',
+  findings: '发现',
+}
+
+//: 2026-10-06 删掉了 ``samples``（"试试搜这些"的示例词）与 ``quickSearch`` ——
+//: 配套的空态卡片已删（见模板里那段说明）。
+//: 2026-10-06 **删掉了「状态码」下拉筛选**（连同 statusOptions /
+//: statusFilterSupported / 那条 watch，以及 loadPage 里的 cond 构造）。
+//:
+//: 后端 `status` 字段只映射在 `urls` 上（`postgres.py::_ASSET_FILTER_FIELDS`），
+//: 其余类型走 `col is None -> continue` **静默丢弃**。而这一页的默认类型是
+//: 「域名 + IP」—— 也就是**最常用的视图下这个筛选根本不生效**，选完的结果
+// 与不选完全一致，且没有任何报错。真库实测：不带筛选 total=3、status=404
+// 也是 total=3；切到 urls 才降到 0。
+//:
+//: 之前一版是"仅在 urls 时启用、否则禁用下拉"，但那仍让一个**大多数时候
+// 用不了**的控件常驻在筛选栏里。与其半可用，不如整条去掉 —— 需要看状态码
+// 分布时，切到「URL」类型后看列表里的 status 列即可。
+//: 真要恢复，先把后端 `status` 映射补到各类型上，别又加回一个假筛选。
 
 const currentGroupName = computed(
   () => groups.value.find((g) => g.id === groupId.value)?.name || '未知分组',
@@ -442,26 +626,46 @@ const currentGroupName = computed(
 
 // 分组下拉要能选，所以进页面就把分组列表拉一次（只有名字和 id，很轻）
 //
-// ⚠️ 这里**不**顺手把资产表也拉出来。改成"打开就列全部"时加过一句
-// ``await loadPage()``，结果是请求发出、服务端 200，但前端 Promise 不 settle、
-// 按钮卡在 loading，且页面被反复重建。根因没定位到（源码结构核对过是对的），
-// 所以先撤回这一句：默认类型 + 端口折进行这两处是验证过的，
-// 「打开即出结果」等定位到那个不 settle 的点再加。
-onMounted(async () => {
-  groupsLoading.value = true
-  try {
-    groups.value = await listGroups()
-  } catch {
-    // 分组接口挂掉不该让整个页面不可用 —— 搜索本身不依赖它
-    groups.value = []
-  } finally {
-    groupsLoading.value = false
-  }
+// 2026-10-06：这里**补上了**资产表的自动加载（`loadPage()`），即"打开就列全部"。
+// 之前撤过一次，症状是"请求发出、服务端 200，但 Promise 不 settle、按钮卡在
+// loading，页面被反复重建"。
+//
+// ⚠️ **当前状态：请求层已验证通过，渲染层未通过，根因仍未定位。** 别把任何
+// 猜测当结论 —— 2026-10-06 排查时推翻过两个假设（见下），都不成立。
+//
+// 已验证成立的（服务端日志 + 接口直调为证）：
+//   · 挂载时确实发出请求、参数正确：
+//     ``GET /api/search/flat?q=&type=domains,ips&limit=50&offset=0&live=false``
+//   · 后端返回 200、响应体正常（50 行、total=219，字段齐全）
+//   · 构建产物里 ``loadPage`` 确实被 onMounted 调用且函数体逐句正确
+//     （编译成 ``Fe(()=>{Ke()...,T()})``，``T`` 就是 loadPage）
+//   · 同一次加载里 ``/api/groups`` 被调 3 次而 ``/api/search/flat`` 只有 1 次
+//     → **组件挂载了多次**，而最终活着那个实例的 loading 一直为 true
+//
+// 已验证**不成立**的猜测（都实测过，别再重复）：
+//   1. "空关键词让 trigram 索引失效所以慢" —— 实测该查询 2ms；且 120s 的 axios
+//      超时早该触发却没触发，说明不是慢。
+//   2. "常驻的 a-drawer 打断 patch" —— 给它加 ``v-if`` 后症状完全不变。
+//
+// **下次要查就从"为什么一次加载挂载 3 次"入手。** 想退回"不自动加载"的话，
+// 删掉下面那行 loadPage() 即可。
+onMounted(() => {
+  // 分组列表 —— 失败不该让页面不可用，搜索本身不依赖它
+  listGroups()
+    .then((data) => { groups.value = Array.isArray(data) ? data : [] })
+    .catch(() => { groups.value = [] })
+    .finally(() => { groupsLoading.value = false })
+
+  // 资产表：打开就列全部。**不要 await**（见上面那段）
+  loadPage()
 })
 
 const columns = [
   { title: '资产', key: 'asset' },
-  { title: '存活', key: 'alive', width: 60 },
+  // 「健康」而不是原来的「存活」：这一列按 ``status < 400`` 染绿，量的其实是
+  // "**响应是否正常**"，不是"这台机器活不活"。开着 3306 的数据库主机当然是活的，
+  // 但它没有 Web 响应、圆点必然是灰的 —— 叫「存活」会把它说成死的。
+  { title: '健康', key: 'alive', width: 60 },
   { title: '端口', key: 'ports', width: 150 },
   { title: '路径', key: 'paths', width: 70, sorter: (a, b) => (a.path_count || 0) - (b.path_count || 0) },
   { title: '标题 · 状态', key: 'title' },
@@ -469,18 +673,17 @@ const columns = [
   { title: '首见', key: 'first_seen', width: 110 },
 ]
 
-/** 后端已 UNION 好并排好序，这里只做展示层的字段整形 + 存活过滤。
+/** 后端已 UNION 好并排好序，这里只做展示层的字段整形。
  *
  *  **不再合并多类型结果** —— 那是旧数据流（每类各取 N 条）的做法，页与页
  *  之间顺序不连续。现在分页在数据库里切（``search_flat``），前端拿到的
- *  就是全局第 N 页。 */
+ *  就是全局第 N 页。
+ *
+ *  ⚠️ 这里**不做任何过滤**（原有一段按 aliveFilter 过滤当前页的代码已删）。
+ *  服务端分页 + 前端过滤必然对不上 ``total``：命中的那些行在别的页上，
+ *  而当前页可能一条都不剩、显示成"没有匹配的资产"。筛选一律下推后端。 */
 const rows = computed(() =>
   results.value
-    .filter((r) => {
-      if (aliveFilter.value === 'alive' && r.status == null) return false
-      if (aliveFilter.value === 'dead' && r.status != null) return false
-      return true
-    })
     .map((r, i) => ({
       ...r,
       _type: r.asset_type,
@@ -505,19 +708,27 @@ const pageBreakdown = computed(() => {
 const displayQuery = computed(() => {
   const parts = []
   if (groupId.value) parts.push(`分组:${currentGroupName.value}`)
+  // 任务筛选也要出现在标题里 —— 否则筛完看不出当前看的是哪次任务的结果
+  if (scanId.value != null) parts.push(`任务:${currentScanLabel.value}`)
   parts.push(keyword.value.trim() || '全部')
   return parts.filter(Boolean).join(' · ')
+})
+
+/** 当前选中任务的展示名。任务可能已被删（扫描列表取不到），回落成 id。 */
+const currentScanLabel = computed(() => {
+  if (scanId.value == null) return ''
+  const s = scans.value.find((x) => x.scan_id === scanId.value)
+  return s ? scanLabel(s) : `#${scanId.value}`
 })
 
 const keywordPlaceholder = '输入域名、IP、URL、标题、技术名（至少 2 个字符）'
 
 function resetAll() {
   keyword.value = ''
-  type.value = 'domains,ips'
   dateRange.value = null
-  aliveFilter.value = ''
-  statusFilter.value = null
   groupId.value = null
+  scanId.value = null
+  scanKeyword.value = ''
   searched.value = false
   results.value = []
   totalCount.value = 0
@@ -557,7 +768,7 @@ function subtitleOf(r) {
   }
 }
 
-const assetLabel = (key) => typeOptions.find((t) => t.value === key)?.label || key
+const assetLabel = (key) => TYPE_LABELS[key] || key
 
 function statusClass(status) {
   if (status == null) return ''
@@ -708,11 +919,6 @@ function gotoScan(record) {
   router.push({ path: '/taskList/taskDetail', query: { id: record.scan_id } })
 }
 
-function quickSearch(value) {
-  keyword.value = value
-  doSearch()
-}
-
 async function doSearch() {
   // 全空**不再拦**：后端 ``/api/search/flat`` 已经放开空词（只拦 1 个字符
   // 那种没意义的搜索），所以「打开就列出全部」和「点搜索」是同一个结果。
@@ -727,19 +933,20 @@ async function doSearch() {
 async function loadPage() {
   loading.value = true
   try {
-    // 状态码筛选走 filters 传给后端（search_flat 只认这一种结构化条件）。
-    // 原来这里是 `[...filters.value]` 再 push —— 那个 filters 由「条件构建行」
-    // 产生，该行已按要求删掉，现在只有状态码这一条来源。
-    const cond = []
-    if (statusFilter.value != null) {
-      cond.push({ field: 'status', op: 'eq', value: statusFilter.value })
-    }
+    // 不传 filters：状态码下拉已删（见上面 statusOptions 处那段说明 —— 它在
+    // 非 urls 类型下会被后端静默丢弃）。后端那条 `filters` 通道还在，
+    // 等哪天有**各类型都支持**的筛选再接上。
     const r = dateRange.value
     const data = await searchAssetsFlat(keyword.value.trim(), {
-      type: type.value,
+      // 固定域名 + IP（类型下拉已删）。写常量而不是留个 ref：
+      // 没有控件能改它，ref 只会让人以为还能切。
+      type: ASSET_TYPE,
       limit: pageSize.value,
       offset: (currentPage.value - 1) * pageSize.value,
-      filters: cond,
+      // 任务筛选：传 scan_id 而不是任务名。后端按 `scan_asset` 的
+      // 「这次扫描看到过」来过滤，所以**重扫时也能查到**（资产表里那条行
+      // 仍挂在首次发现者名下，用 t.scan_id 会一条都查不出来）。
+      scanId: scanId.value,
       groupId: groupId.value,
       // 时间段闭区间。**必须带时区**：库里的 first_seen 是 ISO 带偏移的串，
       // 不带时区会按服务器本地时区解释，跨时区部署时边界会差几个小时。
@@ -900,6 +1107,46 @@ function onPageChange(page, size) {
   background: rgba(180, 35, 24, 0.08);
 }
 .src-tag { font-size: 11px; }
+/* 任务下拉的选项：两行 —— 第一行任务名，第二行灰色「任务ID：<短码>」。
+   分两行是因为 TaskId 很重要（用户常按它找任务），挤在一行会被长名称挤掉。 */
+.scan-option {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.35;
+  padding: 2px 0;
+}
+.scan-option-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.scan-option-desc {
+  font-size: 11px;
+  color: var(--tk-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 选中后显示的那一行。
+   名称可能很长（实测有"亿联网络技术股份有限公司…"这种），而 **id 是定位任务
+   的唯一硬坐标**，所以让它 `flex-shrink: 0` 固定在末尾：名称过长时省略的是
+   名称，id 永远可见。 */
+.scan-selected {
+  display: flex;
+  align-items: baseline;
+  min-width: 0;
+  overflow: hidden;
+}
+.scan-selected > .scan-selected-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.scan-selected > .scan-selected-id {
+  flex-shrink: 0;
+  margin-left: 6px;
+  color: var(--tk-text-muted);
+}
 /* 路径数：同为等宽 + 600 会触发伪粗体锯齿，改用 UI 字体 + 500 */
 .path-count {
   color: var(--tk-accent);
@@ -989,10 +1236,4 @@ function onPageChange(page, size) {
   line-height: 1.5;
   word-break: break-all;
 }
-.sample { cursor: pointer; user-select: none; }
-.sample:hover {
-  color: var(--tk-accent);
-  border-color: var(--tk-accent);
-}
-.hint { font-size: 12.5px; line-height: 1.7; }
 </style>

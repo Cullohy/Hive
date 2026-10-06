@@ -75,7 +75,18 @@ export async function downloadExport(id, format, type = 'domains', filename) {
   setTimeout(() => URL.revokeObjectURL(url), 3000)
 }
 
-export const screenshotUrl = (relativePath) => `/api/screenshots/${relativePath}`
+/**
+ * 取某个端点的**响应报文**（2026-10-06 取代截图）。
+ *
+ * 为什么换：截图是"长什么样"，而测绘里真正反复要看的是"**回了什么**"——
+ * 报错页原文、目录列表、登录表单、JS 里的接口地址、泄露的配置文件。
+ * 报文是 HTTP 客户端本来就已经下载的东西，零额外成本。
+ *
+ * 定位靠 (scan_id, url) 两步：按 URL 找全局唯一的端点行，再用 scan_asset
+ * 确认这次扫描确实看到过它（重扫时资产行留在首次发现者名下）。
+ */
+export const getResponseBody = (scanId, url) =>
+  http.get(`/api/scans/${scanId}/response`, { params: { url } })
 
 // ── 全局资产搜索 ─────────────────────────────────────────────────────
 // 同样只搜探活确认过的资产（后端 live 默认 true）。不过滤的话搜 qq.com
@@ -103,10 +114,14 @@ export const searchAssets = (q, type = 'all', limit = 50, scanId, filters = null
 // 它要展示整个资产库，探活状态交给页面上的「仅存活 / 仅未探活」下拉去筛。
 // 不显式传就等于把行为挂在后端默认值上，改默认值时这边会静默变行为。
 // since / until: 「首见时间」闭区间（ISO 串）。都不给 = 不按时间筛。
+// scanId: 只看某次扫描看到过的资产。后端按 `scan_asset` 关联表过滤
+// （不是 `t.scan_id` —— 那个只是"谁最先发现的"，重扫时一条都查不出来）。
+// 用 `!= null` 而不是真值判断：`scan_id` 不会是 0，但真值写法在 id=0 时
+// 会静默变成"不筛"，与"不传"不可区分。
 export const searchAssetsFlat = (
   q,
   { type = 'all', limit = 50, offset = 0, filters = null, groupId = null,
-    since = null, until = null, live = true } = {},
+    since = null, until = null, live = true, scanId = null } = {},
 ) =>
   http.get('/api/search/flat', {
     params: {
@@ -116,6 +131,7 @@ export const searchAssetsFlat = (
       offset,
       live,
       ...(groupId ? { group_id: groupId } : {}),
+      ...(scanId != null ? { scan_id: scanId } : {}),
       ...(filters && filters.length ? { filters: JSON.stringify(filters) } : {}),
       ...(since ? { since } : {}),
       ...(until ? { until } : {}),

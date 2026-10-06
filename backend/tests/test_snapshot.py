@@ -429,13 +429,16 @@ class TestRescanWritesThroughGlobalAssets(EngineTestCase):
         )
         self.assertTrue(after["is_cdn"], "重扫的 finding 没点亮 is_cdn")
 
-    async def test_screenshot_write_survives_a_rescan(self) -> None:
-        """截图写进的是"上一轮已存在"的端点行，且**真写进去时才算成功**。
+    async def test_title_fill_survives_a_rescan(self) -> None:
+        """标题回填写进的是"上一轮已存在"的端点行，且**真写进去时才算成功**。
 
-        ⚠️ 端点行必须由**第一次**扫描建立 —— 那样 ``http_endpoint.scan_id``
-        才是"第一轮那个 id"，第二轮的 UPDATE 才真的面临"scan_id 对不上"。
-        （第一版测试把 HTTP_RESPONSE 也投影在第二轮，于是行本来就是第二轮的，
-        删掉修复照样绿 —— 写测试时得先确认"资产行的 scan_id 到底是谁的"。）
+        2026-10-06：截图模块被删（响应报文取代了它），但这个测试守的性质
+        **完全没变** —— 跨 scan 去重之后 ``http_endpoint.scan_id`` 只是
+        "谁最先发现的"，所以任何"按 url 定位 + UPDATE"的写路径都**不能带
+        scan_id**，否则重扫时命中 0 行。
+
+        换成 ``fill_endpoint_title``：它按 url 定位，所以第二轮照样写得进去；
+        而返回 False（而不是无条件 True）是调用方唯一能察觉"没写进去"的信号。
         """
         from core.engine.event import Event, EventType
 
@@ -445,7 +448,8 @@ class TestRescanWritesThroughGlobalAssets(EngineTestCase):
             return self.storage.project(sid, Event(
                 type=EventType.HTTP_RESPONSE, data=url, module="http_probe",
                 tags={"status": 200, "host": "www.example.com", "ip": "9.9.9.9",
-                      "port": 80, "scheme": "http"},
+                      "port": 80, "scheme": "http", "title": "",
+                      "content_type": "text/html", "body_snippet": "<html></html>"},
             ))
 
         first = await self._scan()
@@ -458,12 +462,14 @@ class TestRescanWritesThroughGlobalAssets(EngineTestCase):
         )
         self.assertEqual(int(row["scan_id"]), first, "前置条件不成立")
 
-        blob = b"\x89PNG-fake-1"
         self.assertTrue(
-            await self.storage.save_screenshot(second, url, blob),
-            "重扫时截图写不进去 —— UPDATE 还带着 scan_id？",
+            await self.storage.fill_endpoint_title(url, "统一用户中心"),
+            "重扫时标题回填写不进去 —— UPDATE 还带着 scan_id？",
         )
-        self.assertEqual(await self.storage.screenshot_blob(second, url), blob)
+        after = await self.storage._fetchone(
+            "SELECT title FROM http_endpoint WHERE url = ?", (url,)
+        )
+        self.assertEqual(after["title"], "统一用户中心")
 
 
 if __name__ == "__main__":

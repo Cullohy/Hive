@@ -11,9 +11,11 @@ from __future__ import annotations
 import re
 import unittest
 from pathlib import Path
+from unittest import IsolatedAsyncioTestCase
 
 import asyncpg
 
+from core.engine.event import Event, EventType
 from core.storage.pg import (
     Row,
     _count_from_status,
@@ -893,12 +895,15 @@ class TestRealDatabase(unittest.IsolatedAsyncioTestCase):
             "更新 0 行却返回 True",
         )
 
-    async def test_screenshot_failure_is_logged(self) -> None:
-        """截图写失败**要留线索**。
+    async def test_title_fill_failure_is_logged(self) -> None:
+        """标题回填写失败**要留线索**（截图模块删掉后，这条原则留给新方法）。
 
-        ``rowcount == 0`` 那条分支有 warning，而连接断了 / 权限不足 / 语句
-        超时全被压成同一个 ``False``，调用方当成"还没有端点行"于是不再重试，
-        事后查日志一条线索都没有。
+        以前测的是 ``save_screenshot``：``rowcount == 0`` 那条分支有 warning，
+        而连接断了 / 权限不足 / 语句超时全被压成同一个 ``False``，调用方
+        当成"还没有端点行"于是不再重试，事后查日志一条线索都没有。
+
+        同样的坑对 ``fill_endpoint_title`` 一样成立 —— 它也是"写不进去就
+        返回 False"的形状，所以这里钉住的是**行为**而不是某个方法名。
         """
         from unittest import mock
 
@@ -907,7 +912,9 @@ class TestRealDatabase(unittest.IsolatedAsyncioTestCase):
         self.storage._conn.execute.side_effect = RuntimeError("connection reset")
         try:
             with self.assertLogs("recon.storage", level="WARNING") as caught:
-                ok = await self.storage.save_screenshot(1, "http://x/", b"png")
+                ok = await self.storage.fill_endpoint_title(
+                    "http://x/", "统一用户中心"
+                )
         finally:
             self.storage._conn = real
 
@@ -916,6 +923,137 @@ class TestRealDatabase(unittest.IsolatedAsyncioTestCase):
             any("connection reset" in line for line in caught.output),
             f"异常被吞掉且没有日志：{caught.output}",
         )
+
+class TestResponseBody(unittest.IsolatedAsyncioTestCase):
+    """响应报文存取（2026-10-06 取代截图）。
+
+    报文是"目标回了什么"—— 测绘里反复要看的东西，取代只能看"长什么样"
+    的截图。判据覆盖四件容易做错的事：往返、截断要标、扫描隔离、
+    **防退化成空**（新观测没抓到正文时不能把上一轮的抹掉）。
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.storage = await make_storage()
+        self.sid = await self.storage.create_scan(targets=["example.com"], preset="t")
+        await self.storage.project(
+            self.sid,
+            Event(
+                type=EventType.HTTP_RESPONSE, data="http://x.example.com/a", module="m",
+                tags={"url": "http://x.example.com/a", "scheme": "http", "status": 200,
+                      "title": "标题", "content_type": "text/html; charset=utf-8",
+                      "body_snippet": "<html>hello</html>", "body_truncated": False},
+            ),
+        )
+
+    async def asyncTearDown(self) -> None:
+        await drop_storage(self.storage)
+
+    async def test_body_roundtrip(self) -> None:
+        got = await self.storage.response_body(self.sid, "http://x.example.com/a")
+        self.assertIn("hello", got["body"])
+        self.assertFalse(got["truncated"])
+        self.assertIn("text/html", got["content_type"])
+
+    async def test_max_bytes_truncates_and_marks(self) -> None:
+        """限长返回时**必须**标 truncated —— 否则用户会拿半截当完整结论。"""
+        await self.storage.project(
+            self.sid,
+            Event(
+                type=EventType.HTTP_RESPONSE, data="http://x.example.com/big", module="m",
+                tags={"url": "http://x.example.com/big", "scheme": "http", "status": 200,
+                      "content_type": "text/html", "body_snippet": "X" * 500,
+                      "body_truncated": True},
+            ),
+        )
+        got = await self.storage.response_body(
+            self.sid, "http://x.example.com/big", max_bytes=50
+        )
+        self.assertEqual(len(got["body"]), 50)
+        self.assertTrue(got["truncated"], "截断了却没标 —— 前端会当完整报文显示")
+
+    async def test_other_scan_cannot_read_it(self) -> None:
+        """别的扫描不该读到这份报文（按扫描隔离的语义要保住）。"""
+        other = await self.storage.create_scan(targets=["other.com"], preset="t")
+        got = await self.storage.response_body(other, "http://x.example.com/a")
+        self.assertEqual(got["body"], "", "跨扫描串读了")
+
+    async def test_empty_body_does_not_wipe_previous(self) -> None:
+        """新观测没抓到正文时，**不能**把上一轮的报文清掉。
+
+        站点改了 content-type、或这轮被 WAF 挡了，都会让 body 为空；
+        若用 ``body = excluded.body`` 直接覆盖，这里的 NULL 就把
+        "这个端点有报文"变成了"没有" —— 而它明明有。
+        """
+        await self.storage.project(
+            self.sid,
+            Event(
+                type=EventType.HTTP_RESPONSE, data="http://x.example.com/a", module="m",
+                tags={"url": "http://x.example.com/a", "scheme": "http", "status": 502,
+                      "content_type": "application/octet-stream", "body_snippet": ""},
+            ),
+        )
+        got = await self.storage.response_body(self.sid, "http://x.example.com/a")
+        self.assertIn("hello", got["body"], "这一轮没抓到正文就把旧报文抹掉了")
+
+    async def test_non_textual_body_is_not_stored(self) -> None:
+        """图片/二进制**一律不存** —— 存了在 JSON 响应里就是乱码。
+
+        ⚠️ 这条判据**必须放在存储层**，不能只靠 ``http_probe`` 过滤：
+        实测那样会漏，任何直接调 ``project()`` 的路径（测试替身、手搓事件）
+        都能把二进制塞进来。放这里才是**唯一**一份判据。
+        """
+        await self.storage.project(
+            self.sid,
+            Event(
+                type=EventType.HTTP_RESPONSE, data="http://x.example.com/a.png",
+                module="m",
+                tags={"url": "http://x.example.com/a.png", "scheme": "http",
+                      "status": 200, "content_type": "image/png",
+                      "body_snippet": "\\x89PNGfake", "body_truncated": False},
+            ),
+        )
+        got = await self.storage.response_body(self.sid, "http://x.example.com/a.png")
+        self.assertEqual(got["body"], "", "二进制被存下来了")
+
+    async def test_missing_content_type_still_stores(self) -> None:
+        """没有 content-type 时**宁可存**：漏存比存乱码更可惜（乱码用户一眼看得出）。"""
+        await self.storage.project(
+            self.sid,
+            Event(
+                type=EventType.HTTP_RESPONSE, data="http://x.example.com/nc",
+                module="m",
+                tags={"url": "http://x.example.com/nc", "scheme": "http",
+                      "status": 200, "content_type": "",
+                      "body_snippet": "<html>无 MIME</html>"},
+            ),
+        )
+        got = await self.storage.response_body(self.sid, "http://x.example.com/nc")
+        self.assertIn("无 MIME", got["body"], "没有 content-type 就把正文丢了")
+
+    async def test_title_fill_only_when_empty(self) -> None:
+        """SPA 标题回填：**只在原来为空时写**，先到的留下。"""
+        await self.storage.project(
+            self.sid,
+            Event(
+                type=EventType.HTTP_RESPONSE, data="http://x.example.com/spa", module="m",
+                tags={"url": "http://x.example.com/spa", "scheme": "http", "status": 200,
+                      "title": "", "content_type": "text/html", "body_snippet": "x"},
+            ),
+        )
+        first = await self.storage.fill_endpoint_title(
+            "http://x.example.com/spa", "统一用户中心"
+        )
+        second = await self.storage.fill_endpoint_title(
+            "http://x.example.com/spa", "另一个标题"
+        )
+        row = await self.storage._fetchone(
+            "SELECT title FROM http_endpoint WHERE url = ?",
+            ("http://x.example.com/spa",),
+        )
+        self.assertTrue(first, "第一次该写进去")
+        self.assertFalse(second, "已经有标题了，第二次不该覆盖")
+        self.assertEqual(row["title"], "统一用户中心")
+
 
 class TestEndpointClusters(unittest.IsolatedAsyncioTestCase):
     """同款系统聚类（favicon 哈希 / 标题）—— 供应链横向最省力的杠杆。
@@ -1124,6 +1262,673 @@ class TestSearchIndex(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             await conn.close()
+
+
+class TestUrlUpsertSchemesNotNull(IsolatedAsyncioTestCase):
+    """``url`` 的 UPSERT **不能把 ``schemes`` 写成 NULL**。
+
+    ## 起因
+
+    ``schemes`` 列是 ``TEXT[] NOT NULL``，而合并写法是::
+
+        schemes = (SELECT array_agg(DISTINCT s ORDER BY s)
+                   FROM unnest(url.schemes || excluded.schemes) AS s)
+
+    ``array_agg`` 遇到**零行**返回 NULL（不是空数组）。而"零行"的真实触发
+    条件很容易凑齐：写点给的是 ``[scheme] if scheme else []``，所以只要这条
+    URL 解析不出 scheme 就是空数组 —— protocol-relative 的 ``//host/path``
+    与裸路径都算（``split_url`` 对它们返回 ``''``），而 ``url_extract`` 正是
+    从网页正文里抽链接，抽到 protocol-relative 是家常便饭。
+
+    两边都空 → ``unnest('{}' || '{}')`` 零行 → ``array_agg`` → NULL → 撞
+    NOT NULL 约束（SQLSTATE 23502），**整条 UPSERT 回滚**：``last_seen`` 没
+    推进、该 URL 这轮直接丢。异常被 ``scanner.py`` 的 ``except Exception``
+    吞成一行 error 日志，不看日志完全察觉不到。
+
+    ## 为什么"投影两次"是必要的条件
+
+    第一次是 INSERT，不走 ``DO UPDATE`` 子句，所以正常写进空数组。必须**第二
+    次**才进冲突分支。重复投影不是假设：``_link_asset`` 的文档明确说同一次
+    扫描内重复事件会重新投影，第二轮扫描更是必然。
+
+    判据是**真库真抛异常** + 行还在不在，不从被测 SQL 文本自证。
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.storage = await make_storage()
+        self.scan_id = await self.storage.create_scan(
+            targets=["example.com"], preset="t"
+        )
+
+    async def asyncTearDown(self) -> None:
+        await drop_storage(self.storage)
+
+    async def _project(self, data: str) -> None:
+        await self.storage.project(
+            self.scan_id,
+            Event(
+                type=EventType.URL, data=data, module="url_extract",
+                tags={"source": "url_extract", "kind": "link"},
+            ),
+        )
+
+    async def test_scheme_less_url_survives_reprojection(self) -> None:
+        """无 scheme 的 URL 被重复投影时不能抛 NOT NULL 违例。"""
+        for data in ("/admin", "//x.example.com/a", "http://x.example.com/b"):
+            with self.subTest(data=data):
+                await self._project(data)          # 第一次: INSERT
+                try:
+                    await self._project(data)      # 第二次: 冲突分支
+                except Exception as e:  # noqa: BLE001
+                    self.fail(
+                        f"第二次投影 {data!r} 抛异常 {type(e).__name__}: {e}\n"
+                        f"这会让整条 UPSERT 回滚，资产丢失且只有一行 error 日志"
+                    )
+
+    async def test_scheme_less_url_keeps_advancing_last_seen(self) -> None:
+        """修完之后重复投影还必须真的推进 ``last_seen``。
+
+        只断言"没抛异常"不够 —— 那也可能是**静默回滚**。所以补一条正向断言：
+        冲突分支跑完之后，行的 ``last_seen`` 应当是更新过的（这里用
+        ``first_seen`` 与 ``last_seen`` 拉开时间来判定）。
+        """
+        await self._project("//y.example.com/a")
+        await self.storage.conn.execute(
+            "UPDATE url SET first_seen = '2000-01-01T00:00:00+00:00' "
+            "WHERE dedup_key = 'y.example.com|/a'"
+        )
+        await self._project("//y.example.com/a")
+
+        row = await self.storage._fetchone(
+            "SELECT first_seen, last_seen, schemes FROM url "
+            "WHERE dedup_key = 'y.example.com|/a'"
+        )
+        self.assertIsNotNone(row, "冲突分支把行回滚掉了")
+        self.assertNotEqual(
+            row["first_seen"], row["last_seen"],
+            "last_seen 没有被冲突分支更新 —— 说明 UPDATE 实际没生效",
+        )
+        self.assertEqual(list(row["schemes"]), [], "无 scheme 不该凭空长出协议")
+
+    async def test_scheme_merge_still_unions(self) -> None:
+        """对照组：带 scheme 的**并集语义不能被上面那处修复破坏**。
+
+        防止有人用"清空 schemes"来躲开 NOT NULL —— 那会把 ``schemes`` 这个
+        暴露面事实（同一个路径 http 与 https 都通）整个丢掉。
+        """
+        await self._project("http://z.example.com/p")
+        await self._project("https://z.example.com/p")   # 同一 dedup_key
+
+        row = await self.storage._fetchone(
+            "SELECT schemes FROM url WHERE dedup_key = 'z.example.com|/p'"
+        )
+        self.assertIsNotNone(row, "两次不同 scheme 应该合成一行")
+        self.assertEqual(sorted(row["schemes"]), ["http", "https"])
+
+    async def test_parent_url_is_not_lost_on_reprojection(self) -> None:
+        """``parent_url`` 会在冲突时被**静默丢弃** —— 它是唯一会真丢的列。
+
+        ``parent_url`` 可空，写点是 ``str(tags.get("from") or "") or None``：
+        事件没带 ``from`` 标签时就是 NULL。同一 dedup_key 第二次投影若带了
+        ``from``（先被 url_extract 抽到、后被 js_assets 验证并指明出处），
+        而 ON CONFLICT 子句没列这一项 —— 更完整的那次观察就没了，
+        这一行永久停在 NULL，"这条路径是从哪发现的"永久查不到。
+        """
+        await self.storage.project(
+            self.scan_id,
+            Event(type=EventType.URL, data="http://p.example.com/a", module="m1",
+                  tags={"source": "m1", "kind": "link"}),
+        )
+        row = await self.storage._fetchone(
+            "SELECT parent_url FROM url WHERE dedup_key = 'p.example.com|/a'"
+        )
+        self.assertIsNone(row["parent_url"], "前置条件：第一次应当是 NULL")
+
+        # 第二次带 from（更完整的信息）
+        await self.storage.project(
+            self.scan_id,
+            Event(type=EventType.URL, data="http://p.example.com/a", module="m2",
+                  tags={"source": "m2", "kind": "js_path",
+                        "from": "http://p.example.com/app.js"}),
+        )
+        row = await self.storage._fetchone(
+            "SELECT parent_url FROM url WHERE dedup_key = 'p.example.com|/a'"
+        )
+        self.assertEqual(
+            row["parent_url"], "http://p.example.com/app.js",
+            "后一次更完整的出处被静默丢弃了",
+        )
+
+    async def test_parent_url_is_not_erased_by_a_bare_reprojection(self) -> None:
+        """反向护栏：补齐之后，新的空观测**不能**把已有出处抹掉。"""
+        await self.storage.project(
+            self.scan_id,
+            Event(type=EventType.URL, data="http://q.example.com/a", module="m1",
+                  tags={"source": "m1", "from": "http://q.example.com/i.js"}),
+        )
+        await self.storage.project(
+            self.scan_id,
+            Event(type=EventType.URL, data="http://q.example.com/a", module="m2",
+                  tags={"source": "m2"}),
+        )
+        row = await self.storage._fetchone(
+            "SELECT parent_url FROM url WHERE dedup_key = 'q.example.com|/a'"
+        )
+        self.assertEqual(row["parent_url"], "http://q.example.com/i.js")
+
+
+class TestTechnologyEvidenceUpsert(IsolatedAsyncioTestCase):
+    """``technology.evidence`` 为 NULL 时，后续真实证据**必须写得进去**。
+
+    ## 起因（三值逻辑）
+
+    列是可空的，写点传的是 ``tags.get("evidence")``（没有 ``or ""`` 归一，
+    而同一段的 category/version/vendor/product 都做了归一 —— 就这一列漏了）。
+    合并条件写的是::
+
+        CASE WHEN technology.evidence = '' OR technology.implied THEN ...
+
+    第一次落库 evidence 为 NULL、implied 为 false 时：
+    ``NULL = ''`` → NULL，``NULL OR false`` → NULL，CASE 走 ELSE 保留 NULL。
+    于是**之后无论多少次带真实证据的直接命中都写不进去** —— 该技术在资产
+    检索和 host_detail 里永远没有证据可显示。
+
+    对照：把条件改成 ``evidence IS NULL OR evidence = '' OR implied`` 就好
+    （已在真库上验过条件求值从 NULL 变成 true）。
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.storage = await make_storage()
+        self.scan_id = await self.storage.create_scan(
+            targets=["example.com"], preset="t"
+        )
+
+    async def asyncTearDown(self) -> None:
+        await drop_storage(self.storage)
+
+    async def _project(self, evidence: str | None, *, implied: bool) -> None:
+        tags: dict[str, object] = {
+            "host": "t.example.com", "implied": implied,
+            "category": "web", "version": "", "vendor": "", "product": "",
+        }
+        if evidence is not None:
+            tags["evidence"] = evidence
+        await self.storage.project(
+            self.scan_id,
+            Event(type=EventType.TECHNOLOGY, data="SomeTech", module="fp", tags=tags),
+        )
+
+    async def test_null_evidence_gets_filled_by_later_hit(self) -> None:
+        # 第一次没有证据（tags 里根本没有 evidence 键）
+        await self._project(None, implied=False)
+        row = await self.storage._fetchone(
+            "SELECT evidence FROM technology WHERE host = 't.example.com'"
+        )
+        self.assertIsNotNone(row)
+        self.assertIsNone(row["evidence"], "前置条件：第一次应当是 NULL")
+
+        # 第二次带真实证据的直接命中
+        await self._project("header: X-Powered-By", implied=False)
+        row = await self.storage._fetchone(
+            "SELECT evidence FROM technology WHERE host = 't.example.com'"
+        )
+        self.assertEqual(
+            row["evidence"], "header: X-Powered-By",
+            "NULL evidence 让 CASE 的 WHEN 求值为 NULL，真实证据永远写不进去",
+        )
+
+    async def test_null_evidence_gets_filled_by_direct_hit_over_implied(self) -> None:
+        """先来一条**推断命中**（无证据），再来一条直接命中，也必须能顶掉。"""
+        await self._project(None, implied=True)
+        await self._project("body: nginx", implied=False)
+        row = await self.storage._fetchone(
+            "SELECT evidence, implied FROM technology WHERE host = 't.example.com'"
+        )
+        self.assertEqual(row["evidence"], "body: nginx")
+        self.assertFalse(row["implied"], "直接命中应当把推断标记也清掉")
+
+    async def test_first_real_evidence_is_not_overwritten(self) -> None:
+        """反向护栏：已经有证据的行，**不该**被后来的空证据冲掉。"""
+        await self._project("header: A", implied=False)
+        await self._project(None, implied=False)
+        row = await self.storage._fetchone(
+            "SELECT evidence FROM technology WHERE host = 't.example.com'"
+        )
+        self.assertEqual(row["evidence"], "header: A")
+
+
+class TestGraphRescanKeepsEdges(IsolatedAsyncioTestCase):
+    """关系图的**边**必须与节点同口径：都按"这次扫描看到过"来算。
+
+    ## 起因
+
+    资产跨 scan 去重之后，``domain.scan_id`` 只表示"**谁最先发现的**"。
+    节点走 ``self.domains(scan_id)``（经 ``scan_asset``，能查到重扫看到的
+    老域名），而 ``resolves_to`` 边原先按 ``d.scan_id = ?`` 过滤 ——
+    第二次扫描时域名行仍挂在首次发现者名下，那条查询**零行**。
+
+    症状很有迷惑性：域名节点、IP 节点都画出来了，**只有边全没了**，
+    看着像前端渲染问题，而根因在 SQL。
+
+    ## 判据
+
+    两次扫描同一组资产，断言**两次都有 resolves_to 边**。只断言"边不为空"
+    是不够的 —— 第一次扫描本来就有边，恒绿。
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.storage = await make_storage()
+        self.s1 = await self.storage.create_scan(targets=["example.com"], preset="t")
+        self.s2: int | None = None
+
+    async def asyncTearDown(self) -> None:
+        await drop_storage(self.storage)
+
+    async def _seed(self, scan_id: int) -> None:
+        await self.storage.project(
+            scan_id,
+            Event(type=EventType.DNS_NAME, data="www.example.com", module="m"),
+        )
+        await self.storage.project(
+            scan_id,
+            Event(
+                type=EventType.IP_ADDRESS, data="1.2.3.4", module="m",
+                parent_data="www.example.com",
+            ),
+        )
+
+    async def test_edges_present_on_both_first_and_rescan(self) -> None:
+        await self._seed(self.s1)
+        g1 = await self.storage.graph(self.s1)
+        edges1 = [e for e in g1["edges"] if e["relation"] == "resolves_to"]
+        self.assertTrue(edges1, f"第一次扫描就应当有边，实际: {g1['edges']}")
+
+        # 第二次扫描看同一批资产（资产表全局唯一，scan_id 仍记在第一次名下）
+        self.s2 = await self.storage.create_scan(targets=["example.com"], preset="t")
+        await self._seed(self.s2)
+
+        g2 = await self.storage.graph(self.s2)
+        edges2 = [e for e in g2["edges"] if e["relation"] == "resolves_to"]
+        self.assertTrue(
+            edges2,
+            f"重扫时 resolves_to 边全丢（节点 {len(g2['nodes'])} 个）—— "
+            f"边还在按 d.scan_id 过滤，而节点走的是 scan_asset",
+        )
+
+
+class TestGroupAssetSearchEscaping(IsolatedAsyncioTestCase):
+    """组内资产搜索框必须转义 LIKE 通配符。
+
+    ``_`` 在 LIKE 里是"匹配任意单字符"、``%`` 是"匹配一切"。不转义的话
+    搜 ``a_b`` 会把 ``axb`` 一起带出来，搜 ``%`` 直接列出全组资产 ——
+    而 **total 与列表用了同一个错误模式**，数字看着还自洽，特别难发现。
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.storage = await make_storage()
+        now = "2026-01-01T00:00:00+00:00"
+        cur = await self.storage.conn.execute(
+            "INSERT INTO asset_group (name, created_at) VALUES ('g', ?)", (now,)
+        )
+        self.gid = int(cur.lastrowid)
+        for key in ("a_b", "axb", "zzz"):
+            await self.storage.conn.execute(
+                "INSERT INTO asset_group_asset "
+                "(group_id, asset_type, asset_key, first_seen, last_seen) "
+                "VALUES (?, 'ip', ?, ?, ?)",
+                (self.gid, key, now, now),
+            )
+
+    async def asyncTearDown(self) -> None:
+        await drop_storage(self.storage)
+
+    async def test_underscore_is_literal(self) -> None:
+        """搜 ``a_b`` 只该命中字面量那一条，不能把 ``axb`` 带出来。"""
+        got = await self.storage.list_group_assets(self.gid, q="a_b")
+        keys = [r["asset_key"] for r in got["rows"]]
+        self.assertEqual(keys, ["a_b"], f"下划线没被转义: {keys}")
+        self.assertEqual(got["total"], 1, "total 也用了同一个错误模式")
+
+    async def test_percent_does_not_match_everything(self) -> None:
+        got = await self.storage.list_group_assets(self.gid, q="%")
+        self.assertEqual(got["total"], 0, f"搜 %% 竟列出了 {got['total']} 条")
+
+
+class TestGroupSyncCountsAndGlobalStats(IsolatedAsyncioTestCase):
+    """两处**计数**口径：同步新增数不能互相覆盖，概览要与列表一致。"""
+
+    async def asyncSetUp(self) -> None:
+        self.storage = await make_storage()
+        self.sid = await self.storage.create_scan(targets=["example.com"], preset="t")
+
+    async def asyncTearDown(self) -> None:
+        await drop_storage(self.storage)
+
+    async def test_domain_and_cidr_scopes_accumulate_ip_count(self) -> None:
+        """域名范围 + 网段范围**同时**配了时，IP 数要累加而不是被覆盖。
+
+        两段各自 ``ON CONFLICT DO NOTHING`` 去重、各自报"我新插了几条"，
+        但原先第二段是**直接赋值** —— 域名范围带进来的 IP 数被整段吃掉。
+        数据照样入库了，丢的只是回给 UI 的那个数字，而它正是用户判断
+        "这次同步带进来多少东西"的依据。
+
+        ## 判据为什么这么写（这里有个陷阱，值得记下来）
+
+        原先想造"两段各收一个不同 IP"让覆盖(得 1)与累加(得 2)拉开差异，
+        **两次都造不出来**，两次都是恒绿：
+
+        1. 只造「域名 + 端口」而没有 ``http_endpoint`` → 域名范围那段的
+           ``rowcount`` 恒为 0，两种写法结果相同。
+        2. 把域名段的 IP 放到网段**外**、只靠端点进来 → 域名段那段是按端点的
+           ``e.host`` 匹配的，而 ``http_probe`` 产出的事件**根本不传 host 标签**
+           （见 http_probe.py::_emit 的 tags），host 由 ``domain or ip`` 推出，
+           生产数据里既可能是域名也可能是 IP。硬塞 ``host='b.example.com'``
+           造出来的数据在真实链路里不会出现；且一旦该 IP 也在网段内，
+           网段那段会一起收掉，两段 rowcount 互补 → 仍然恒绿。
+
+        所以退一步断言**真正可验证**的性质：返回值与实际入库条数一致。
+        覆盖写法在"两段都有贡献"时会返回更小的数、与入库条数对不上；
+        累加写法两者恒等。这条判据不依赖"两段是否重叠"，也不依赖
+        只有测试才造得出的数据形态。
+        """
+        # IP A：在网段内、有端口 -> 必然被「网段范围」那段收走
+        await self.storage.project(
+            self.sid,
+            Event(
+                type=EventType.IP_ADDRESS, data="10.1.2.3", module="m",
+                parent_data="a.example.com",
+            ),
+        )
+        await self.storage.project(
+            self.sid,
+            Event(
+                type=EventType.OPEN_TCP_PORT, data="10.1.2.3:80", module="m",
+                tags={"ip": "10.1.2.3", "port": 80, "protocol": "tcp"},
+            ),
+        )
+        # IP B：也在网段内，但有端点 -> 「域名范围」那段**可能**也收它
+        # （按端点 host 匹配；生产数据里 host 可能是域名也可能是 IP）
+        await self.storage.project(
+            self.sid,
+            Event(type=EventType.DNS_NAME, data="b.example.com", module="m"),
+        )
+        await self.storage.project(
+            self.sid,
+            Event(
+                type=EventType.IP_ADDRESS, data="10.9.9.9", module="m",
+                parent_data="b.example.com",
+            ),
+        )
+        await self.storage.project(
+            self.sid,
+            Event(
+                type=EventType.HTTP_RESPONSE, data="http://b.example.com/",
+                module="m",
+                tags={"url": "http://b.example.com/", "scheme": "http",
+                      "domain": "b.example.com", "ip": "10.9.9.9", "port": 80,
+                      "status": 200},
+            ),
+        )
+        # 一个既有域名范围、一个既有网段范围（走公开 API，别手拼列名）
+        now = "2026-01-01T00:00:00+00:00"
+        cur = await self.storage.conn.execute(
+            "INSERT INTO asset_group (name, created_at) VALUES ('g', ?)", (now,)
+        )
+        gid = int(cur.lastrowid)
+        await self.storage.add_group_scopes(gid, ["example.com", "10.0.0.0/8"])
+
+        result = await self.storage.sync_scan_to_group(gid, self.sid)
+        in_group = await self.storage._fetchone(
+            "SELECT COUNT(*) AS c FROM asset_group_asset "
+            "WHERE group_id = ? AND asset_type = 'ip'",
+            (gid,),
+        )
+        stored = int(in_group["c"])
+        self.assertGreater(stored, 0, "夹具没生效：一个 IP 都没进组")
+        self.assertEqual(
+            result.get("ip", 0), stored,
+            f"返回的 IP 数 {result.get('ip')} 与实际入库 {stored} 对不上 —— "
+            f"两段的贡献被互相覆盖了：{result}",
+        )
+
+    async def test_group_sync_is_idempotent(self) -> None:
+        """重复同步必须**幂等**：第二次新增数应为 0，不得重复计。"""
+        await self.storage.project(
+            self.sid,
+            Event(type=EventType.IP_ADDRESS, data="10.1.2.3", module="m",
+                  parent_data="a.example.com"),
+        )
+        await self.storage.project(
+            self.sid,
+            Event(type=EventType.OPEN_TCP_PORT, data="10.1.2.3:80", module="m",
+                  tags={"ip": "10.1.2.3", "port": 80, "protocol": "tcp"}),
+        )
+        now = "2026-01-01T00:00:00+00:00"
+        cur = await self.storage.conn.execute(
+            "INSERT INTO asset_group (name, created_at) VALUES ('g', ?)", (now,)
+        )
+        gid = int(cur.lastrowid)
+        await self.storage.add_group_scopes(gid, ["example.com", "10.0.0.0/8"])
+
+        first = await self.storage.sync_scan_to_group(gid, self.sid)
+        second = await self.storage.sync_scan_to_group(gid, self.sid)
+        self.assertGreater(first.get("ip", 0), 0, "第一次同步就该有新增")
+        self.assertEqual(
+            second.get("ip", 0), 0,
+            f"重复同步又报新增 {second.get('ip')} 条 —— 计数没有幂等",
+        )
+
+    async def _reverse_domain_summary(self, ip_id: int) -> str:
+        """直接跑 ``ips`` 规格里那段 ``dn.name`` 表达式，取出截断后的串。
+
+        ## 为什么绕开 search_flat
+
+        「有域名映射的 IP 不再单列」这条规则（同文件
+        :class:`TestMappedIpsAreFoldedIntoDomain`）会把挂了域名的 IP 从列表里
+        滤掉 —— 而反查域名**只可能出现在有域名映射的 IP 上**。所以拿列表测它
+        必然搜不到，测试就变成"断言夹具失效"。
+
+        而截断本身是那段 SQL 的性质，与它出现在哪张表里无关。所以这里直接用
+        同一段表达式（从 :data:`core.storage.postgres._SEARCH_SPECS` 取，
+        不复制一份）查一次 —— 测的是 SQL 逻辑本身。
+        """
+        from core.storage.postgres import _SEARCH_SPECS
+
+        join = _SEARCH_SPECS["ips"].join
+        # 截取"反查域名"那一个 LATERAL（含 "LEFT JOIN LATERAL ... dn ON TRUE"
+        # 整块）—— 它自带闭合括号，整体搬过来才不会出现括号不配对。
+        # 从 string_agg 往前找**最近的**那个 LATERAL（前面还有一个取端点的 ep，
+        # 别抓错）。用 rfind 而不是写死偏移 —— 改动这段 SQL 时偏移会失效。
+        anchor = join.index("string_agg")
+        block_start = join.rindex("LEFT JOIN LATERAL (", 0, anchor)
+        block_end = join.index(") dn ON TRUE", block_start) + len(") dn ON TRUE")
+        block = join[block_start:block_end]
+        sql = f"SELECT dn.name FROM ip t {block} WHERE t.id = ?"
+        row = await self.storage._fetchone(sql, (ip_id,))
+        return (row["name"] or "") if row else ""
+
+    async def test_ip_reverse_domains_are_truncated(self) -> None:
+        """IP 行的反查域名**必须有上限** —— 不能把全部域名拼成一串。
+
+        CDN / 共享主机上一个 IP 解析到几十个域名是常事（实测 yealink 的
+        183.251.103.227 有 23 个），全量 ``string_agg`` 出来 644 字，界面
+        一行放不下也读不出重点。
+
+        规则：按字典序取前 2 个，超出时补「等 N 个域名」。取字典序是为了
+        **确定性** —— 同一批数据每次都拼出同样的字符串，不随扫描顺序抖动。
+        """
+        now = "2026-01-01T00:00:00+00:00"
+        cur = await self.storage.conn.execute(
+            "INSERT INTO ip (scan_id, addr, first_seen, last_seen) "
+            "VALUES (?, '9.9.9.9', 'now', 'now')",
+            (self.sid,),
+        )
+        ip_id = int(cur.lastrowid)
+        for name in (f"h{i}.cdn.example.com" for i in range(12)):
+            await self.storage.project(
+                self.sid, Event(type=EventType.DNS_NAME, data=name, module="m")
+            )
+            row = await self.storage._fetchone(
+                "SELECT id FROM domain WHERE name = ?", (name,)
+            )
+            await self.storage.conn.execute(
+                "INSERT INTO domain_ip (domain_id, ip_id, first_seen, last_seen) "
+                "VALUES (?, ?, ?, ?)",
+                (int(row["id"]), ip_id, now, now),
+            )
+        await self.storage.conn.commit()
+
+        extra = await self._reverse_domain_summary(ip_id)
+        self.assertTrue(extra, "反查域名整列为空了")
+        self.assertIn(
+            "等 12 个域名", extra,
+            f"12 个域名没被截断成摘要：{extra!r}",
+        )
+        # 只留 2 个 + 摘要，整体长度应当很短
+        self.assertLess(
+            len(extra), 120,
+            f"截断后仍然太长，界面放不下：{len(extra)} 字 {extra!r}",
+        )
+
+    async def test_few_ip_reverse_domains_are_listed_in_full(self) -> None:
+        """反向护栏：不超过 2 个时**原样全列**，别硬加「等 N 个」。
+
+        截断是为了解决"太长"，不是为了统一格式。只剩一两个域名还写成
+        "… 等 1 个域名"是把简单事说复杂。
+        """
+        now = "2026-01-01T00:00:00+00:00"
+        cur = await self.storage.conn.execute(
+            "INSERT INTO ip (scan_id, addr, first_seen, last_seen) "
+            "VALUES (?, '8.8.8.8', 'now', 'now')",
+            (self.sid,),
+        )
+        ip_id = int(cur.lastrowid)
+        for name in ("only.example.com", "two.example.com"):
+            await self.storage.project(
+                self.sid, Event(type=EventType.DNS_NAME, data=name, module="m")
+            )
+            row = await self.storage._fetchone(
+                "SELECT id FROM domain WHERE name = ?", (name,)
+            )
+            await self.storage.conn.execute(
+                "INSERT INTO domain_ip (domain_id, ip_id, first_seen, last_seen) "
+                "VALUES (?, ?, ?, ?)",
+                (int(row["id"]), ip_id, now, now),
+            )
+        await self.storage.conn.commit()
+
+        extra = await self._reverse_domain_summary(ip_id)
+        self.assertNotIn("等", extra, f"只有 2 个域名却加了摘要：{extra!r}")
+        self.assertIn("only.example.com", extra)
+        self.assertIn("two.example.com", extra)
+
+    async def test_global_port_count_includes_protocol(self) -> None:
+        """概览的端口数必须与 ``port`` 表的行数一致 —— 身份含 protocol。
+
+        ``port_key`` 把 protocol 算进身份（``ip|port|protocol``），
+        概览原先只按 ``ip:port`` 去重，同一 IP 同一端口号上 tcp+udp 会被
+        合成一条，于是概览数字比资产管理页的列表少。
+        """
+        await self.storage.conn.execute(
+            "INSERT INTO ip (scan_id, addr, first_seen, last_seen) "
+            "VALUES (?, '1.2.3.4', 'now', 'now')",
+            (self.sid,),
+        )
+        ip_row = await self.storage._fetchone(
+            "SELECT id FROM ip WHERE addr = '1.2.3.4'"
+        )
+        for proto in ("tcp", "udp"):
+            await self.storage.conn.execute(
+                "INSERT INTO port (scan_id, ip_id, ip, port, protocol, "
+                "first_seen, last_seen) "
+                "VALUES (?, ?, '1.2.3.4', 53, ?, 'now', 'now')",
+                (self.sid, int(ip_row["id"]), proto),
+            )
+        rows = await self.storage._fetchone("SELECT COUNT(*) AS c FROM port")
+        stats = await self.storage.global_stats()
+        self.assertEqual(
+            int(rows["c"]), 2, "夹具没生效：应当有 2 条（tcp + udp）"
+        )
+        self.assertEqual(
+            stats["ports"], 2,
+            "概览把 tcp/udp 合成一条了，与端口列表对不上",
+        )
+
+
+class TestMappedIpsAreFoldedIntoDomain(IsolatedAsyncioTestCase):
+    """**有域名映射的 IP 不作为独立资产列出**（原始设计）。
+
+    一个 IP 解析得到域名时，它的信息（端口/状态/标题）已经全部挂在域名行上
+    （``domains`` 的 LATERAL 按 ``e.host = t.name`` 取）。IP 再单占一行就是
+    同一份信息在列表里出现两遍。只有**没有域名映射的裸 IP**才独立成条。
+
+    ## 配套要求（这条是本测试的真正难点）
+
+    滤掉 IP 行之后，域名原本**只搜 name**，于是搜 "10.0.0.1" 这种 IP 关键词
+    会一条都搜不到 —— 那个 IP 的信息全在域名行上，却没法用 IP 找出来。
+    所以 ``domains`` 的检索列必须补上"它解析到的 IP"。两条一起验。
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.storage = await make_storage()
+        self.s1 = await self.storage.create_scan(targets=["example.com"], preset="t")
+        self.s2 = await self.storage.create_scan(targets=["other.com"], preset="t")
+        # 有域名映射的 IP
+        for d in ("a.example.com", "b.example.com"):
+            await self.storage.project(
+                self.s1, Event(type=EventType.DNS_NAME, data=d, module="m")
+            )
+            await self.storage.project(
+                self.s1,
+                Event(type=EventType.IP_ADDRESS, data="10.0.0.1", module="m",
+                      parent_data=d),
+            )
+        # 没有域名映射的裸 IP
+        await self.storage.project(
+            self.s2, Event(type=EventType.IP_ADDRESS, data="10.0.0.9", module="m")
+        )
+        await self.storage.project(
+            self.s2,
+            Event(type=EventType.OPEN_TCP_PORT, data="10.0.0.9:80", module="m",
+                  tags={"ip": "10.0.0.9", "port": 80, "protocol": "tcp"}),
+        )
+
+    async def asyncTearDown(self) -> None:
+        await drop_storage(self.storage)
+
+    async def test_mapped_ip_is_not_listed_but_bare_ip_is(self) -> None:
+        flat = await self.storage.search_flat(
+            "", types=["domains", "ips"], limit=50, live=False
+        )
+        keys = {r["asset_key"] for r in flat["rows"]}
+        self.assertNotIn(
+            "10.0.0.1", keys,
+            "有域名映射的 IP 仍单列 —— 它的信息已经在域名行上了，重复",
+        )
+        self.assertIn("10.0.0.9", keys, "裸 IP 必须独立成条，否则会丢资产")
+        self.assertIn("a.example.com", keys)
+        self.assertIn("b.example.com", keys)
+
+    async def test_searching_by_ip_still_finds_the_domain(self) -> None:
+        """按 IP 搜仍要能搜到域名行 —— 否则那些信息就找不回来了。"""
+        flat = await self.storage.search_flat(
+            "10.0.0.1", types=["domains", "ips"], limit=50, live=False
+        )
+        keys = {r["asset_key"] for r in flat["rows"]}
+        self.assertTrue(
+            keys & {"a.example.com", "b.example.com"},
+            f"搜 IP 关键词搜不到任何域名行，IP 的信息等于丢了：{keys}",
+        )
+
+    async def test_total_matches_rows(self) -> None:
+        """total 必须与实际行数一致（滤掉 IP 行后两边要同步少）。"""
+        flat = await self.storage.search_flat(
+            "", types=["domains", "ips"], limit=50, live=False
+        )
+        self.assertEqual(
+            flat["total"], len(flat["rows"]),
+            "total 与行数对不上 —— 计数查询与取行查询的过滤条件没同步",
+        )
 
 
 if __name__ == "__main__":

@@ -303,8 +303,17 @@ async function fetchLibrary() {
 }
 
 function onTableChange(pagination) {
-  page.value = pagination.current
-  pageSize.value = pagination.pageSize
+  // 改页大小时**必须回到第 1 页**：vc-pagination 的 changePageSize 会保留
+  // 当前页并连发 change(current, size)，停在第 5 页从 20 改成 50 的话
+  // offset = (5-1)*50 = 200，落在中段 —— 用户以为在看第一页，实际是中段数据。
+  // 同 TaskDetailView 的 onEventPageChange。
+  const sizeChanged = pagination.pageSize !== pageSize.value
+  if (sizeChanged) {
+    pageSize.value = pagination.pageSize
+    page.value = 1
+  } else {
+    page.value = pagination.current
+  }
   fetchLibrary()
 }
 

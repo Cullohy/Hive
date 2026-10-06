@@ -1955,13 +1955,34 @@ class TestPtrClassification(unittest.TestCase):
         self.assertEqual(kind, "invalid")
         self.assertIn("localhost", detail)
 
-    def test_provider_wins_when_both_present(self) -> None:
-        """同一台机器既有云默认名又有真名时，按"共享主机"处理更保守。"""
+    def test_real_name_wins_over_cloud_default_name(self) -> None:
+        """真域名 + 云默认名同时存在时，**真域名必须留下**。
+
+        原来这里是 ``test_provider_wins_when_both_present``，断言"按共享主机
+        处理更保守" —— 那个断言**本身就是 bug**：它会让 ``real.example.com``
+        被整条丢掉，永远不会被产出成 DNS_NAME，也就永远不会被解析/探测/爆破，
+        而 finding 里还写着"这是共享主机"，主动误导操作的人。
+
+        "保守"的正确含义是**不下结论**，而不是**把已经拿到的真域名扔掉**：
+        真域名是否在范围内，由调用方拿 ``targets`` 去判。
+        """
         from core.domains.resolve.ip_ptr import classify_ptr
 
         name, kind, detail = classify_ptr(
             ["ec2-1-2-3-4.compute-1.amazonaws.com", "real.example.com"]
         )
+        self.assertEqual(
+            name, "real.example.com",
+            "真域名被云默认名吞掉了 —— 这个资产永远不会被探测",
+        )
+        self.assertEqual(kind, "candidate")
+        self.assertIn("real.example.com", detail)
+
+    def test_provider_still_wins_when_it_is_the_only_name(self) -> None:
+        """对照组：只有云默认名时，仍然按"共享主机"处理。"""
+        from core.domains.resolve.ip_ptr import classify_ptr
+
+        name, kind, detail = classify_ptr(["ec2-1-2-3-4.compute-1.amazonaws.com"])
         self.assertIsNone(name)
         self.assertEqual(kind, "provider")
         self.assertIn("amazonaws", detail)

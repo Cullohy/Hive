@@ -183,11 +183,17 @@
               row-key="id"
               size="small"
               :pagination="{
-                pageSize: 20,
-                showSizeChanger: false,
+                pageSize: assetPageSize,
+                showSizeChanger: true,
                 current: assetPage,
                 total: assetTotal,
-                onChange: (p) => { assetPage = p; loadAssets() },
+                // ant-design-vue 4.2.6 的 `usePagination.onInternalChange` 调的是
+                // `onChange(current, pageSize)` —— **两个位置参数**，不是分页对象。
+                // 原来写成 `(p) => { assetPage = p; loadAssets() }`：单参写法在
+                // 这里恰好拿到页码数字，能用；但 pageSize 被整个丢弃，而
+                // `showSizeChanger` 又允许改页大小 —— 改了之后表格还按 20 条一页
+                // 算 offset，页大小与实际条数对不上，翻页会漏数据/重复。
+                onChange: (p, size) => { onAssetPageChange(p, size) },
               }"
             >
               <template #bodyCell="{ column, record }">
@@ -363,6 +369,10 @@ const assetLoading = ref(false)
 const assetCounts = ref({})
 const assetTotal = ref(0)
 const assetPage = ref(1)
+//: 页大小。**必须与 loadAssets 里发出去的 limit 同源** —— 原来 limit 在
+//: loadAssets 里硬编码 20、分页配置也写死 pageSize:20，两处各写一份，
+//: 一旦放开 showSizeChanger 就必然对不上（offset 按一个值算、limit 发另一个）。
+const assetPageSize = ref(20)
 const assetKeyword = ref('')
 const assetTab = ref('domain')
 
@@ -396,6 +406,20 @@ async function refreshDetail() {
   await loadAssets()
 }
 
+/**
+ * 分页回调。antd 传的是 `(current, pageSize)` 两个位置参数。
+ *
+ * **改页大小必须回到第 1 页**：vc-pagination 的 `changePageSize` 会保留
+ * 当前页并连发 `change(current, size)`，停在第 5 页改页大小的话，
+ * offset 算出来落在中段 —— 用户以为在看第一页，实际看到的是中段数据。
+ */
+function onAssetPageChange(page, size) {
+  const sizeChanged = size && size !== assetPageSize.value
+  if (sizeChanged) assetPageSize.value = size
+  assetPage.value = sizeChanged ? 1 : page
+  loadAssets()
+}
+
 async function loadAssets() {
   if (!current.value) return
   assetLoading.value = true
@@ -403,8 +427,8 @@ async function loadAssets() {
     const data = await getGroupAssets(current.value.id, {
       type: assetTab.value,
       q: assetKeyword.value,
-      limit: 20,
-      offset: (assetPage.value - 1) * 20,
+      limit: assetPageSize.value,
+      offset: (assetPage.value - 1) * assetPageSize.value,
     })
     assets.value = data.rows
     assetCounts.value = data.counts

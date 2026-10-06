@@ -448,29 +448,52 @@ class TestMonitorScheduler(DiffTestCase):
 
 # --------------------------------------------------------------------- 截图
 
-class TestScreenshotSoftFail(unittest.IsolatedAsyncioTestCase):
+class TestPageTitleSoftFail(unittest.IsolatedAsyncioTestCase):
+    """浏览器起不来必须软失败（禁用模块），不能抛错中断整个扫描。
+
+    2026-10-06 截图模块被删、换成只取标题的 ``page_title`` —— 但"起浏览器"
+    这件事本身还在，所以这条软失败的性质**完全没变**，跟着换了个对象。
+    """
+
     async def test_setup_soft_fails_without_browser(self) -> None:
-        """浏览器起不来时必须软失败（禁用模块），而不是抛错中断扫描。"""
-        from core.domains.web_hunter.screenshot import screenshot
+        from core.domains.web_hunter.page_title import page_title
 
         scanner = mock.Mock()
         scanner.log = None
         scanner.settings = {}
-        module = screenshot(scanner, {})
+        module = page_title(scanner, {})
         module.log = mock.Mock()
 
         async def boom(self, async_playwright):
             return False, "启动 Chromium 失败: 假装没有浏览器"
 
-        with mock.patch.object(screenshot, "_launch", boom):
+        with mock.patch.object(page_title, "_launch", boom):
             result = await module.setup()
         self.assertEqual(result, (None, "启动 Chromium 失败: 假装没有浏览器"))
 
 
-class TestScreenshotReal(unittest.IsolatedAsyncioTestCase):
-    """真跑一次 Playwright 截图（对着本地 http.server，不依赖外网）。"""
+class TestPageTitleReal(unittest.IsolatedAsyncioTestCase):
+    """真跑一次 Playwright 取标题（对着本地 http.server，不依赖外网）。
 
-    PORT = 8799
+    重点验证**新增的判据**：静态 ``<title>`` 为空时才会起浏览器。
+    2026-10-06 起这个模块是截图模块的替代品 —— SPA 的 ``<title>`` 是空标签、
+    真实标题由 JS 写入，不起浏览器就拿不到。
+    """
+
+    PORT = 8798
+
+    #: 空 ``<title>`` + 脚本运行时写入 —— 复刻 SPA 站点的真实形态。
+    #:
+    #: ⚠️ **必须带 ``<meta charset="utf-8">``**。缺了它浏览器会按 latin-1
+    #: 解析页面，``document.title`` 取回来就是「ç»Ÿä¸€ç”¨æˆ·ä¸­å¿ƒ」
+    #: 这种乱码 —— 那不是代码的锅，是**页面自己**没声明编码。真实站点都带。
+    SPA_HTML = (
+        "<html><head><meta charset='utf-8'><title></title></head>"
+        "<body><div id=app></div>"
+        "<script>document.title='统一用户中心';</script></body></html>"
+    )
+    #: 传统服务端渲染页面的形态：标题本来就在 HTML 里。
+    SSR_HTML = "<html><head><title>Shot Page</title></head><body>hi</body></html>"
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -478,12 +501,11 @@ class TestScreenshotReal(unittest.IsolatedAsyncioTestCase):
             from playwright.async_api import async_playwright  # noqa: F401
         except ImportError:
             raise unittest.SkipTest("未安装 playwright")
-        cls.serve_dir = TEST_TMP_ROOT / "shot_site"
+        cls.serve_dir = TEST_TMP_ROOT / "title_site"
         cls.serve_dir.mkdir(parents=True, exist_ok=True)
-        (cls.serve_dir / "index.html").write_text(
-            "<html><head><title>Shot Page</title></head><body><h1>hi</h1></body></html>",
-            encoding="utf-8",
-        )
+        (cls.serve_dir / "spa.html").write_text(cls.SPA_HTML, encoding="utf-8")
+        (cls.serve_dir / "ssr.html").write_text(cls.SSR_HTML, encoding="utf-8")
+        (cls.serve_dir / "index.html").write_text(cls.SSR_HTML, encoding="utf-8")
 
         class Handler(SimpleHTTPRequestHandler):
             def __init__(self, *args, **kwargs):
@@ -501,178 +523,107 @@ class TestScreenshotReal(unittest.IsolatedAsyncioTestCase):
         cls.httpd.shutdown()
         cls.httpd.server_close()
 
-    async def test_capture_writes_png_to_db(self) -> None:
-        """截图落 **DB BLOB**（``http_endpoint.screenshot_data``），不再是磁盘文件 + FINDING。
+    def _module(self):
+        """造一个未 ``setup()`` 的模块实例（供只测 handle_event 分支用）。"""
+        from core.domains.web_hunter.page_title import page_title
 
-        这个模块改过设计：截图是二进制，塞不进事件载荷，所以从"发一条带相对路径的
-        FINDING、再由投影回填"改成"直接按 URL 写 http_endpoint"。
-        老的断言（找 ``kind == "screenshot"`` 的 finding、再去磁盘上找文件）已经
-        不成立了 —— 它们钉的是旧行为。
-        """
-        from core.engine.preset import Preset
-        from core.engine.scanner import Scanner
+        scanner = mock.Mock()
+        scanner.log = None
+        scanner.settings = {"settle_ms": 300}
+        m = page_title(scanner, {})
+        m.log = mock.Mock()
+        return m
 
-        TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
-        root = TEST_TMP_ROOT / f"s{uuid.uuid4().hex[:10]}"
-        mods = root / "mods"
-        mods.mkdir(parents=True, exist_ok=True)
-        (mods / "emit_url.py").write_text(
-            "from core.engine.event import EventType\n"
-            "from core.engine.module import BaseModule\n\n\n"
-            "class emit_url(BaseModule):\n"
-            "    watched_events = (EventType.SEED,)\n"
-            "    produced_events = (EventType.HTTP_RESPONSE, EventType.URL)\n"
-            "    flags = ('passive', 'safe')\n\n"
-            "    async def handle_event(self, event):\n"
-            f"        url = 'http://127.0.0.1:{self.PORT}/'\n"
-            "        # 先把端点建出来。截图模块是**按 URL 写 http_endpoint** 的，\n"
-            "        # 真实扫描里那一行由 http_probe 产出；这里省掉它就得自己造。\n"
-            "        await self.emit_event(\n"
-            "            url, EventType.HTTP_RESPONSE, parent=event,\n"
-            "            tags={'url': url, 'domain': '127.0.0.1', 'ip': '127.0.0.1',\n"
-            f"                  'port': {self.PORT}, 'scheme': 'http', 'status': 200,\n"
-            "                  'title': 'T'})\n"
-            "        await self.emit_event(url, EventType.URL, parent=event)\n",
-            encoding="utf-8",
+    async def test_fills_title_for_spa_page(self) -> None:
+        """静态标题为空 → 起浏览器 → 把 JS 写的标题补进存储层。"""
+        from core.domains.web_hunter.page_title import page_title
+
+        storage = mock.AsyncMock()
+        scanner = mock.Mock()
+        scanner.storage = storage
+        # settle_ms 调小一点让测试快；其余走 setup() 的默认值
+        scanner.settings = {"settle_ms": 300}
+        m = page_title(scanner, {})
+        m.log = mock.Mock()
+        # ⚠️ 必须走 setup()：它除了起浏览器还初始化 timeout_ms / body_max 这些
+        # _fill() 要用的字段。直接调 _launch 的话那些属性根本没建。
+        ok = await m.setup()
+        if ok is not True:
+            self.skipTest(f"Chromium 不可用: {ok}")
+        try:
+            url = f"http://127.0.0.1:{self.PORT}/spa.html"
+            await m._fill(url)
+        finally:
+            await m.cleanup()
+
+        storage.fill_endpoint_title.assert_awaited_once()
+        args = storage.fill_endpoint_title.await_args[0]
+        self.assertEqual(args[0], url)
+        self.assertEqual(args[1], "统一用户中心", "没拿到 JS 运行时写入的标题")
+        self.assertEqual(m.stats["filled"], 1)
+
+    async def test_skips_when_static_title_already_present(self) -> None:
+        """静态标题非空 → **压根不排队**（省掉一次浏览器启动）。"""
+        m = self._module()
+        event = mock.Mock()
+        event.type = "http_response"
+        event.data = f"http://127.0.0.1:{self.PORT}/ssr.html"
+        event.tags = {"url": event.data, "title": "Shot Page", "host": "x"}
+        await m.handle_event(event)
+        self.assertEqual(
+            m.stats["queued"], 0,
+            "静态就有标题还去起浏览器 —— 整个模块省开销的关键就是这条",
         )
 
-        storage = await make_storage()
-        try:
-            preset = Preset(
-                name="t",
-                include=["emit_url", "screenshot"],
-                module_dirs=[str(mods)],
-            )
-            scanner = Scanner(targets=["example.com"], preset=preset, storage=storage)
-            try:
-                summary = await scanner.scan()
-            except Exception as e:  # 浏览器环境问题不算产品缺陷
-                self.skipTest(f"Chromium 不可用: {e}")
 
-            if "screenshot" not in summary["modules_enabled"]:
-                self.skipTest(
-                    f"screenshot 模块未启用: {summary['modules_skipped'].get('screenshot')}"
-                )
+class TestResponseProjection(DiffTestCase):
+    """响应报文落库（2026-10-06 取代 ``TestScreenshotProjection``）。
 
-            url = f"http://127.0.0.1:{self.PORT}/"
-            endpoints = await storage.endpoints(scanner.scan_id)
-            with_shot = [e for e in endpoints if e["screenshot"]]
-            self.assertEqual(len(with_shot), 1, f"endpoints={endpoints}")
+    守的性质一样，只是对象从"截图 BLOB + 相对路径"换成"响应报文 + 截断标记"：
+      · 报文要真的写进去；
+      · ``endpoints()`` **绝不能**把正文带出来（几千个端点 = 几百 MB）；
+      · 按"这次扫描看到过"取，不是按"谁最先发现的"；
+      · URL 对不上任何端点时静默跳过，不打断链路。
+    """
 
-            # 二进制真的写进去了，而且是 PNG。
-            #
-            # ⚠️ 走 `screenshot_blob()` 而不是从 `endpoints()` 里取 —— 端点行
-            # **不该带** BYTEA（会让 API 序列化 500，见上面几条测试的说明）。
-            blob = await storage.screenshot_blob(scanner.scan_id, url)
-            self.assertIsNotNone(blob, "screenshot_data 是空的")
-            self.assertTrue(bytes(blob).startswith(b"\x89PNG"), "不是 PNG")
-            self.assertGreater(len(bytes(blob)), 1000)
+    BODY = "<html><head><title>T</title></head><body>" + "x" * 200 + "</body></html>"
+    URL = "http://www.example.com"
 
-            # 相对路径形态保持 {scan_id}/{sha256(url)[:16]}.png —— 前端兼容它
-            expected = (
-                f"{scanner.scan_id}/"
-                f"{hashlib.sha256(url.encode()).hexdigest()[:16]}.png"
-            )
-            self.assertEqual(with_shot[0]["screenshot"], expected)
-
-            # **不再产 FINDING** —— 那正是这次设计改动的内容
-            findings = await storage.findings(scanner.scan_id)
-            self.assertEqual(
-                [f for f in findings if f["kind"] == "screenshot"], [],
-                f"不该再有截图 FINDING: {findings}",
-            )
-        finally:
-            await storage.close()
-            shutil.rmtree(root, ignore_errors=True)
-
-
-class TestScreenshotProjection(DiffTestCase):
-    async def test_save_screenshot_writes_blob_and_path(self) -> None:
-        """截图二进制 + 相对路径**一起**写进 ``http_endpoint``。
-
-        原来这条测的是"FINDING 投影回填端点"，现在那条链路已经没有了 ——
-        模块直接调 ``save_screenshot``。所以这里改成直接钉存储层的行为。
-        """
-        scan_id = await self.storage.create_scan(targets=["example.com"], preset="t")
+    async def _seed(self, *, body: str = None, ctype: str = "text/html") -> int:
+        sid = await self.storage.create_scan(targets=["example.com"], preset="t")
         for event in (
             ev(EventType.DNS_NAME, "www.example.com", source="brute"),
             ev(EventType.IP_ADDRESS, "1.1.1.1"),
             ev(EventType.OPEN_TCP_PORT, "1.1.1.1:80", ip="1.1.1.1", port=80),
-            ev(EventType.HTTP_RESPONSE, "http://www.example.com",
-               url="http://www.example.com", domain="www.example.com", ip="1.1.1.1",
-               port=80, scheme="http", status=200, title="T"),
+            ev(EventType.HTTP_RESPONSE, self.URL, url=self.URL,
+               domain="www.example.com", ip="1.1.1.1", port=80, scheme="http",
+               status=200, title="T", content_type=ctype,
+               body_snippet=self.BODY if body is None else body),
         ):
-            await self.storage.save_event(scan_id, event)
-            await self.storage.project(scan_id, event)
+            await self.storage.save_event(sid, event)
+            await self.storage.project(sid, event)
+        return sid
 
-        url = "http://www.example.com"
-        png = b"\x89PNG\r\n\x1a\n" + b"x" * 128
-        self.assertTrue(await self.storage.save_screenshot(scan_id, url, png))
+    async def test_body_is_written_and_readable(self) -> None:
+        """报文写进 ``http_endpoint.body``，且能按 url 取回。"""
+        scan_id = await self._seed()
 
         endpoints = await self.storage.endpoints(scan_id)
         self.assertEqual(len(endpoints), 1)
-        expected = (
-            f"{scan_id}/{hashlib.sha256(url.encode()).hexdigest()[:16]}.png"
-        )
-        self.assertEqual(endpoints[0]["screenshot"], expected)
+        self.assertGreater(endpoints[0]["body_size"], 0)
+        self.assertFalse(endpoints[0]["body_truncated"])
 
-        # ⚠️ **``endpoints()`` 绝不能带 ``screenshot_data``。**
-        #
-        # 它返回的 dict 会被 FastAPI 直接序列化成 JSON，而截图是 BYTEA ——
-        # 实测抛 `invalid utf-8 sequence of 1 bytes from index 0`，
-        # **整个任务详情页 500**。
-        #
-        # 这条断言以前是反的（要求 blob 在里面），所以那个 bug 被测试**钉成了
-        # 期望行为**，一直没被发现。图片本身走
-        # `GET /api/screenshots/{scan_id}/{url}` → `screenshot_blob()`。
-        self.assertNotIn(
-            "screenshot_data", endpoints[0],
-            "endpoints() 带了截图二进制 —— 会让 API 序列化直接 500",
-        )
-        # 而按需取二进制仍然拿得到
-        self.assertEqual(await self.storage.screenshot_blob(scan_id, url), png)
+        got = await self.storage.response_body(scan_id, self.URL)
+        self.assertIn("<html>", got["body"])
 
-    async def test_screenshot_blob_is_scoped_to_the_scan_that_saw_it(self) -> None:
-        """截图按"**这次扫描看到过**"取，不是按"谁最先发现的"。
-
-        跨 scan 去重之后 ``http_endpoint.scan_id`` 只是"谁最先发现的"，
-        重扫同一目标时资产行留在旧扫描名下。如果按那个字段查，**新任务取自己的
-        截图会 404**（而页面上的链接正是新任务 id）。
-        """
-        url = "http://www.example.com"
-        png = b"\x89PNG\r\n\x1a\n" + b"y" * 64
-
-        async def seed() -> int:
-            sid = await self.storage.create_scan(targets=["example.com"], preset="t")
-            for event in (
-                ev(EventType.DNS_NAME, "www.example.com", source="brute"),
-                ev(EventType.IP_ADDRESS, "1.1.1.1"),
-                ev(EventType.OPEN_TCP_PORT, "1.1.1.1:80", ip="1.1.1.1", port=80),
-                ev(EventType.HTTP_RESPONSE, url, url=url, domain="www.example.com",
-                   ip="1.1.1.1", port=80, scheme="http", status=200, title="T"),
-            ):
-                await self.storage.save_event(sid, event)
-                await self.storage.project(sid, event)
-            return sid
-
-        first = await seed()
-        self.assertTrue(await self.storage.save_screenshot(first, url, png))
-        second = await seed()          # 重扫同一个目标
-
-        self.assertEqual(await self.storage.screenshot_blob(first, url), png)
-        self.assertEqual(
-            await self.storage.screenshot_blob(second, url), png,
-            "重扫之后新任务取不到自己看到的截图",
-        )
-        # 没看到过它的扫描取不到（既没 500 也不会串）
-        third = await self.storage.create_scan(targets=["other.com"], preset="t")
-        self.assertIsNone(await self.storage.screenshot_blob(third, url))
-
-    async def test_endpoints_never_pull_the_blob(self) -> None:
-        """``endpoints()`` 的 SQL 里不该出现 ``screenshot_data``。
+    async def test_endpoints_never_pull_the_body(self) -> None:
+        """``endpoints()`` 的 SQL 里**不能**带 ``body``（只准带长度）。
 
         上面那条断言测的是"结果里没有"，这条测的是"**压根没去取**"——
-        否则每次列端点都要从数据库搬几 MB 的二进制。
+        否则一次几千个端点的扫描就是几百 MB 正文涌进 JSON，列表页直接卡死。
+
+        ⚠️ 这条以前因为实现里留着 ``screenshot`` 两个字而失败过；现在换成
+        同一原则的**新对象**（body / body_size），别再让它退回去。
         """
         import inspect
         import re as _re
@@ -681,54 +632,54 @@ class TestScreenshotProjection(DiffTestCase):
 
         src = inspect.getsource(PostgresStorage.endpoints)
         # ⚠️ 先把注释去掉：这个方法为了讲清"为什么不能用 SELECT *"**在注释里
-        # 提到了 screenshot_data**，直接搜源码会把注释也算命中（第一版就这么错的）。
+        # 提到了 body**，直接搜源码会把注释也算命中（第一版就这么错的）。
         code = "\n".join(
             ln for ln in src.splitlines() if not ln.strip().startswith("#")
         )
-        # 去掉行尾注释
         code = _re.sub(r"#.*$", "", code, flags=_re.M)
-        self.assertNotIn("screenshot_data", code)
         self.assertNotIn("SELECT *", code, "endpoints() 用了 SELECT *")
-        # 但截图**路径**必须留着 —— 前端靠它显示缩略图
-        self.assertIn("screenshot", code)
+        # 正文字段名不能出现（只允许 length(body) 这种取长度的写法）
+        self.assertNotRegex(code, r"body_truncated\s*=\s*excluded|,\s*body\s*,")
+        # 但长度与截断标记必须留着 —— 前端靠它们决定显不显示「查看」按钮
+        self.assertIn("body_size", code)
+        self.assertIn("body_truncated", code)
 
-    async def test_save_screenshot_for_unknown_url_is_a_noop(self) -> None:
+    async def test_body_is_scoped_to_the_scan_that_saw_it(self) -> None:
+        """报文按"**这次扫描看到过**"取，不是按"谁最先发现的"。
+
+        跨 scan 去重之后 ``http_endpoint.scan_id`` 只是"谁最先发现的"，
+        重扫同一目标时资产行留在旧扫描名下。按那个字段查，**新任务取自己的
+        报文会 404**（而页面上的链接正是新任务 id）。
+        """
+        first = await self._seed()
+        second = await self._seed()          # 重扫同一个目标
+
+        self.assertIn("<html>", (await self.storage.response_body(first, self.URL))["body"])
+        self.assertIn(
+            "<html>", (await self.storage.response_body(second, self.URL))["body"],
+            "重扫之后新任务取不到自己看到的响应",
+        )
+        # 没看到过它的扫描取不到（既没 500 也不会串）
+        third = await self.storage.create_scan(targets=["other.com"], preset="t")
+        self.assertEqual(
+            (await self.storage.response_body(third, self.URL))["body"], "",
+            "跨扫描串读了",
+        )
+
+    async def test_write_for_unknown_url_is_a_noop(self) -> None:
         """URL 对不上任何端点时不能报错、也不能误伤别的行。
 
-        截图是**扫描末尾**并行落盘的，目标端点可能因为超时/被删而不在表里 ——
-        那种情况下静默跳过是对的，抛出去会把整条截图链打断。
+        报文是**扫描末尾**并行落盘的，目标端点可能因为超时/被删而不在表里 ——
+        那种情况下静默跳过是对的，抛出去会把整条链打断。
 
-        ⚠️ 返回值从"永远 True"改成了**"是否真写进去了"**（2026-10-04）。旧实现
-        无条件 ``return True``，于是 UPDATE 命中 0 行也报成功，调用方无从
-        察觉截图丢了 —— 而那正是调用方最需要知道的。这里是"什么都没写"，
-        所以必须返回 False；本测试原来 assertTrue，钉的是实现细节而不是意图。
+        ⚠️ 返回"是否真写进去了"而不是永远 True：UPDATE 命中 0 行也报成功的话，
+        调用方无从察觉数据丢了 —— 而那正是它最需要知道的。这里是"什么都没写"，
+        所以必须返回 False。
         """
-        scan_id = await self.storage.create_scan(targets=["example.com"], preset="t")
-        for event in (
-            ev(EventType.DNS_NAME, "www.example.com", source="brute"),
-            ev(EventType.IP_ADDRESS, "1.1.1.1"),
-            ev(EventType.OPEN_TCP_PORT, "1.1.1.1:80", ip="1.1.1.1", port=80),
-            ev(EventType.HTTP_RESPONSE, "http://www.example.com",
-               url="http://www.example.com", domain="www.example.com", ip="1.1.1.1",
-               port=80, scheme="http", status=200, title="T"),
-        ):
-            await self.storage.save_event(scan_id, event)
-            await self.storage.project(scan_id, event)
-
-        # 什么都没写 → 必须如实报告 False（而不是"成功"）
-        self.assertFalse(
-            await self.storage.save_screenshot(scan_id, "http://nope.invalid/", b"\x89PNG"),
-            "URL 没有对应端点行 —— 什么都没写却报成功",
+        ok = await self.storage.fill_endpoint_title(
+            "http://不存在.example.com/", "标题"
         )
-        endpoints = await self.storage.endpoints(scan_id)
-        self.assertEqual(len(endpoints), 1)
-        self.assertIsNone(endpoints[0]["screenshot"], "误伤了不相关的端点")
-        # 二进制也不该出现在端点行里（见上一条测试的说明）
-        self.assertNotIn("screenshot_data", endpoints[0])
-        self.assertIsNone(
-            await self.storage.screenshot_blob(scan_id, "http://nope.invalid/")
-        )
-
+        self.assertFalse(ok, "URL 对不上任何端点时却报成功")
 
 class TestNoiseFindings(DiffTestCase):
     """截图流水账不该出现在"发现"里。

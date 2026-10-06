@@ -116,6 +116,55 @@ class TestScanName(WebTestCase):
         self.assertEqual(record["name"], "月度巡检")
 
 
+class TestScanRequestStrictness(WebTestCase):
+    """``ScanRequest`` 拒绝未知字段。
+
+    pydantic 默认 ``extra="ignore"``，字段名写错时接口照样 201、扫描照跑，
+    只是那一项**根本没生效**。在这个接口上"没生效"的方向很要命：把
+    ``enable_sources`` 写成 ``enable``，用户勾选的额度源静默失效、扫描按预设
+    全量跑；本想用 ``overrides`` 收窄范围的，收窄同样不生效。
+    """
+
+    def _post(self, body: dict):
+        return self.client.post("/api/scans", json=body)
+
+    def test_misspelled_enable_sources_is_rejected(self) -> None:
+        """这条是本组用例的由来：``enable`` 曾经被静默丢弃，整轮跑成全量。"""
+        resp = self._post({
+            "name": "字段名写错",
+            "targets": ["example.com"],
+            "preset": str(self.preset_path),
+            "enable": ["passive_fofa"],          # 真实字段是 enable_sources
+        })
+        self.assertEqual(resp.status_code, 422, resp.text)
+
+    def test_unknown_field_is_rejected(self) -> None:
+        for extra in ("targets2", "overrides_", "Enable", "module"):
+            with self.subTest(field=extra):
+                resp = self._post({
+                    "name": "未知字段",
+                    "targets": ["example.com"],
+                    "preset": str(self.preset_path),
+                    extra: ["x"],
+                })
+                self.assertEqual(resp.status_code, 422, resp.text)
+
+    def test_all_real_fields_still_accepted(self) -> None:
+        """反向用例：收紧不能误伤已知字段，否则是把接口改残了。"""
+        record = self.start(["example.com"], name="五字段齐全")
+        self.assertIn("scan_id", record)
+        self.wait_done(record["scan_id"])
+
+        resp = self._post({
+            "name": "enable_sources 正常",
+            "targets": ["example.com"],
+            "preset": str(self.preset_path),
+            "enable_sources": [],
+            "overrides": [],
+        })
+        self.assertIn(resp.status_code, (200, 201), resp.text)
+
+
 class TestMetaEndpoints(WebTestCase):
     def test_health(self) -> None:
         data = self.client.get("/api/health").json()
@@ -223,24 +272,28 @@ class TestNoAuthGate(WebTestCase):
         self.assertNotIn("authorized_targets", resp.json())
 
 
-class TestScreenshotRoute(WebTestCase):
-    """``GET /api/screenshots/{scan_id}/{url}``。
+class TestResponseRoute(WebTestCase):
+    """``GET /api/scans/{scan_id}/response?url=...``（2026-10-06 取代截图路由）。
 
     ## 为什么单独补这一组
 
-    **这个路由以前完全没有测试覆盖，而它从写下来就是坏的** ——
-    它直接调 ``store.conn.fetchrow()``，而 ``PgConnection`` 上**根本没有这个方法**
-    （只有 ``fetchone`` / ``fetchall`` / ``execute`` / ``executescript``）。
-    于是任何点开截图的操作都是 500，而且没人发现。
+    这组测试的前身是 ``/api/screenshots/{scan_id}/{url}``，而那个路由
+    **从写下来就是坏的** —— 它直接调 ``store.conn.fetchrow()``，而
+    ``PgConnection`` 上**根本没有这个方法**（只有 ``fetchone`` / ``fetchall`` /
+    ``execute`` / ``executescript``）。于是任何点开截图的操作都是 500，没人发现。
 
-    连带暴露的还有第二个问题：查询写的是 ``WHERE scan_id = $1``，跨 scan 去重之后
-    那个字段只是"谁最先发现的"，**重扫同一目标时新任务取自己的截图会 404**
+    连带暴露的第二个问题：查询写的是 ``WHERE scan_id = $1``，跨 scan 去重之后
+    那个字段只是"谁最先发现的"，**重扫同一目标时新任务取自己的数据会 404**
     （而页面上的链接正是新任务的 id）。
+
+    新路由把同一个教训接着守：定位必须是**两步**（按 url 找全局唯一的端点行，
+    再用 ``scan_asset`` 确认这次扫描看到过它），且缺失一律 404 不许 500。
     """
 
     URL = "http://www.example.com"
+    BODY = "<html><head><title>T</title></head><body>hello</body></html>"
 
-    async def _seed(self) -> tuple[int, bytes]:
+    async def _seed(self) -> int:
         """用**独立连接**往同一个 schema 里种数据。
 
         ⚠️ 不能用 ``self.client.app.state.storage`` —— 那条连接活在 TestClient
@@ -268,47 +321,67 @@ class TestScreenshotRoute(WebTestCase):
                 Event(EventType.HTTP_RESPONSE, self.URL, module="t",
                       tags={"url": self.URL, "domain": "www.example.com",
                             "ip": "1.1.1.1", "port": 80, "scheme": "http",
-                            "status": 200, "title": "T"}),
+                            "status": 200, "title": "T",
+                            "content_type": "text/html",
+                            "body_snippet": self.BODY}),
             ):
                 await store.save_event(scan_id, event)
                 await store.project(scan_id, event)
-            png = b"\x89PNG\r\n\x1a\n" + b"z" * 64
-            await store.save_screenshot(scan_id, self.URL, png)
-            return scan_id, png
+            return scan_id
         finally:
             await store.close()
 
-    def test_serves_the_png(self) -> None:
-        from urllib.parse import quote
-
-        scan_id, png = asyncio.run(self._seed())
-        resp = self.client.get(
-            f"/api/screenshots/{scan_id}/{quote(self.URL, safe='')}"
+    def _get(self, scan_id: int, url: str):
+        return self.client.get(
+            f"/api/scans/{scan_id}/response", params={"url": url}
         )
+
+    def test_serves_the_body(self) -> None:
+        scan_id = asyncio.run(self._seed())
+        resp = self._get(scan_id, self.URL)
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertEqual(resp.content, png)
-        self.assertEqual(resp.headers["content-type"], "image/png")
+        data = resp.json()
+        self.assertIn("hello", data["body"])
+        self.assertEqual(data["url"], self.URL)
+        self.assertEqual(data["status"], 200)
+        self.assertFalse(data["truncated"])
 
-    def test_missing_screenshot_is_404_not_500(self) -> None:
-        """**回归**：不存在的截图必须 404。
+    def test_missing_body_is_404_not_500(self) -> None:
+        """**回归**：取不到必须是 404，不能是 500。
 
-        修复前这里是 500（``AttributeError: 'PgConnection' object has no
+        前一个版本这里就是 500（``AttributeError: 'PgConnection' object has no
         attribute 'fetchrow'``）—— 前端只会看到一个"服务器错误"。
         """
-        from urllib.parse import quote
+        scan_id = asyncio.run(self._seed())
+        resp = self._get(scan_id, "http://nope.invalid/")
+        self.assertEqual(resp.status_code, 404, resp.text)
 
-        scan_id, _ = asyncio.run(self._seed())
-        resp = self.client.get(
-            f"/api/screenshots/{scan_id}/{quote('http://nope.invalid/', safe='')}",
-        )
+    def test_other_scan_cannot_read_it(self) -> None:
+        """**重扫隔离**：这次扫描没看到过的端点，取不到。
+
+        这条守住"两步定位"的后半段。写成 ``WHERE scan_id = $1`` 的话，
+        重扫同一目标时新任务会取到旧任务的数据（或者反过来 404）——
+        两种都是错的：用户看的必须是**这次**扫描观测到的东西。
+        """
+        from core.storage.postgres import PostgresStorage
+
+        from .pgutil import DSN
+
+        async def other_scan() -> int:
+            store = PostgresStorage(DSN, schema=self.schema, create_search_index=False)
+            await store.open()
+            try:
+                return await store.create_scan(targets=["other.com"], preset="t")
+            finally:
+                await store.close()
+
+        scan_id = asyncio.run(self._seed())
+        other = asyncio.run(other_scan())
+        resp = self._get(other, self.URL)
         self.assertEqual(resp.status_code, 404, resp.text)
 
     def test_unknown_scan_id_is_404(self) -> None:
-        from urllib.parse import quote
-
-        resp = self.client.get(
-            f"/api/screenshots/999999/{quote(self.URL, safe='')}"
-        )
+        resp = self._get(999999, self.URL)
         self.assertEqual(resp.status_code, 404, resp.text)
 
 

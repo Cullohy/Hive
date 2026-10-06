@@ -338,12 +338,17 @@
                   <span v-else class="tk-muted">未探活</span>
                 </template>
                 <template v-else-if="column.key === 'shot'">
+                  <!--
+                    「报文」取代「截图」。按钮显不显示看 ``body_size`` ——
+                    后端只在正文是文本（且有内容）时才存，二进制不存
+                    （存了也读不出来）。
+                  -->
                   <a-button
-                    v-if="record.screenshot"
+                    v-if="record.body_size"
                     type="link"
                     size="small"
                     style="padding: 0"
-                    @click="showShot(record.screenshot, record.url)"
+                    @click="showResponse(record)"
                   >
                     查看
                   </a-button>
@@ -651,11 +656,27 @@
       </a-spin>
     </a-modal>
 
-    <!-- 截图 -->
-    <a-modal v-model:open="shotOpen" title="网页截图" :footer="null" width="900">
+    <!-- 响应报文（2026-10-06 取代截图） -->
+    <a-modal
+      v-model:open="shotOpen"
+      title="响应内容"
+      :footer="null"
+      width="900"
+    >
       <a-spin :spinning="shotLoading">
-        <img v-if="shotSrc" :src="shotSrc" class="shot-img" alt="截图" />
-        <div v-else-if="!shotLoading" class="tk-empty">截图加载失败</div>
+        <template v-if="shotText">
+          <div class="resp-meta">
+            <span class="tk-mono">{{ shotUrl }}</span>
+            <a-tag v-if="shotStatus" color="blue">HTTP {{ shotStatus }}</a-tag>
+            <a-tag v-if="shotType">{{ shotType }}</a-tag>
+            <!-- 被截断时要**明说**，否则用户会拿半截报文当完整结论 -->
+            <a-tag v-if="shotTruncated" color="orange">
+              已截断（只显示前 {{ formatBytes(shotText.length) }}）
+            </a-tag>
+          </div>
+          <pre class="resp-body">{{ shotText }}</pre>
+        </template>
+        <div v-else-if="!shotLoading" class="tk-empty">没有响应内容</div>
       </a-spin>
     </a-modal>
   </div>
@@ -679,6 +700,7 @@ import {
   getEvents,
   getScan,
   getTrace,
+  getResponseBody,
   stopScan,
 } from '@/api'
 import { openProgressStream } from '@/api/stream'
@@ -722,8 +744,13 @@ const trace = ref([])
 const diffOpen = ref(false)
 const diff = ref(null)
 const diffLoading = ref(false)
+// 响应报文弹窗（2026-10-06 取代截图）
 const shotOpen = ref(false)
-const shotSrc = ref('')
+const shotText = ref('')
+const shotUrl = ref('')
+const shotStatus = ref(null)
+const shotType = ref('')
+const shotTruncated = ref(false)
 const shotLoading = ref(false)
 
 let controller = null
@@ -788,7 +815,7 @@ const urlColumns = [
   { title: '来源', dataIndex: 'source', key: 'source', width: 120 },
   { title: '类型', dataIndex: 'kind', key: 'kind', width: 90 },
   { title: '发现于', key: 'parent_url', width: 240, ellipsis: true },
-  { title: '截图', key: 'shot', width: 70 },
+  { title: '响应', key: 'shot', width: 70 },
 ]
 const techColumns = [
   { title: '主机', dataIndex: 'host', key: 'host', width: 240 },
@@ -1065,7 +1092,9 @@ const mergedUrls = computed(() => {
         title: e.title,
         server: e.server,
         content_length: e.content_length,
-        screenshot: e.screenshot,
+        // 报文长度（后端只给长度，正文要单独取，见 showResponse）
+        body_size: e.body_size,
+        content_type: e.content_type,
       })
     } else {
       // 防御：端点不在 url 表里（结构上不该发生，但别让它消失）
@@ -1185,21 +1214,34 @@ async function showTrace(record) {
   }
 }
 
-async function showShot(screenshotPath, url) {
+async function showResponse(record) {
   shotOpen.value = true
-  shotSrc.value = ''
+  shotText.value = ''
+  shotUrl.value = record.url || ''
+  shotStatus.value = record.status ?? null
+  shotType.value = record.content_type || ''
+  shotTruncated.value = false
   shotLoading.value = true
   try {
-    // screenshotPath 格式: scan_id/hash.png (旧路径)，从中提取 scan_id
-    const scanId = screenshotPath.split('/')[0]
-    const response = await fetch(`/api/screenshots/${scanId}/${encodeURIComponent(url)}`)
-    if (!response.ok) throw new Error(`HTTP ${response.status}`)
-    shotSrc.value = URL.createObjectURL(await response.blob())
+    const data = await getResponseBody(id, record.url)
+    shotText.value = data.body || ''
+    shotStatus.value = data.status ?? shotStatus.value
+    shotType.value = data.content_type || shotType.value
+    // 后端已经截过一次，这里服务端再按 max_bytes 截，会把 truncated 置真
+    shotTruncated.value = !!data.truncated
   } catch (e) {
-    message.error(`截图加载失败: ${e.message}`)
+    message.error(`响应加载失败: ${e.message}`)
   } finally {
     shotLoading.value = false
   }
+}
+
+/** 字节数给人看（截断提示用）。 */
+function formatBytes(n) {
+  if (!n) return '0 B'
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / 1024 / 1024).toFixed(1)} MB`
 }
 
 onMounted(async () => {
@@ -1425,5 +1467,29 @@ onUnmounted(() => {
   width: 100%;
   border: 1px solid var(--tk-border);
   border-radius: 6px;
+}
+/* 响应报文弹窗 */
+.resp-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  font-size: 12.5px;
+}
+.resp-body {
+  margin: 0;
+  padding: 12px;
+  max-height: 62vh;
+  overflow: auto;
+  background: var(--tk-bg-soft);
+  border: 1px solid var(--tk-border);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  /* 报文里常有超长的一行（JS / base64 / token），不换行会把弹窗撑爆 */
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 </style>

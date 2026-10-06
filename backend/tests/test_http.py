@@ -37,6 +37,7 @@ class FakeResponse:
         headers=None,
         content_type: str = "text/plain; charset=utf-8",
         url: str = "http://fake/",
+        reason_phrase: str = "",
     ) -> None:
         self._data = data
         self.status_code = status
@@ -45,12 +46,25 @@ class FakeResponse:
         self.closed = False
         self._text: str | None = None
         self._url = url
+        #: 真实 httpx.Response 有这个属性（wafw00f 的 ``matchReason`` 认它）
+        self.reason_phrase = reason_phrase
 
     def read(self) -> bytes:
         return self._data
 
     async def read_async(self) -> bytes:
         return self._data
+
+    async def aread(self) -> bytes:
+        """httpx ``stream()`` 上下文里的全量读取。"""
+        return self._data
+
+    async def _iter_once(self):
+        yield self._data
+
+    def aiter_bytes(self):
+        """真实 httpx.Response 的 ``aiter_bytes()`` 是**异步生成器函数**。"""
+        return self._iter_once()
 
     @property
     def text(self) -> str:
@@ -84,6 +98,70 @@ class BrokenEncodingResponse(FakeResponse):
         raise httpx.DecodingError("Can not decode content-encoding: br")
 
 
+class ChunkedResponse(FakeResponse):
+    """真·分块流，并**记录被消费了几块**。
+
+    ``consumed`` 是这里唯一有意义的判据：光断言"拿到的字节 <= 上限"，
+    回退成 ``await response.aread()`` 再切片也一样成立 —— 那正是这次改动
+    要治的毛病（整包进内存，切片一分钱内存都省不下）。只有"没把整个流
+    读完"才是真的省下了内存。
+    """
+
+    def __init__(self, total: int, chunk: int = 65536, **kw) -> None:
+        super().__init__(b"", **kw)
+        self.total = total
+        self.chunk = chunk
+        self.consumed = 0
+        self.aread_called = False
+
+    @property
+    def total_chunks(self) -> int:
+        return (self.total + self.chunk - 1) // self.chunk
+
+    async def aread(self) -> bytes:
+        # 模拟"整个 body 一次性进内存"
+        self.aread_called = True
+        self.consumed = self.total_chunks
+        return b"A" * self.total
+
+    async def _gen(self):
+        left = self.total
+        while left > 0:
+            n = min(self.chunk, left)
+            self.consumed += 1
+            yield b"A" * n
+            left -= n
+
+    def aiter_bytes(self):
+        return self._gen()
+
+
+class FakeStreamCtx:
+    """httpx ``AsyncClient.stream()`` 的形状。
+
+    ⚠️ 真实 httpx 里 ``stream()`` 是被 ``@asynccontextmanager`` 装饰的方法：
+    **调用它本身不发请求**，只是返回一个上下文管理器；真正的请求发生在
+    ``__aenter__``。所以异常也必须由 ``__aenter__`` 抛。
+
+    这里曾经写成"``stream()`` 直接抛异常"的形状，测试照样绿 —— 但那意味着
+    桩和真实时序不一致：真实 httpx 是在进入上下文时才建连/读响应头，
+    提前抛会漏掉"已经建连但读响应头失败"那一段。
+    """
+
+    def __init__(self, response: FakeResponse | Exception) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> FakeResponse:
+        if isinstance(self._response, Exception):
+            raise self._response
+        return self._response
+
+    async def __aexit__(self, *exc: object) -> bool:
+        if isinstance(self._response, FakeResponse):
+            await self._response.aclose()
+        return False
+
+
 class FakeHttpxClient:
     """Fake httpx.AsyncClient，用于测试 fetch()。"""
 
@@ -91,8 +169,19 @@ class FakeHttpxClient:
 
     def __init__(self, response: FakeResponse | Exception) -> None:
         self._response = response
+        #: ``get()`` 的调用记录，用于断言 fetch_bytes 的重定向参数
+        self.get_calls: list[dict] = []
 
     async def request(self, method, url, **kwargs):
+        if isinstance(self._response, Exception):
+            raise self._response
+        return self._response
+
+    def stream(self, **kwargs) -> FakeStreamCtx:
+        return FakeStreamCtx(self._response)
+
+    async def get(self, url, **kwargs):
+        self.get_calls.append({"url": url, **kwargs})
         if isinstance(self._response, Exception):
             raise self._response
         return self._response
@@ -213,6 +302,101 @@ class TestFetchPath(unittest.IsolatedAsyncioTestCase):
         async with HTTPClient(retries=0) as client:
             client._client = fake
             self.assertIsNone(await client.fetch("http://x/"))
+
+
+class TestStreamBoundedRead(unittest.IsolatedAsyncioTestCase):
+    """``fetch()`` 的流式限量读取。
+
+    改之前的形态是 ``await client.request()`` + ``raw[:max_bytes]`` 事后切片：
+    切片看着在截断，其实整个 body 已经进内存了 —— 一个返回 500MB 的下载型
+    端点，``http_probe`` 的 batch_size=10 并发下就足以把后端打爆。
+    现在改成 ``client.stream()`` + 超限立刻 break。
+
+    判据是 ``consumed``（流被消费了几块），不是"返回字节数没超" —— 后者
+    在旧实现下同样成立，恒绿。
+    """
+
+    async def _fetch(self, resp: FakeResponse, max_bytes: int):
+        fake = fake_httpx_client(resp)
+        async with HTTPClient() as client:
+            client._client = fake
+            return await client.fetch("http://x/big", max_bytes=max_bytes)
+
+    async def test_does_not_read_whole_body_when_over_limit(self) -> None:
+        resp = ChunkedResponse(total=1024 * 1024, chunk=65536)
+        result = await self._fetch(resp, max_bytes=65536)
+
+        self.assertEqual(resp.total_chunks, 16)
+        self.assertFalse(resp.aread_called, "不该走 aread()（那会把整包读进内存）")
+        self.assertLess(resp.consumed, resp.total_chunks,
+                        "流没读完 = 上限真的在生效")
+        self.assertTrue(result.truncated)
+        self.assertLessEqual(len(result.text.encode("utf-8")), 65536)
+
+    async def test_never_exceeds_limit_even_by_a_whole_chunk(self) -> None:
+        """块比上限大时也必须切到上限 —— 少一个 chunk 不行，超一个也不行。"""
+        resp = ChunkedResponse(total=200_000, chunk=100_000)
+        result = await self._fetch(resp, max_bytes=1000)
+        self.assertTrue(result.truncated)
+        self.assertEqual(len(result.text.encode("utf-8")), 1000)
+        # 第一块就超了，但那块本身是 100000 字节 -> 一定会被判截断
+        self.assertEqual(resp.consumed, 1)
+
+    async def test_body_under_limit_is_not_marked_truncated(self) -> None:
+        resp = ChunkedResponse(total=100, chunk=65536)
+        result = await self._fetch(resp, max_bytes=65536)
+        self.assertFalse(result.truncated)
+        self.assertEqual(result.text, "A" * 100)
+
+    async def test_zero_max_bytes_means_unbounded(self) -> None:
+        """``max_bytes<=0`` = 不设上限，那就老老实实全读。"""
+        resp = ChunkedResponse(total=300_000, chunk=65536)
+        result = await self._fetch(resp, max_bytes=0)
+        self.assertFalse(result.truncated)
+        self.assertEqual(len(result.text.encode("utf-8")), 300_000)
+        self.assertEqual(resp.consumed, resp.total_chunks)
+
+    async def test_stream_response_is_closed(self) -> None:
+        """``async with`` 退出必须把连接还回池子，否则批量探测会耗尽连接。"""
+        resp = ChunkedResponse(total=100, chunk=65536)
+        await self._fetch(resp, max_bytes=65536)
+        self.assertTrue(resp.closed)
+
+
+class TestFetchBytesRedirects(unittest.IsolatedAsyncioTestCase):
+    """``fetch_bytes()`` 的重定向与状态码（favicon 哈希就靠它）。
+
+    httpx 0.28.x 的 ``AsyncClient`` 默认**不跟随**重定向，而 ``fetch()``
+    是显式传了的 —— 两条路径不一致时，站点把 ``/favicon.ico`` 301 到别处
+    （极常见）就会拿那个几十字节的重定向响应体算哈希。
+    """
+
+    async def _call(self, resp: FakeResponse):
+        fake = fake_httpx_client(resp)
+        async with HTTPClient() as client:
+            client._client = fake
+            data = await client.fetch_bytes("http://x/favicon.ico")
+        return data, fake
+
+    async def test_follows_redirects(self) -> None:
+        resp = FakeResponse(b"\x00icon-bytes", status=200)
+        _, fake = await self._call(resp)
+        self.assertTrue(fake.get_calls, "根本没发请求")
+        self.assertTrue(fake.get_calls[0].get("follow_redirects"),
+                        "没显式跟随重定向 -> favicon 哈希算在跳转响应体上")
+
+    async def test_non_200_final_status_yields_nothing(self) -> None:
+        """跳完之后必须回 200；302 落地的登录页 HTML 拿来算哈希同样没意义。"""
+        data, _ = await self._call(FakeResponse(b"<html>login</html>", status=302))
+        self.assertEqual(data, b"")
+
+    async def test_error_status_yields_nothing(self) -> None:
+        data, _ = await self._call(FakeResponse(b"nope", status=404))
+        self.assertEqual(data, b"")
+
+    async def test_success_returns_bytes(self) -> None:
+        data, _ = await self._call(FakeResponse(b"\x00icon-bytes", status=200))
+        self.assertEqual(data, b"\x00icon-bytes")
 
 
 class TestRequestStats(unittest.IsolatedAsyncioTestCase):

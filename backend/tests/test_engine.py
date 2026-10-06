@@ -625,6 +625,139 @@ class TestEventLimitConverges(unittest.IsolatedAsyncioTestCase):
             summary = await self._run(_P(td))
             self.assertIn("events.limit_hit", summary["stats"])
 
+    async def test_limit_is_not_exceeded(self) -> None:
+        """``max_events`` 必须是**真的上限**：处理的事件数不得超过它。
+
+        ## 起因
+
+        上限判定原来写在 ``_visited.add()`` 与 ``events.new += 1`` **之后**，
+        用的是 ``>``：事件先被记进 ``_visited``，再拿"含本条的总数"比上限。
+        于是 ``max_events=2`` 会放行 3 条 —— **上限被突破**，而且
+        ``events.new`` 报出来的是 3、与实际派发数对不上。
+
+        这类 off-by-one 静默把预算放大，最坏情况是"限了 50 万事件"的
+        扫描实际处理了 50 万零几条，机器被打满而没有任何提示。
+
+        ## 判据
+
+        断言 ``events.new <= max_events``。**只断言触顶不够** —— 触顶一直
+        都能触发，哪怕上限早就被突破了。
+        """
+        import tempfile
+        from pathlib import Path as _P
+
+        with tempfile.TemporaryDirectory() as td:
+            summary = await self._run(_P(td))
+            got = summary["stats"]["events.new"]
+            self.assertLessEqual(
+                got, self.MAX_EVENTS,
+                f"max_events={self.MAX_EVENTS} 却处理了 {got} 条事件 —— 上限被突破",
+            )
+            self.assertEqual(
+                summary["stats"]["events.limit_hit"], 1,
+                "没触顶，测试没打到那条路径",
+            )
+
+
+
+class TestTargetNormalization(unittest.TestCase):
+    """用户输入的目标必须先**归一化干净**，否则作用域闸门会误杀全部子域。
+
+    ## 为什么这组测试重要
+
+    目标归一化一旦被 BOM、尾随冒号这类字符污染，``root_domain_of`` 就一个
+    子域都匹配不上。症状极具迷惑性：扫描**照常跑完**、状态 ``finished``、
+    资产数 0，日志里只有一行 debug —— 与"这个目标真没有子域"完全无法区分。
+
+    闸门方向是**过严**（不是泄漏），但对用户来说结果一样：扫了个寂寞。
+    """
+
+    def _normalize(self, raw: str) -> str:
+        from core.engine.scanner import Scanner
+
+        return Scanner._normalize_target(raw)
+
+    def test_trailing_colon_is_a_port_separator(self) -> None:
+        """``example.com:`` 里的空端口要被剥掉。
+
+        来自 ``host:port`` 输入框、或配置文件里手写的一行很容易带上。
+        按"冒号后必须全是数字"判断会漏掉空串（``"".isdigit()`` 是 False），
+        目标就原样存成 ``example.com:``，于是所有真实子域全部越界。
+        """
+        self.assertEqual(self._normalize("example.com:"), "example.com")
+
+    def test_bom_and_zero_width_are_stripped(self) -> None:
+        """``str.strip()`` **不**去 BOM —— Windows 编辑器存的文件十有八九带。"""
+        self.assertEqual(self._normalize("\ufeffexample.com"), "example.com")
+        self.assertEqual(self._normalize("example.com\u200b"), "example.com")
+
+    def test_subdomains_of_degraded_targets_stay_in_scope(self) -> None:
+        """回归护栏：上面两种退化目标，子域必须仍在范围内。"""
+        from core.engine.event import Event, EventType
+
+        for raw in ("example.com:", "\ufeffexample.com"):
+            with self.subTest(raw=raw):
+                s = Scanner.__new__(Scanner)
+                s.targets = [self._normalize(raw)]
+                s.enforce_scope = True
+                s.max_scope_distance = 4
+                self.assertTrue(
+                    s.in_scope(Event(type=EventType.DNS_NAME, data="www.example.com")),
+                    f"目标 {raw!r} 归一化成了 {s.targets[0]!r}，子域被判越界",
+                )
+
+    def test_ipv6_targets_still_survive(self) -> None:
+        """防回归：去端口的逻辑不能把 IPv6 从第一个冒号切断。"""
+        for raw in ("2606:2800:220:1::1", "[2606:2800:220:1::1]", "[::1]:8080"):
+            with self.subTest(raw=raw):
+                self.assertIn(":", self._normalize(raw), "IPv6 被腰斩了")
+        self.assertEqual(self._normalize("[::1]:8080"), "::1")
+
+    def test_degenerate_targets_are_rejected(self) -> None:
+        """归一化成空串的输入必须被拒，不能混进 ``self.targets``。
+
+        关键在于 ``[""]`` 是**真值列表**（非空）—— 所以"归一化后再过滤"
+        是唯一正确的位置：过滤原始串的话，这些输入会带着空串进扫描，
+        而 ``root_domain_of("")`` 返回 ``""``、``in_scope`` 判据是
+        ``is not None``，空串照样通过 —— **整个作用域闸门就此失效**。
+        """
+        from core.engine.preset import Preset
+        from core.engine.scanner import Scanner
+
+        for bad in (".", "*", "http://", "//", "\ufeff", "   "):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    Scanner(targets=[bad], preset=Preset(name="t", include=[]))
+
+    def test_normal_targets_are_unchanged(self) -> None:
+        """回归护栏：正常输入的行为不能被上面几处修复带偏。"""
+        s = Scanner(
+            targets=["Example.COM.", "*.a.com", "http://b.com:8080/x"],
+            preset=Preset(name="t", include=[]),
+        )
+        self.assertEqual(s.targets, ["example.com", "a.com", "b.com"])
+
+
+class TestCDNMatcherCustomPath(unittest.TestCase):
+    """``CDNMatcher(path)`` 传自定义库路径时不能崩。
+
+    潜伏 bug：``__init__`` 里用了 ``Path(path)``，但模块顶部**从没 import 过
+    ``Path``**。``from __future__ import annotations`` 只推迟**注解**的求值，
+    函数体里的 ``Path`` 是运行时查找 —— 所以无参构造（树内现有的调用方式）
+    一切正常，一旦传路径就 ``NameError``。
+    """
+
+    def test_constructing_with_a_path_works(self) -> None:
+        from core.util.cdn import CDNMatcher
+
+        m = CDNMatcher("custom_cdn.json")
+        self.assertEqual(str(m.path), "custom_cdn.json")
+
+    def test_constructing_without_a_path_still_works(self) -> None:
+        from core.util.cdn import CDNMatcher
+
+        m = CDNMatcher()
+        self.assertTrue(str(m.path).endswith("cdn_info.json"))
 
 
 class TestModuleDiscovery(unittest.TestCase):
@@ -864,8 +997,13 @@ class TestModuleDiscovery(unittest.TestCase):
                 # 那条理由不成立 —— 域的划分标准是"一类问题"，不是"一行代码"，
                 # resolve/ 与 fingerprint/ 也都是 1 个模块）。
                 # 模块名与 flags 一律没动，只是同域了。
+                # 2026-10-06：**screenshot -> page_title**。截图整块删掉（响应报文
+                # 取代了它：``http_endpoint.body``），但"静态提不到标题"这个洞留下
+                # 了 —— SPA 的 ``<title>`` 是空标签、真实标题由 JS 写入。新的
+                # ``page_title`` 只做这一件事（起浏览器读 ``document.title``，
+                # 静态标题非空时压根不跑），所以模块名和 flags 都是有意换的。
                 "web_hunter": sorted([
-                    "http_probe", "screenshot", "soft404_probe", "tls_cert",
+                    "http_probe", "page_title", "soft404_probe", "tls_cert",
                     "js_assets", "url_extract", "dir_brute", "port_scan",
                 ]),
             },
