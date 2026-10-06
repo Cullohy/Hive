@@ -210,6 +210,79 @@ class TestHttpProbeAndFingerprint(EngineTestCase):
         self.assertIn("WordPress", names)
         self.assertIn("PHP", names)
 
+    def _responder_cn(self, url: str):
+        """正文**含中文**的响应 —— 字符数与字节数必然不等。
+
+        这是 ``content_length`` 判据的关键：ASCII 页面下 ``len(text)``
+        恰好等于字节数，用它当"长度"看不出任何问题，一到中文站就全错。
+        """
+        if url.endswith("/favicon.ico"):
+            return FetchResult(url=url, status=200, text="")
+        body = (
+            "<html><head><title>中文页面</title></head>"
+            "<body>这是一个用于测试的中文页面，正文里刻意放了足够多的汉字，"
+            "好让 UTF-8 的字节数明显大于字符数。</body></html>"
+        )
+        return FetchResult(
+            url=url,
+            status=200,
+            headers={"content-type": "text/html; charset=utf-8"},
+            text=body,
+            history=[],
+            body_bytes=len(body.encode("utf-8")),
+        )
+
+    async def test_content_length_is_bytes_not_characters(self) -> None:
+        """``http_endpoint.content_length`` 必须是**字节数**。
+
+        起因是真跑 yealink 对出来的：``http_probe`` 写的是 ``len(result.text)``，
+        那是**字符数**。实测同一批页面 65506 字符 = 65536 字节、2150 字符 =
+        2170 字节 —— 于是界面上的"长度"和实际下载量对不上，而拿它判断
+        "正文有没有被截断"（``content_length > body_max``）会得出**相反**结论。
+
+        这里跑**真链路**（``run_scan`` -> 存储层），不单测辅助函数 ——
+        只测辅助函数的话，把调用点改回 ``len(result.text)`` 测试照样全绿
+        （这个坑本轮真踩过）。
+        """
+        self.add_module_file("emit_ips", EMIT_IPS)
+
+        with mock.patch.object(ConnectScanner, "scan", make_fake_scan({REAL_IP: [80]})), \
+             mock.patch.object(HTTPClient, "fetch", make_fake_fetch(self._responder_cn)), \
+             mock.patch.object(HTTPClient, "fetch_bytes", fake_fetch_bytes):
+            scanner, _ = await self.run_scan(
+                targets=["example.com"],
+                include=["emit_ips", "port_scan", "http_probe", "fingerprint"],
+                module_config={
+                    "port_scan": {"ports": "top10"},
+                    "http_probe": {"schemes": ["http"], "prefer_https": False},
+                },
+            )
+
+        endpoints = await self.storage.endpoints(scanner.scan_id)
+        self.assertEqual(len(endpoints), 1)
+        ep = endpoints[0]
+
+        got = await self.storage.response_body(scanner.scan_id, ep["url"])
+        self.assertTrue(got, "响应报文没落库")
+        # ``response_body`` 返回的是 dict（正文 + 截断标志），取正文那条
+        stored = got.get("body") if isinstance(got, dict) else got
+        self.assertTrue(stored, f"响应报文为空: {got!r}")
+        chars = len(stored)
+        octets = len(stored.encode("utf-8"))
+        self.assertGreater(
+            octets, chars,
+            "夹具没起作用：正文里必须有中文，字节数才可能大于字符数",
+        )
+        self.assertEqual(
+            ep["content_length"], octets,
+            f"content_length 记成了 {ep['content_length']}，"
+            f"字符数={chars}、字节数={octets} —— 落库成了字符数",
+        )
+        self.assertNotEqual(
+            ep["content_length"], chars,
+            "又退回 len(text) 了 —— 中文页面上这一列是错的",
+        )
+
     async def test_volatile_tags_are_not_persisted(self) -> None:
         """响应头与正文片段要传给 fingerprint, 但不能落库。"""
         self.add_module_file("emit_ips", EMIT_IPS)
@@ -567,6 +640,43 @@ class TestResolverPoolUnit(unittest.IsolatedAsyncioTestCase):
         self.assertIn("b", pool.healthy())
         # 熔断期间不会被选中
         self.assertTrue(all(pool.pick() == "b" for _ in range(4)))
+
+    async def test_inflight_reports_do_not_extend_the_ban(self) -> None:
+        """熔断之后，**在途查询**的迟到报告不得续期，也不得重复告警。
+
+        实测踩到的：``dns_brute`` 并发 200 时，几十个在途查询可能同时拿到
+        **同一个**解析器（``pick()`` 那一刻它还没熔断）。它们陆续超时回来时
+        各报一次，于是 ``streak_fail`` 一路 3→36，**每次都打一条 WARNING、
+        每次都把 ``banned_until`` 再顺延 60s** —— 那个解析器于是永远等不到
+        恢复，而日志被几百行同一条消息刷死，真信号全埋掉。
+
+        改回去（去掉 ``if stat.banned(...): return``）这两条断言都会红。
+        """
+        from core.domains.resolve._lib import resolver_pool as rp
+
+        pool = self._pool(["a"], ban_after=3, ban_seconds=60.0)
+        for _ in range(3):
+            pool.report("a", "timeout")
+        self.assertNotIn("a", pool.healthy(), "阈值内就该熔断")
+
+        banned_at = pool.stats["a"].banned_until
+
+        # 模拟 30 个在途查询陆续回来（它们都是熔断**之前**拿到这个地址的）
+        with mock.patch.object(rp.log, "warning") as warned:
+            for _ in range(30):
+                pool.report("a", "timeout")
+
+        self.assertEqual(
+            pool.stats["a"].banned_until, banned_at,
+            "熔断窗口被在途查询续期了 —— 这个解析器永远没有机会恢复",
+        )
+        self.assertEqual(
+            warned.call_count, 0,
+            f"熔断后仍在告警，共 {warned.call_count} 条 —— 日志会被刷死",
+        )
+        # 统计口径仍要如实累计（errors / timeouts 是真发生的）
+        self.assertEqual(pool.stats["a"].timeouts, 33)
+        self.assertEqual(pool.stats["a"].sent, 33)
 
     async def test_all_banned_force_unbans_one(self) -> None:
         """全部熔断时必须强行解禁，否则整批查询直接卡死。"""

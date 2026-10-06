@@ -1105,6 +1105,78 @@ class TestDirmapWordlistEndToEnd(EngineTestCase):
         self.assertFalse(row["title"])
 
 
+class TestDirBruteContentLength(EngineTestCase):
+    """``dir_brute`` 落库的 ``content_length`` 也必须是**字节数**。
+
+    与 ``http_probe`` 同一个病根，两处各写了一遍 ``len(result.text)``。
+    这里必须单独测一遍调用点：只测 ``services/http.py`` 里的辅助函数的话，
+    把 ``dir_brute`` 的调用点改回 ``len(result.text)`` 测试照样全绿
+    （本轮真踩过 —— 头两次变异验证就是被这个骗过去的）。
+    """
+
+    HOST = "http://fuzz.example.com"
+    #: 正文含足量汉字，保证 UTF-8 字节数明显大于字符数
+    CN_BODY = "配置文件泄露：数据库口令是 hunter2，务必尽快更换。" * 6
+
+    @staticmethod
+    def _resp(url, status, size, *, text="", headers=None):
+        from core.services.http import FetchResult
+
+        return FetchResult(
+            url=url, status=status, text=text or "x" * size,
+            headers=headers if headers is not None else {},
+        )
+
+    async def test_content_length_is_bytes(self) -> None:
+        from core.services.http import HTTPClient
+
+        # ⚠️ 字典文件名必须逐用例唯一：``load_path_words`` 带 lru_cache，
+        # 同名字典整个进程只读一次（见 TestZeroHitAbort 里记的坑）。
+        wl = Path(__file__).resolve().parents[1] / ".testtmp" / "dir_clen_cn.txt"
+        wl.parent.mkdir(parents=True, exist_ok=True)
+        wl.write_text("cnhit\np001\n", encoding="utf-8")
+
+        def responder(url: str):
+            if url.endswith("/cnhit"):
+                return self._resp(url, 200, 0, text=self.CN_BODY)
+            return self._resp(url, 404, 64)
+
+        def fake_fetch(client, url, **kwargs):  # noqa: ANN001
+            async def go():
+                return responder(url)
+            return go()
+
+        self.add_module_file("emit_port", EMIT_PORT)
+        with mock.patch.object(HTTPClient, "fetch", fake_fetch):
+            scanner, _ = await self.run_scan(
+                targets=["example.com"],
+                include=["emit_port", "http_probe", "dir_brute"],
+                module_config={
+                    "dir_brute": {
+                        "wordlist": str(wl), "probes": 3, "concurrency": 4, "delay": 0,
+                        "max_paths": 0, "zero_hit_abort": 0,
+                    },
+                    "http_probe": {"prefer_https": False, "schemes": ["http"]},
+                },
+            )
+
+        hit = f"{self.HOST}/cnhit"
+        rows = {r["url"]: r for r in await self.storage.endpoints(scanner.scan_id, limit=500)}
+        self.assertIn(hit, rows, f"命中没落成 http_endpoint: {sorted(rows)}")
+        row = rows[hit]
+
+        chars = len(self.CN_BODY)
+        octets = len(self.CN_BODY.encode("utf-8"))
+        self.assertGreater(
+            octets, chars, "夹具失效：正文必须有中文，字节数才可能大于字符数")
+        self.assertEqual(
+            row["content_length"], octets,
+            f"content_length={row['content_length']}，字符数={chars}、字节数={octets}"
+            " —— dir_brute 这处又落成字符数了",
+        )
+        self.assertNotEqual(row["content_length"], chars)
+
+
 class TestDirBruteQuotaUnderConcurrency(EngineTestCase):
     """``dir_brute`` 开了 3 个 worker，配额**不能**被超发。
 

@@ -452,6 +452,81 @@ class TestRequestStats(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.stats, {"requests": 1, "retries": 0, "errors": 0})
 
 
+class TestContentLength(unittest.TestCase):
+    """``content_length`` 必须是**字节数**。
+
+    起因是真跑 yealink 时对出来的：``http_probe`` 与 ``dir_brute`` 两处都写
+    ``len(result.text)``，那是解码后的**字符数**。实测同一批页面：
+
+    ==================================  =========  ==========
+    页面                字符数(旧)     字节数(真)
+    ==================================  =========  ==========
+    support.yealink.com.cn              65506      65536
+    ticket.yealink.com.cn                2150       2170
+    ams.yealink.com.cn                   1732       1740
+    ==================================  =========  ==========
+
+    中文站一页 UTF-8 HTML 里两者差几百字节，所以这一列在**所有中文页面上
+    都是错的**。界面把它当"长度"显示，而拿它判断"正文有没有被截断"
+    （``content_length > body_max``）会得出**相反**的结论。
+    """
+
+    def _result(self, text, *, header=None, body_bytes=None):
+        from core.services.http import FetchResult
+
+        headers = {"Content-Type": "text/html; charset=utf-8"}
+        if header is not None:
+            headers["Content-Length"] = header
+        raw = text.encode("utf-8")
+        return FetchResult(
+            url="http://x/", status=200, headers=headers, text=text,
+            body_bytes=len(raw) if body_bytes is None else body_bytes,
+        )
+
+    def test_prefers_the_header_when_present(self) -> None:
+        """头在就用头 —— 那是资源的**真实大小**，即使本地只读到一部分。"""
+        from core.services.http import content_length
+
+        r = self._result("短", header="999999")
+        self.assertEqual(content_length(r), 999999,
+                         "头就是权威值：本地截断了也不该改小")
+
+    def test_falls_back_to_bytes_when_chunked(self) -> None:
+        """实测 yealink 全家都是 chunked（没有这个头），这时只能用读到的字节数。"""
+        from core.services.http import content_length
+
+        r = self._result("中文页面" * 10)          # 40 字符 / 120 字节
+        self.assertEqual(len(r.text), 40)
+        self.assertEqual(content_length(r), 120, "chunked 下也得是字节数")
+
+    def test_never_returns_the_character_count(self) -> None:
+        """核心判据：含中文时结果必须 ≠ 字符数。"""
+        from core.services.http import content_length
+
+        text = "中" * 50                            # 50 字符 / 150 字节
+        r = self._result(text)
+        self.assertNotEqual(
+            content_length(r), len(text),
+            "又退回 len(text) 了 —— 中文页面上这一列是错的",
+        )
+
+    def test_last_resort_encodes_when_body_bytes_missing(self) -> None:
+        """``body_bytes`` 没填（老构造路径）也不能退回字符数。"""
+        from core.services.http import FetchResult, content_length
+
+        r = FetchResult(url="http://x/", status=200, headers={}, text="中文")
+        r.body_bytes = 0
+        self.assertEqual(content_length(r), 6)      # 2 字 × 3 字节
+
+    def test_truncated_still_reports_what_was_read(self) -> None:
+        """被截断且没有头时，这一列只能等于"读到的字节数" —— 上限由标志表达。"""
+        from core.services.http import content_length
+
+        r = self._result("x" * 65536, body_bytes=65536)
+        r.truncated = True
+        self.assertEqual(content_length(r), 65536)
+
+
 class TestProxyResolution(unittest.TestCase):
     """代理怎么定 —— 这里定错一次，整场扫描的出站就是错的。
 
