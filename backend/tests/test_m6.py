@@ -873,12 +873,20 @@ class TestScanDeleteCascade(DiffTestCase):
         )
 
     async def test_asset_group_entries_are_cleaned(self) -> None:
-        """资产分组存的是域名字面量，不引 domain.id —— 外键管不到。"""
+        """删掉被组引用的任务时，组内条目必须跟着收敛，分组本身留下。
+
+        ``asset_group_asset`` 存的是资产字面量、不引各资产表的 id，所以外键
+        管不到它；而组成员资格现在由 ``asset_group_scan`` 决定，那上面有
+        ``scan_id`` 的 CASCADE —— 关联行会自己消失，但**组内那批资产行不会**。
+
+        以前这里是按 ``domain`` / ``ip`` 两种类型逐个 DELETE（跟着资产行的
+        ``scan_id`` 反查）。范围改成"按任务"之后有两个问题：一是组内类型已经
+        有七种，枚举永远漏；二是"这条资产属于哪个组"由**被关联的任务**决定，
+        而不是资产自己那行的 ``scan_id``。现在改成删完扫描直接重算受影响的组。
+        """
         scan_id = await self._scan_with_asset()
-        gid = await self.storage.create_group(
-            name="g1", description="", scopes=["example.com"],
-        )
-        await self.storage.sync_scan_to_group(gid, scan_id)
+        gid = await self.storage.create_group(name="g1", description="")
+        await self.storage.set_group_scans(gid, [scan_id])
         before = await self._c("SELECT COUNT(*) FROM asset_group_asset")
         self.assertGreater(
             before, 0, "前提：同步确实把资产收进了组",
@@ -888,11 +896,14 @@ class TestScanDeleteCascade(DiffTestCase):
 
         self.assertEqual(
             await self._c("SELECT COUNT(*) FROM asset_group_asset"), 0,
-            f"分组里留下了 {before} 条指向已删资产的条目",
+            f"分组里留下了 {before} 条指向已删任务的条目 —— 没有任何东西会再去同步这个组",
         )
-        # 分组本身与它的范围不受影响 —— 那是长期配置，不是这次扫描的产物
+        # 分组本身与其余任务是长期配置，不该因为删任务而消失
         self.assertEqual(await self._c("SELECT COUNT(*) FROM asset_group"), 1)
-        self.assertEqual(await self._c("SELECT COUNT(*) FROM asset_group_scope"), 1)
+        self.assertEqual(
+            await self._c("SELECT COUNT(*) FROM asset_group_scan"), 0,
+            "任务关联行没被清掉 —— FK 的 CASCADE 没生效",
+        )
 
     async def test_monitor_baseline_and_change_history_are_cleaned(self) -> None:
         """``change`` / ``monitor.last_scan_id`` 是裸 BIGINT，没有外键。"""

@@ -666,7 +666,11 @@ const columns = [
   // "**响应是否正常**"，不是"这台机器活不活"。开着 3306 的数据库主机当然是活的，
   // 但它没有 Web 响应、圆点必然是灰的 —— 叫「存活」会把它说成死的。
   { title: '健康', key: 'alive', width: 60 },
-  { title: '端口', key: 'ports', width: 150 },
+  // 「开放端口」而不是「端口」：这一列折进行里的全是 port 表的记录，而
+  // port 表**只记扫到开放端口的**（closed/filtered 不入表）。叫「端口」会
+  // 让人以为列的是"这台机器理论上有哪些端口"。空值显示「—」也表示
+  // "没扫到开放端口"，与标题正好对上。
+  { title: '开放端口', key: 'ports', width: 150 },
   { title: '路径', key: 'paths', width: 70, sorter: (a, b) => (a.path_count || 0) - (b.path_count || 0) },
   { title: '标题 · 状态', key: 'title' },
   { title: '风险', key: 'risk', width: 80 },

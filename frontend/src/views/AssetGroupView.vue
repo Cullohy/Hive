@@ -34,9 +34,21 @@
             </div>
           </template>
 
+          <!-- 任务：名字优先，附资产量。列表页就要能看出"这个组由哪几次扫描构成" -->
+          <template v-else-if="column.key === 'scans'">
+            <span v-if="(record.scans || []).length" class="tk-mono tk-small">
+              {{ record.scans.slice(0, 2).map((s) => s.name || `#${s.scan_id}`).join('、')
+              }}<template v-if="record.scans.length > 2">
+                等 {{ record.scans.length }} 个</template>
+            </span>
+            <span v-else class="tk-muted">未选任务</span>
+          </template>
+
           <template v-else-if="column.key === 'counts'">
             <span class="tk-mono">
-              域名 <b>{{ record.domain_count ?? 0 }}</b> · IP <b>{{ record.ip_count ?? 0 }}</b>
+              合计 <b>{{ assetTotalOf(record) }}</b>
+              <span v-if="record.domain_count" class="tk-muted">
+                （域名 {{ record.domain_count }} · IP {{ record.ip_count || 0 }}）</span>
             </span>
           </template>
 
@@ -63,8 +75,8 @@
         </template>
         <template #emptyText>
           <div class="tk-empty">
-            还没有资产分组。新建一个，把域名 / IP 网段圈进来，之后每次扫描
-            都能把「新发现」同步进组里。
+            还没有资产分组。新建一个，勾上几个任务 —— 这些任务扫出来的资产
+            就是一个组。
           </div>
         </template>
       </a-table>
@@ -74,7 +86,7 @@
     <a-modal
       v-model:open="formOpen"
       :title="editing ? '编辑分组' : '新建分组'"
-      :width="620"
+      :width="640"
       :confirm-loading="saving"
       ok-text="保存"
       cancel-text="取消"
@@ -82,14 +94,38 @@
     >
       <a-form layout="vertical" style="margin-bottom: 0">
         <a-form-item label="分组名称">
-          <a-input v-model:value="form.name" placeholder="例如：核心业务资产" />
+          <a-input v-model:value="form.name" placeholder="例如：亿联网络（主站 + 复测）" />
         </a-form-item>
-        <a-form-item label="范围（每行一条）">
-          <a-textarea
-            v-model:value="scopeText"
-            :rows="4"
-            :placeholder="scopePlaceholder"
-          />
+        <a-form-item label="包含的任务">
+          <a-select
+            v-model:value="form.scanIds"
+            mode="multiple"
+            show-search
+            allow-clear
+            :filter-option="filterScan"
+            placeholder="选择任务（可多选）。组内资产 = 这些任务扫出资产的并集"
+            style="width: 100%"
+            :not-found-content="scans.length ? undefined : '还没有任务，先去扫一个'"
+          >
+            <a-select-option
+              v-for="s in scans"
+              :key="s.scan_id"
+              :value="s.scan_id"
+              :label="scanLabel(s)"
+            >
+              {{ scanLabel(s) }}
+              <!-- ⚠️ 用 ``domains`` 而不是 ``asset_count``：``/api/scans`` 只回
+                   domains / urls 两个现算计数，没有全类型总数。写一个不存在的
+                   字段名，下拉里就会恒显示「0 资产」—— 那是假数据。 -->
+              <span class="tk-muted opt-meta">
+                {{ (s.targets || []).join(', ') }} · 域名 {{ s.domains ?? 0 }}
+              </span>
+            </a-select-option>
+          </a-select>
+          <div class="tk-muted tk-small" style="margin-top: 6px">
+            勾几个任务就是一组。取消勾选时，**只被那个任务扫到**的资产会离组；
+            几个任务都扫到的仍然留在组里。
+          </div>
         </a-form-item>
         <a-form-item label="描述（可选）">
           <a-input v-model:value="form.description" placeholder="这个分组是干什么的" />
@@ -97,7 +133,7 @@
       </a-form>
     </a-modal>
 
-    <!-- ── 分组详情（抽屉）：范围 + 资产 + 同步 ── -->
+    <!-- ── 分组详情（抽屉）：包含的任务 + 资产 ── -->
     <a-drawer
       v-model:open="detailOpen"
       :title="current ? `${current.name} · 资产` : '分组资产'"
@@ -105,57 +141,27 @@
     >
       <a-spin :spinning="detailLoading">
         <template v-if="current">
-          <!-- 范围 -->
+          <!-- 包含的任务 -->
           <div class="section">
             <div class="section-head">
-              <span class="section-title">范围</span>
-              <a-button size="small" @click="openAddScope">
-                <PlusOutlined /> 添加范围
+              <span class="section-title">包含的任务</span>
+              <a-button size="small" @click="openEdit(current)">
+                <EditOutlined /> 调整
               </a-button>
             </div>
             <a-tag
-              v-for="s in current.scopes || []"
-              :key="s.id"
+              v-for="s in current.scans || []"
+              :key="s.scan_id"
               class="tk-mono scope-tag"
-              closable
-              @close="onDeleteScope(s)"
+              :closable="!removing"
+              @close="onRemoveScan(s)"
             >
-              {{ s.scope }}
+              {{ s.name || `#${s.scan_id}` }}
+              <span class="tk-muted tk-small"> · {{ s.asset_count ?? 0 }}</span>
             </a-tag>
-            <span v-if="!(current.scopes || []).length" class="tk-muted">
-              还没有范围。范围决定「哪些资产算这个组的」。
+            <span v-if="!(current.scans || []).length" class="tk-muted">
+              还没有勾选任务 —— 组内资产为空。
             </span>
-          </div>
-
-          <!-- 同步 -->
-          <div class="section">
-            <div class="section-head">
-              <span class="section-title">同步扫描资产</span>
-            </div>
-            <div class="sync-bar">
-              <a-select
-                v-model:value="syncScanId"
-                show-search
-                option-filter-prop="label"
-                placeholder="选择要同步的任务（按名称搜）"
-                style="min-width: 260px"
-              >
-                <a-select-option
-                  v-for="s in scans"
-                  :key="s.scan_id"
-                  :value="s.scan_id"
-                  :label="scanLabel(s)"
-                >
-                  {{ scanLabel(s) }}
-                </a-select-option>
-              </a-select>
-              <a-button type="primary" :disabled="!syncScanId" :loading="syncing" @click="onSync">
-                同步到本组
-              </a-button>
-              <span class="tk-muted sync-hint">
-                只把这次扫描「新发现」的资产记进来，已在组里的不会重复计。
-              </span>
-            </div>
           </div>
 
           <!-- 资产 -->
@@ -171,9 +177,12 @@
               />
             </div>
 
-            <a-tabs v-model:activeKey="assetTab" @change="loadAssets">
-              <a-tab-pane key="domain" :tab="`域名 (${assetCounts.domain || 0})`" />
-              <a-tab-pane key="ip" :tab="`IP (${assetCounts.ip || 0})`" />
+            <a-tabs v-model:activeKey="assetTab" @change="onTabChange">
+              <a-tab-pane
+                v-for="t in assetTabs"
+                :key="t.key"
+                :tab="`${t.label} (${assetCounts[t.key] || 0})`"
+              />
             </a-tabs>
 
             <a-table
@@ -189,16 +198,17 @@
                 total: assetTotal,
                 // ant-design-vue 4.2.6 的 `usePagination.onInternalChange` 调的是
                 // `onChange(current, pageSize)` —— **两个位置参数**，不是分页对象。
-                // 原来写成 `(p) => { assetPage = p; loadAssets() }`：单参写法在
-                // 这里恰好拿到页码数字，能用；但 pageSize 被整个丢弃，而
-                // `showSizeChanger` 又允许改页大小 —— 改了之后表格还按 20 条一页
-                // 算 offset，页大小与实际条数对不上，翻页会漏数据/重复。
                 onChange: (p, size) => { onAssetPageChange(p, size) },
               }"
             >
               <template #bodyCell="{ column, record }">
                 <template v-if="column.key === 'asset_key'">
                   <span class="tk-mono">{{ record.asset_key }}</span>
+                </template>
+                <template v-else-if="column.key === 'asset_type'">
+                  <a-tag :color="typeColor(record.asset_type)">
+                    {{ typeLabel(record.asset_type) }}
+                  </a-tag>
                 </template>
                 <template v-else-if="column.key === 'url'">
                   <span class="tk-muted tk-small">{{ record.url || '-' }}</span>
@@ -212,42 +222,40 @@
         </template>
       </a-spin>
     </a-drawer>
-
-    <!-- 添加范围 -->
-    <a-modal
-      v-model:open="scopeOpen"
-      title="添加范围"
-      :width="520"
-      ok-text="添加"
-      cancel-text="取消"
-      @ok="onAddScope"
-    >
-      <a-textarea
-        v-model:value="newScopeText"
-        :rows="3"
-        placeholder="输入域名或 CIDR 范围"
-      />
-    </a-modal>
   </div>
 </template>
 
 <script setup>
-import { PlusOutlined } from '@ant-design/icons-vue'
+import { EditOutlined, PlusOutlined } from '@ant-design/icons-vue'
 import { message } from 'ant-design-vue'
 import { computed, onMounted, reactive, ref } from 'vue'
 
 import {
-  addGroupScopes,
   createGroup,
   deleteGroup,
-  deleteGroupScope,
   getGroup,
   getGroupAssets,
   listGroups,
   listScans,
-  syncScanToGroup,
   updateGroup,
 } from '@/api'
+
+/** 资产类型 → 展示名。顺序即 tab 顺序。
+ *
+ *  ⚠️ **不要写成写死的两三个 tab。** 范围改成"按任务"之后，组内资产就是
+ *  所选任务的 scan_asset 并集，类型由任务扫出什么决定 —— 早先写死
+ *  「域名 / IP」两个 tab 的结果是：点进去是空的，tab 上的数字却非零
+ *  （counts 里有、过滤条件对不上）。
+ */
+const ASSET_TYPES = [
+  { key: 'domain', label: '域名' },
+  { key: 'ip', label: 'IP' },
+  { key: 'port', label: '端口' },
+  { key: 'url', label: 'URL' },
+  { key: 'http_endpoint', label: 'HTTP 端点' },
+  { key: 'technology', label: '技术栈' },
+  { key: 'url_path', label: '路径' },
+]
 
 // ── 分组列表 ─────────────────────────────────────────────────────────
 const groups = ref([])
@@ -261,15 +269,22 @@ const statCards = computed(() => [
     value: groups.value.reduce((n, g) => n + (g.domain_count || 0), 0),
   },
   { label: '归集 IP', value: groups.value.reduce((n, g) => n + (g.ip_count || 0), 0) },
+  { label: '归集资产', value: groups.value.reduce((n, g) => n + assetTotalOf(g), 0) },
 ])
 
 const groupColumns = [
   { title: '名称', key: 'name', width: 260 },
-  { title: '范围', dataIndex: 'scope_count', key: 'scope_count', width: 80 },
-  { title: '资产', key: 'counts', width: 200 },
+  { title: '包含的任务', key: 'scans', width: 240 },
+  { title: '资产', key: 'counts', width: 220 },
   { title: '创建时间', dataIndex: 'created_at', key: 'created_at', width: 120 },
   { title: '操作', key: 'actions', width: 180 },
 ]
+
+/** 组内资产总数。列表接口不带分类型明细，用 domain+ip 兜底显示。 */
+function assetTotalOf(g) {
+  if (typeof g.asset_count === 'number') return g.asset_count
+  return (g.domain_count || 0) + (g.ip_count || 0)
+}
 
 async function load() {
   loading.value = true
@@ -293,33 +308,31 @@ onMounted(() => {
 const formOpen = ref(false)
 const editing = ref(null)
 const saving = ref(false)
-const form = reactive({ name: '', description: '' })
-const scopeText = ref('')
-
-// 提示文案放 computed：多行三元写进模板属性会被 Vue 的 tokenizer 拆坏
-const scopePlaceholder = 'panabit.com\nexample.org'
+const form = reactive({ name: '', description: '', scanIds: [] })
 
 function openCreate() {
   editing.value = null
   form.name = ''
   form.description = ''
-  scopeText.value = ''
+  form.scanIds = []
   formOpen.value = true
 }
 
 async function openEdit(record) {
-  // 列表行不含 scopes（只有 scope_count），编辑要先取详情
+  // 列表行可能不含完整 scans，编辑前先取详情
   let full = record
-  try {
-    full = await getGroup(record.id)
-  } catch (e) {
-    message.error(e.message)
-    return
+  if (!full.scans) {
+    try {
+      full = await getGroup(record.id)
+    } catch (e) {
+      message.error(e.message)
+      return
+    }
   }
   editing.value = full
   form.name = full.name
   form.description = full.description || ''
-  scopeText.value = (full.scopes || []).map((s) => s.scope).join('\n')
+  form.scanIds = (full.scans || []).map((s) => s.scan_id)
   formOpen.value = true
 }
 
@@ -329,18 +342,26 @@ async function save() {
     message.warning('分组名称不能为空')
     return
   }
-  const scopes = scopeText.value.split('\n').map((s) => s.trim()).filter(Boolean)
   saving.value = true
   try {
     if (editing.value) {
-      await updateGroup(editing.value.id, { name, description: form.description, scopes })
+      await updateGroup(editing.value.id, {
+        name,
+        description: form.description,
+        scan_ids: form.scanIds,
+      })
       message.success('已保存')
     } else {
-      await createGroup({ name, description: form.description, scopes })
+      await createGroup({
+        name,
+        description: form.description,
+        scan_ids: form.scanIds,
+      })
       message.success('已创建')
     }
     formOpen.value = false
     await load()
+    if (detailOpen.value && current.value) await refreshDetail()
   } catch (e) {
     message.error(e.message)
   } finally {
@@ -363,27 +384,47 @@ async function onDelete(record) {
 const detailOpen = ref(false)
 const detailLoading = ref(false)
 const current = ref(null)
+const removing = ref(false)
 
 const assets = ref([])
 const assetLoading = ref(false)
 const assetCounts = ref({})
 const assetTotal = ref(0)
 const assetPage = ref(1)
-//: 页大小。**必须与 loadAssets 里发出去的 limit 同源** —— 原来 limit 在
-//: loadAssets 里硬编码 20、分页配置也写死 pageSize:20，两处各写一份，
+//: 页大小。**必须与 loadAssets 里发出去的 limit 同源** —— 两处各写一份，
 //: 一旦放开 showSizeChanger 就必然对不上（offset 按一个值算、limit 发另一个）。
 const assetPageSize = ref(20)
 const assetKeyword = ref('')
 const assetTab = ref('domain')
 
-const syncScanId = ref(null)
-const syncing = ref(false)
+const assetTabs = computed(() => {
+  const present = ASSET_TYPES.filter((t) => (assetCounts.value[t.key] || 0) > 0)
+  return present.length ? present : ASSET_TYPES.slice(0, 2)
+})
 
 const assetColumns = [
   { title: '资产', key: 'asset_key' },
+  { title: '类型', key: 'asset_type', width: 100 },
   { title: 'URL', key: 'url', ellipsis: true },
   { title: '首次归集', dataIndex: 'first_seen', key: 'first_seen', width: 180 },
 ]
+
+function typeLabel(k) {
+  return ASSET_TYPES.find((t) => t.key === k)?.label || k
+}
+
+function typeColor(k) {
+  return (
+    {
+      domain: 'blue',
+      ip: 'cyan',
+      port: 'purple',
+      url: 'green',
+      http_endpoint: 'gold',
+      technology: 'magenta',
+    }[k] || undefined
+  )
+}
 
 async function openDetail(record) {
   current.value = record
@@ -392,7 +433,7 @@ async function openDetail(record) {
   await refreshDetail()
 }
 
-/** 拉分组详情（带 scopes）并刷新资产表。 */
+/** 拉分组详情（带它包含的任务）并刷新资产表。 */
 async function refreshDetail() {
   if (!current.value) return
   detailLoading.value = true
@@ -407,6 +448,34 @@ async function refreshDetail() {
 }
 
 /**
+ * 从组里移出一个任务。
+ *
+ * 走的是「整体替换任务集合」那条路（PUT /api/groups/{id}），而不是某个
+ * 单独的删接口 —— 任务的增删就是"这个组的范围"的增删，本来就是一回事。
+ */
+async function onRemoveScan(s) {
+  if (!current.value) return
+  removing.value = true
+  try {
+    const keep = (current.value.scans || [])
+      .filter((x) => x.scan_id !== s.scan_id)
+      .map((x) => x.scan_id)
+    await updateGroup(current.value.id, {
+      name: current.value.name,
+      description: current.value.description || '',
+      scan_ids: keep,
+    })
+    message.success(`已移出「${s.name || `#${s.scan_id}`}」`)
+    await refreshDetail()
+    await load()
+  } catch (e) {
+    message.error(e.message)
+  } finally {
+    removing.value = false
+  }
+}
+
+/**
  * 分页回调。antd 传的是 `(current, pageSize)` 两个位置参数。
  *
  * **改页大小必须回到第 1 页**：vc-pagination 的 `changePageSize` 会保留
@@ -417,6 +486,12 @@ function onAssetPageChange(page, size) {
   const sizeChanged = size && size !== assetPageSize.value
   if (sizeChanged) assetPageSize.value = size
   assetPage.value = sizeChanged ? 1 : page
+  loadAssets()
+}
+
+function onTabChange(key) {
+  assetTab.value = key
+  assetPage.value = 1
   loadAssets()
 }
 
@@ -441,9 +516,9 @@ async function loadAssets() {
 }
 
 /**
- * 同步下拉里的一行：**任务名称在前** —— 它才是人挑"同步哪一次"的依据
- * （名称是必填的），后面缀上目标，因为同名任务很常见（"每月巡检"），
- * 光看名字分不出是哪一次。
+ * 任务下拉里的一行：**任务名称在前** —— 它才是人挑的依据（名称是必填的），
+ * 后面缀上目标与资产量：同名任务很常见（"每月巡检"），光看名字分不出是哪一次，
+ * 而"它带出多少资产"正是决定要不要勾进这个组的关键信息。
  */
 function scanLabel(s) {
   const name = s.name || `未命名 #${s.scan_id}`
@@ -451,60 +526,11 @@ function scanLabel(s) {
   return targets ? `${name} · ${targets}` : name
 }
 
-async function onSync() {
-  if (!syncScanId.value) return
-  syncing.value = true
-  try {
-    const res = await syncScanToGroup(current.value.id, syncScanId.value)
-    const { domain = 0, ip = 0 } = res.added
-    const picked = scans.value.find((s) => s.scan_id === syncScanId.value)
-    // 报名字而不是 scan_id：用户是照名字挑的，回执里也该是名字
-    const label = picked?.name || `#${syncScanId.value}`
-    message.success(`已把「${label}」同步进本组：新增域名 ${domain} · IP ${ip}`)
-    await refreshDetail()
-    await load()
-  } catch (e) {
-    message.error(e.message)
-  } finally {
-    syncing.value = false
-  }
-}
-
-// ── 范围增删 ─────────────────────────────────────────────────────────
-const scopeOpen = ref(false)
-const newScopeText = ref('')
-
-function openAddScope() {
-  newScopeText.value = ''
-  scopeOpen.value = true
-}
-
-async function onAddScope() {
-  const scopes = newScopeText.value.split('\n').map((s) => s.trim()).filter(Boolean)
-  if (!scopes.length) {
-    message.warning('至少需要一个范围')
-    return
-  }
-  try {
-    await addGroupScopes(current.value.id, scopes)
-    message.success('已添加')
-    scopeOpen.value = false
-    await refreshDetail()
-    await load()
-  } catch (e) {
-    message.error(e.message)
-  }
-}
-
-async function onDeleteScope(scope) {
-  try {
-    await deleteGroupScope(scope.id)
-    message.success('已删除')
-    await refreshDetail()
-    await load()
-  } catch (e) {
-    message.error(e.message)
-  }
+/** 按任务名/目标过滤。``option-filter-prop="label"`` 只认 label 里的文本。 */
+function filterScan(input, option) {
+  const kw = (input || '').toLowerCase()
+  if (!kw) return true
+  return String(option?.label || '').toLowerCase().includes(kw)
 }
 </script>
 
@@ -543,13 +569,9 @@ async function onDeleteScope(scope) {
 .scope-tag {
   margin-bottom: 6px;
 }
-.sync-bar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-.sync-hint {
-  font-size: 12px;
+.opt-meta {
+  display: block;
+  font-size: 11px;
+  line-height: 1.4;
 }
 </style>

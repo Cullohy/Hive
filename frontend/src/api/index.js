@@ -151,13 +151,12 @@ export const getGroup = (id) => http.get(`/api/groups/${id}`)
 export const createGroup = (body) => http.post('/api/groups', body)
 export const updateGroup = (id, body) => http.put(`/api/groups/${id}`, body)
 export const deleteGroup = (id) => http.delete(`/api/groups/${id}`)
-export const addGroupScopes = (id, scopes) =>
-  http.post(`/api/groups/${id}/scopes`, { scopes })
-export const deleteGroupScope = (scopeId) => http.delete(`/api/scopes/${scopeId}`)
+// 分组的"范围"就是它包含的任务（scan_ids）。改范围 = 改勾选，
+// 后端 PUT 整体替换任务集合并自动重算成员，因此这里**没有**单独的
+// "加范围 / 删范围"接口 —— 那两个对应的后端端点已随范围口径退役。
+// 留着前端封装只会得到 404，白白让人以为这条路还能走。
 export const getGroupAssets = (id, params = {}) =>
   http.get(`/api/groups/${id}/assets`, { params })
-export const syncScanToGroup = (id, scanId) =>
-  http.post(`/api/groups/${id}/sync`, { scan_id: scanId })
 
 // ── 周期监控 ─────────────────────────────────────────────────────────
 export const listMonitors = () => http.get('/api/monitors')

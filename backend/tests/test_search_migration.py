@@ -288,16 +288,23 @@ class TestSearchApiKeepsAssetsOfDeletedScans(WebTestCase):
 
 
 class TestGroupSyncAfterMigration(_RealDatabase):
-    """``sync_scan_to_group``：入组按"这次扫描看到的"，清理按资产级失效。
+    """资产分组的成员：按**被关联的任务**收敛，不是按范围逐条匹配。
 
-    分组是**跨扫描累积**的（``schema.sql``：「ARL 的资产分组核心价值恰恰是"看这次
-    监控多发现了什么"」；界面：「只把这次扫描『新发现』的资产记进来，已在组里的
-    不会重复计」）。旧写法两头都错：
+    ## 语义（2026-10-06 起）
 
-    * 入组用 ``d.scan_id = ?`` ⇒ 重扫同一目标时**一条都匹配不到**（资产行还挂在
-      第一次名下），界面提示"已同步：新增域名 0 · IP 0"；
-    * 清理用"这次扫描的存活集合之外全删" ⇒ 子查询为空时 ``NOT IN (空)`` 恒真，
-      **把整组域名删光**（同步一次没跑 http_probe 的扫描就会发生）。
+    分组的"范围"就是它包含的任务列表（``asset_group_scan``），组内资产 =
+    **这些任务扫出的资产的并集**。原先是"范围 = 主域名/网段"，再手动挑一次
+    扫描点同步 —— 两条互不相干的口径混在同一个组里，且换目标就得改范围。
+
+    这一组用例守的三条性质在新语义下**依然成立**，只是表达方式变了：
+
+    * **重扫也能归组。** 资产是跨扫描去重的，``domain`` 行上的 ``scan_id``
+      永远指向**第一次**发现它的那次扫描。所以入组绝不能按资产行的
+      ``scan_id`` 过滤 —— 必须走 ``scan_asset``（每条关联行都记着
+      "这次扫描看到了它"）。否则重扫时匹配 0 行，界面提示"新增 0 条"。
+    * **IP 同理。**
+    * **挂一个"裸扫"任务不能清空组。** 组是并集，加一个什么都不带的
+      任务不会让已有资产消失。
     """
 
     async def _scan_with(self, *, probe: bool, name: str = HOST) -> int:
@@ -318,8 +325,8 @@ class TestGroupSyncAfterMigration(_RealDatabase):
     async def test_rescan_adds_what_it_saw(self) -> None:
         """重扫（这次也探活了）必须能把它看到的资产归集进组。
 
-        旧写法下：域名行与端点行的 ``scan_id`` 都还是**第一次**那次扫描，
-        ``d.scan_id = 第二次`` 匹配 0 行 —— 于是"同步这次扫描"什么都没同步。
+        资产行的 ``scan_id`` 挂在**第一次**那次扫描上；入组走 ``scan_asset``
+        才能拿到"第二次也看到了它"这个事实。
         """
         first = await self._scan_with(probe=True)
         second = await self._scan_with(probe=True)
@@ -328,21 +335,30 @@ class TestGroupSyncAfterMigration(_RealDatabase):
         )
         self.assertEqual(int(row["scan_id"]), first, "前提：资产行挂在第一次名下")
 
-        group = await self.storage.create_group(name="重扫", scopes=["example.com"])
-        added = await self.storage.sync_scan_to_group(group, second)
-        self.assertEqual(added["domain"], 1, "重扫看到的域名没被归集进组")
-        self.assertIn(HOST, await self._keys(group))
+        group = await self.storage.create_group(name="重扫")
+        await self.storage.set_group_scans(group, [second])
+        self.assertIn(HOST, await self._keys(group), "重扫看到的域名没被归集进组")
 
-        # 幂等：同一扫描再同步一次不重复计
-        again = await self.storage.sync_scan_to_group(group, second)
-        self.assertEqual(again["domain"], 0)
+    async def test_sync_is_idempotent(self) -> None:
+        """重复同步同一个任务不能重复计。
 
-    async def test_ip_scope_branch_uses_this_scan(self) -> None:
-        """网段范围那条分支同样按"**这次扫描看到的 IP**"入组。
-
-        它以前写的是 ``i.scan_id = ?``，重扫时同样匹配 0 行；现在走
-        ``scan_asset(ip)`` + ``se.scan_id = sa.scan_id``（只吃一个参数）。
+        组内资产表按 ``(group_id, asset_type, asset_key)`` 唯一，
+        ``ON CONFLICT DO NOTHING`` 保证第二次同步是空操作 ——
+        "跨扫描累积"这个语义要求同一条资产重复同步不重复计。
         """
+        scan_id = await self._scan_with(probe=True)
+        group = await self.storage.create_group(name="幂等")
+        await self.storage.set_group_scans(group, [scan_id])
+        first = await self.storage.sync_group(group)
+        again = await self.storage.sync_group(group)
+        self.assertEqual(
+            again, first,
+            "重复同步后各类型计数变了 —— 同一资产被重复计入了",
+        )
+        self.assertGreater(sum(first.values()), 0, "前提：确实同步进了资产")
+
+    async def test_ip_branch_uses_this_scan(self) -> None:
+        """IP 同理：入组按"这次扫描看到的 IP"，不按资产行的 scan_id。"""
         async def ip_scan() -> int:
             sid = await self._scan(["203.0.113.0/24"])
             await self._project(sid, Event(
@@ -361,10 +377,59 @@ class TestGroupSyncAfterMigration(_RealDatabase):
         )
         self.assertEqual(int(row["scan_id"]), first, "前提：IP 行挂在第一次名下")
 
-        group = await self.storage.create_group(name="网段", scopes=["203.0.113.0/24"])
-        added = await self.storage.sync_scan_to_group(group, rescan)
-        self.assertEqual(added["ip"], 1, "重扫看到的 IP 没被归集进组")
-        self.assertEqual(await self._keys(group, asset_type="ip"), {"203.0.113.9"})
+        group = await self.storage.create_group(name="网段")
+        await self.storage.set_group_scans(group, [rescan])
+        self.assertEqual(
+            await self._keys(group, asset_type="ip"), {"203.0.113.9"},
+            "重扫看到的 IP 没被归集进组",
+        )
+
+    async def test_adding_a_bare_scan_does_not_wipe_the_group(self) -> None:
+        """把一个**什么都没扫到**的任务加进组，不能把已有资产清掉。
+
+        组是所选任务的**并集**：加一个空任务等于并上一个空集，原有内容不变。
+        旧实现里这条对应的是"同步一次没跑 http_probe 的扫描会把组清空"
+        （清理子查询为空、``NOT IN (空)`` 恒真）。
+        """
+        probed = await self._scan_with(probe=True)
+        bare = await self._scan_with(probe=False)
+
+        group = await self.storage.create_group(name="裸扫")
+        await self.storage.set_group_scans(group, [probed])
+        self.assertIn(HOST, await self._keys(group))
+
+        await self.storage.set_group_scans(group, [probed, bare])
+        self.assertIn(
+            HOST, await self._keys(group),
+            "加了一个裸扫任务，已有资产被清掉了 —— 并集语义被破坏",
+        )
+
+    async def test_removing_a_task_drops_only_its_exclusive_assets(self) -> None:
+        """取消勾选任务：**只**移出该任务独占的资产，共有的必须留下。"""
+        async def scan_with(name: str) -> int:
+            sid = await self._scan(["example.com"])
+            await self._project(sid, _domain_event(name))
+            await self._project(sid, _endpoint_event())
+            return sid
+
+        shared = "shared.example.com"
+        only_a = "only-a.example.com"
+        a = await scan_with(shared)
+        await self._project(a, _domain_event(only_a))
+        b = await scan_with(shared)
+
+        group = await self.storage.create_group(name="独占")
+        await self.storage.set_group_scans(group, [a, b])
+        self.assertEqual(
+            await self._keys(group), {shared, only_a},
+            "前提：两个任务并集里的域名",
+        )
+
+        await self.storage.set_group_scans(group, [b])
+        self.assertEqual(
+            await self._keys(group), {shared},
+            "取消任务 A 之后，只该移出 A 独占的 only-a，shared 必须留下",
+        )
 
     async def test_sync_without_http_probe_does_not_wipe_the_group(self) -> None:
         """同步一次**没跑 http_probe** 的扫描，不能把组里已有的域名删光。
@@ -376,23 +441,24 @@ class TestGroupSyncAfterMigration(_RealDatabase):
         probed = await self._scan_with(probe=True)
         bare = await self._scan_with(probe=False)
 
-        group = await self.storage.create_group(name="裸扫", scopes=["example.com"])
-        await self.storage.sync_scan_to_group(group, probed)
+        group = await self.storage.create_group(name="裸扫")
+        await self.storage.set_group_scans(group, [probed])
         self.assertIn(HOST, await self._keys(group))
 
-        await self.storage.sync_scan_to_group(group, bare)
+        await self.storage.set_group_scans(group, [probed, bare])
         self.assertIn(
             HOST, await self._keys(group),
             "同步一次没探活的扫描，把组里已有的域名删光了",
         )
 
     async def test_dead_assets_are_still_pruned(self) -> None:
-        """改口径之后清理**不能失效**：库里没有端点记录的组内域名要被删掉。
+        """清理**不能失效**：不再被任何所选任务覆盖的组内资产要被删掉。
 
-        （这条在旧写法下也通过 —— 它是防止"改过头"的护栏，不是回归复现。
-        新旧口径的差别只在"**什么时候**删"：资产级失效 vs 这次扫描没看到。）
+        新的清理判据是"剩余任务的 ``scan_asset`` 里都找不到它" —— 比旧的
+        "资产级失效（库里没有端点记录）"更直接：组既然是"这些任务的并集"，
+        某个任务撤了，它独占的东西就该跟着走。
         """
-        group = await self.storage.create_group(name="清理", scopes=["example.com"])
+        group = await self.storage.create_group(name="清理")
         await self.storage.conn.execute(
             "INSERT INTO asset_group_asset "
             "(group_id, asset_type, asset_key, first_seen, last_seen) "
@@ -401,12 +467,12 @@ class TestGroupSyncAfterMigration(_RealDatabase):
              "2020-01-01T00:00:00+00:00"),
         )
         probed = await self._scan_with(probe=True)
-        self.assertIn("dead.example.com", await self._keys(group))
 
-        await self.storage.sync_scan_to_group(group, probed)
+        # 只关联一个与 dead 无关的任务 -> dead 不被覆盖，应被清掉
+        await self.storage.set_group_scans(group, [probed])
         self.assertNotIn(
             "dead.example.com", await self._keys(group),
-            "库里已经没有端点记录的域名没被清理",
+            "不再被所选任务覆盖的资产还留在组里",
         )
 
 
@@ -428,9 +494,9 @@ class TestGroupAndFilterTogether(_RealDatabase):
         """造一个含 HOST 的分组，返回 group_id。"""
         scan_id = await self._scan(["example.com"])
         await self._project(scan_id, _domain_event(HOST), _endpoint_event())
-        group = await self.storage.create_group(name="g", scopes=["example.com"])
-        added = await self.storage.sync_scan_to_group(group, scan_id)
-        self.assertEqual(added["domain"], 1, "前提：HOST 真的进了组")
+        group = await self.storage.create_group(name="g")
+        res = await self.storage.set_group_scans(group, [scan_id])
+        self.assertEqual(res["counts"].get("domain"), 1, "前提：HOST 真的进了组")
         return group
 
     async def _search(self, group_id, value: str, *, op="contains", field="name"):

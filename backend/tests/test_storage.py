@@ -888,7 +888,7 @@ class TestRealDatabase(unittest.IsolatedAsyncioTestCase):
             "更新 0 行却返回 True —— 改动被静默丢弃",
         )
 
-        gid = await self.storage.create_group(name="g1", scopes=["example.com"])
+        gid = await self.storage.create_group(name="g1")
         self.assertTrue(await self.storage.update_group(gid, description="d"))
         self.assertFalse(
             await self.storage.update_group(gid + 9999, description="x"),
@@ -1647,7 +1647,7 @@ class TestGroupSyncCountsAndGlobalStats(IsolatedAsyncioTestCase):
             ),
         )
         # IP B：也在网段内，但有端点 -> 「域名范围」那段**可能**也收它
-        # （按端点 host 匹配；生产数据里 host 可能是域名也可能是 IP）
+        #（按端点 host 匹配；生产数据里 host 可能是域名也可能是 IP）
         await self.storage.project(
             self.sid,
             Event(type=EventType.DNS_NAME, data="b.example.com", module="m"),
@@ -1669,15 +1669,13 @@ class TestGroupSyncCountsAndGlobalStats(IsolatedAsyncioTestCase):
                       "status": 200},
             ),
         )
-        # 一个既有域名范围、一个既有网段范围（走公开 API，别手拼列名）
+        # 组 = 这一次扫描扫出来的资产（范围改成"按任务"后不再有手填的范围）
         now = "2026-01-01T00:00:00+00:00"
         cur = await self.storage.conn.execute(
             "INSERT INTO asset_group (name, created_at) VALUES ('g', ?)", (now,)
         )
         gid = int(cur.lastrowid)
-        await self.storage.add_group_scopes(gid, ["example.com", "10.0.0.0/8"])
-
-        result = await self.storage.sync_scan_to_group(gid, self.sid)
+        result = (await self.storage.set_group_scans(gid, [self.sid]))["counts"]
         in_group = await self.storage._fetchone(
             "SELECT COUNT(*) AS c FROM asset_group_asset "
             "WHERE group_id = ? AND asset_type = 'ip'",
@@ -1687,8 +1685,7 @@ class TestGroupSyncCountsAndGlobalStats(IsolatedAsyncioTestCase):
         self.assertGreater(stored, 0, "夹具没生效：一个 IP 都没进组")
         self.assertEqual(
             result.get("ip", 0), stored,
-            f"返回的 IP 数 {result.get('ip')} 与实际入库 {stored} 对不上 —— "
-            f"两段的贡献被互相覆盖了：{result}",
+            f"返回的 IP 数 {result.get('ip')} 与实际入库 {stored} 对不上：{result}",
         )
 
     async def test_group_sync_is_idempotent(self) -> None:
@@ -1708,14 +1705,17 @@ class TestGroupSyncCountsAndGlobalStats(IsolatedAsyncioTestCase):
             "INSERT INTO asset_group (name, created_at) VALUES ('g', ?)", (now,)
         )
         gid = int(cur.lastrowid)
-        await self.storage.add_group_scopes(gid, ["example.com", "10.0.0.0/8"])
+        await self.storage.set_group_scans(gid, [self.sid])
 
-        first = await self.storage.sync_scan_to_group(gid, self.sid)
-        second = await self.storage.sync_scan_to_group(gid, self.sid)
-        self.assertGreater(first.get("ip", 0), 0, "第一次同步就该有新增")
+        # ⚠️ 判据是"再同步一次，计数一模一样"。``sync_group`` 返回的是**当前
+        # 成员数**而不是"这次新增几条"（范围改成按任务后接口契约变了），
+        # 拿"第二次新增应为 0"去判，恒真 —— 第二次返回的仍是总数。
+        first = dict(await self.storage.sync_group(gid))
+        second = dict(await self.storage.sync_group(gid))
+        self.assertGreater(first.get("ip", 0), 0, "第一次同步就该有 IP")
         self.assertEqual(
-            second.get("ip", 0), 0,
-            f"重复同步又报新增 {second.get('ip')} 条 —— 计数没有幂等",
+            second, first,
+            f"重复同步后计数从 {first} 变成 {second} —— 同一条资产被重复计了",
         )
 
     async def _reverse_domain_summary(self, ip_id: int) -> str:
