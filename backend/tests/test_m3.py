@@ -1800,12 +1800,25 @@ class TestEnrichmentProjection(EngineTestCase):
         self.assertEqual(ips[REAL_IP]["org"], "TestOrg")
         self.assertEqual(ips[REAL_IP]["country"], "CN")
 
-        # 富化模块只被触发一次: 它自己发出的重复事件不会回头再喂给它
-        self.assertEqual(summary["stats"].get("module.enrich.ok"), 1)
+        # 富化模块**每个域名触发一次**（它们都解析到同一个 IP）。
+        #
+        # 2026-10-07 起 IP_ADDRESS 的去重键带 parent_data，所以 5 个来源域名
+        # 各得到一条事件、也就是 enrich 被调用 5 次 —— 以前是 1 次（只有第一个
+        # 域名能拿到事件）。**这不是环**：``_cache`` 按 IP 命中，后 4 次不发
+        # HTTP 请求；真正的自反馈也被去重键挡住了（enrich 重发的那条 IP_ADDRESS
+        # 与原事件同键，不会再回头喂给自己）。
+        #
+        # 所以这里断言的是"**有界**"而不是"恰好一次"：调用次数等于共用该 IP 的
+        # 域名数，与域名数成线性 —— 域名再多也不会指数增长。
+        self.assertEqual(summary["stats"].get("module.enrich.ok"), 5)
         self.assertEqual(summary["stats"].get("module.enrich.error", 0), 0)
+        self.assertLessEqual(
+            summary["stats"].get("module.enrich.ok"), 16,
+            "富化被调用了远超域名数的次数 —— 去重键没挡住自反馈，有环",
+        )
         # 扫描能返回本身就证明收敛了(没有死循环), 这里再确认事件数符合预期:
-        # SEED + 4 个 DNS_NAME + 1 个 IP = 6
-        self.assertEqual(summary["events_new"], 6)
+        # SEED + 4 个 DNS_NAME + **5 条 IP_ADDRESS（按父域名各一条）** = 10
+        self.assertEqual(summary["events_new"], 10)
 
 
 TWO_FINDINGS = """

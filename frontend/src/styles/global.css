@@ -126,6 +126,32 @@ a:hover {
   background: rgba(194, 65, 12, 0.04) !important;
 }
 
+/* 列与列之间加竖线。
+ *
+ * antd 默认只在行与行之间画线，列是"断开"的 —— 一行七八个字往横向读过去，
+ * 没有锚点，很容易把「域名 67」和右边的 URL 数看成同一格的东西。
+ *
+ * 用 `:not(:last-child)` 而不是给所有格子都加右边框：表格最右侧再补一条线，
+ * 边框就顶到容器边上了，看着像表格没画完。
+ *
+ * 只画 **body + header** 两处的右边框，不碰 `.ant-table-cell-fix-left` 那些
+ * 固定列 —— 固定列自带阴影，再叠一条线会变成双线。
+ *
+ * ⚠️ 颜色用 **rgba 不用 token**（2026-10-06）：这一列全是白底格，token 里最浅的
+ * ``--tk-border-light``(#f0f0f0 ≈ 6% 黑) 画出来仍然一眼就能看见，用户的原话是
+ * "线太明显了"。竖线在这里只是"读横向时的锚点"，不是边框，给到 4% 才够。
+ * 用 rgba 而不是新增一个 token：这是唯一一处需要比 border-light 更浅的地方，
+ * 为它开一个变量会让 ``:root`` 多一个没人用的名字。
+ */
+.ant-table-thead > tr > th:not(:last-child),
+.ant-table-tbody > tr > td:not(:last-child) {
+  border-right: 1px solid rgba(0, 0, 0, 0.04) !important;
+}
+/* 行 hover 时竖线跟着略深一点，否则底色一变线就彻底"消失"了 */
+.ant-table-tbody > tr:hover > td:not(:last-child) {
+  border-right-color: rgba(0, 0, 0, 0.09) !important;
+}
+
 .ant-pagination-item-active {
   border-color: var(--tk-accent) !important;
 }
@@ -248,75 +274,79 @@ a:hover {
  * edge-end / 各 near-range 组合），枚举必然漏，属性选择器一次盖全，
  * 且不影响普通格子（普通格子的 class 里没有 range-hover）。
  */
-.ant-picker-cell[class*='range-hover']::before,
-.ant-picker-cell[class*='range-hover']::after {
-  border: none !important;
-}
-/* today 的虚线 ::before（前一版已处理，这里作为兜底再钉一次） */
-.ant-picker-cell-today::before,
-.ant-picker-cell-today::after {
-  border: none !important;
-}
+/* ══ 选区**不做任何视觉处理**（2026-10-06，用户要求）══
+ *
+ * 之前这一段堆了十几条规则专门调颜色：深灰实心块、中灰 today 块、浅灰区间带、
+ * 悬停预览同色、虚线框……每修一版就冒出下一版（灰带乱弹 → 块断开 → today 认不出）。
+ * 根因是 antd 把选区画在**三个载体**上，而 rc-picker 的悬停预览还会在运行期
+ * 临时改写其中两个：
+ *   ① td ::before            —— 区间底色带（position:absolute 的独立矩形）
+ *   ② td > .cell-inner       —— 选中格的圆角实心块
+ *   ③ .cell-inner::after     —— 悬停预览那条 top:0/bottom:0 的带
+ *   ④ .cell-inner::before    —— today 的虚线圈 / 两端的半圆头（inset 50%）
+ * 逐个调色必然顾此失彼 —— 枚举永远追不全。
+ *
+ * 所以整块拆掉：选中 / 区间 / today / 悬停预览 / 禁用格一律回到"普通日期格"
+ * 的观感。选了哪几天，**输入框里写着**（"2026-10-08 → 2026-10-17"），
+ * 面板不必再重复表达一遍 —— 之前那堆颜色唯一真正携带的信息，就是这个。
+ *
+ * ⚠️ 下面四类载体必须**一起**清，漏一个就会在面板上漏出半截色块（缺 ② 最明显：
+ * 深色带子上浮着一排看不清的字）。清 background 用 transparent 而不是"不写"，
+ * 因为 antd 自己的规则还在，缺了就会退回它的主色橙红。
+ */
 
-/* 区间中段：底色带在 ::before 上，必须改伪元素。
- * 2026-10-06 起整块面板改灰阶（见下面选中格那条的总说明）。 */
+/* ① ④：伪元素上的带、today 虚线圈、两端半圆头 */
+.ant-picker-cell-selected::before,
 .ant-picker-cell-in-range::before,
-.ant-picker-cell-range-start:not(.ant-picker-cell-range-start-single)::before,
-.ant-picker-cell-range-end:not(.ant-picker-cell-range-end-single)::before {
-  background: var(--tk-surface-3) !important;
-}
-
-/* today：**灰色实心块**（2026-10-06）。
- *
- * 原来是 antd 那个虚线框，我们之前把它换成了实线**描边** —— 但描边在选中区里
- * 很容易和"选中"混起来：截图里 6（今天）是空心框、7-8（选中）是实心块，两个
- * 都是"打了个标记"，读起来要靠"空心 vs 实心"这个二级区别。
- *
- * 改成灰填充之后层级才分得开：
- *   深灰实心 = 已选中（--tk-text）
- *   中灰实心 = 今天      （--tk-text-secondary）
- *   浅灰      = 悬停 / 区间底色
- * 颜色本身就是"选中 / 今天"两个维度，不用再靠空心实心去分。
- *
- * ⚠️ 那些 :not() 守卫是**必须**的：antd 会给"今天且被选中"的格子同时打
- * ``today`` 与 ``selected`` 两个 class，没有守卫的话这条规则可能盖掉选中态。
- * 靠 :not() 排除掉之后，两种颜色靠 class 集合本身区分，与规则先后无关。
- */
+.ant-picker-cell-range-start::before,
+.ant-picker-cell-range-end::before,
+.ant-picker-cell-today::before,
+.ant-picker-cell-today::after,
+.ant-picker-cell-selected .ant-picker-cell-inner::before,
 .ant-picker-cell-today .ant-picker-cell-inner::before {
+  background: transparent !important;
   border: none !important;
-}
-.ant-picker-cell-today:not(.ant-picker-cell-in-range):not(.ant-picker-cell-selected):not(.ant-picker-cell-range-start):not(.ant-picker-cell-range-end) .ant-picker-cell-inner {
-  background: var(--tk-text-secondary) !important;
-  color: #fff !important;
 }
 
-/* 选区两端 + 选中格：实心**深灰** + 白字。
+/* ⚠️ ⑤ 禁用格（`disabledDate` 限定范围之外的日期）—— 这一条是 2026-10-06
+ * 补上的，之前漏了整整一版。
  *
- * ⚠️ 这里**不能只写 .ant-picker-cell-selected**。2026-10-06 实测 antd 4.2.6
- * 给区间两端打的 class 并不对称：
- *   range-start -> "ant-picker-cell-range-start ant-picker-cell-selected"
- *   range-end   -> "ant-picker-cell-range-end"            <- 没有 selected
- * 只认 selected 的话，**结束日永远是空的**，选区看起来在倒数第二天断掉
- * （用户截图里 10-06 就是个空心框）。所以两端都显式列出来。
+ * 症状是"选区起点的上方连着好几行灰带"。查 antd 源码 194-202 行：
+ *   `-disabled` → `cell-inner { background: transparent }`
+ *               → `&::before  { background: colorBgContainerDisabled }`
+ * **灰带画在 td 的 ::before 上**，而我们只清了 `.cell-inner` —— 所以看起来
+ * "清了一半"。`inner` 明明是透明的，底下还压着一条整格的 ::before。
+ *
+ * 之前一直没认出来，是因为它长得太像"选区底色带"了：同样是横贯一整行、
+ * 同样是浅灰、同样在 ::before 上。
  */
-.ant-picker-cell-selected .ant-picker-cell-inner,
-.ant-picker-cell-range-start .ant-picker-cell-inner,
-.ant-picker-cell-range-end .ant-picker-cell-inner {
-  background: var(--tk-text) !important;
-  color: #fff !important;
-}
-/* 两端格子的 ::before 只画半个格子（antd 用 inset 50% 做半圆头），
- * 给它同一个深灰，两端才是完整的实心圆角块。 */
-.ant-picker-cell-range-start:not(.ant-picker-cell-range-start-single)::before,
-.ant-picker-cell-range-end:not(.ant-picker-cell-range-end-single)::before {
-  background: var(--tk-text) !important;
-}
-/* 两端已是实心深色，today 的边框圈叠在上面是多余的 —— 整个去掉。
- * antd 的 today 选择器是 `.in-view.today .inner::before`，这里更具体，盖得住。 */
-.ant-picker-cell-range-start .ant-picker-cell-inner::before,
-.ant-picker-cell-range-end .ant-picker-cell-inner::before,
-.ant-picker-cell-selected .ant-picker-cell-inner::before {
+.ant-picker-cell-disabled::before,
+.ant-picker-cell-disabled::after {
+  background: transparent !important;
   border: none !important;
+}
+
+/* ②：选中 / 区间 / 两端 / today 的格子本体 */
+.ant-picker-cell-selected .ant-picker-cell-inner,
+.ant-picker-cell-in-range .ant-picker-cell-inner,
+.ant-picker-cell-range-start .ant-picker-cell-inner,
+.ant-picker-cell-range-end .ant-picker-cell-inner,
+.ant-picker-cell-today .ant-picker-cell-inner {
+  background: transparent !important;
+  color: inherit !important;
+  box-shadow: none !important;
+}
+
+/* ③：悬停预览。用 [class*='range-hover'] 属性选择器一次盖全 ——
+   antd 的变体有 hover / hover-start / hover-end / edge-start / edge-end
+   以及各自的 near-range 组合，逐个枚举必然漏（这一点已经栽过两次）。 */
+.ant-picker-cell[class*='range-hover']::before,
+.ant-picker-cell[class*='range-hover']::after,
+.ant-picker-cell[class*='range-hover'] .ant-picker-cell-inner::before,
+.ant-picker-cell[class*='range-hover'] .ant-picker-cell-inner::after {
+  background: transparent !important;
+  border: none !important;
+  content: none !important;
 }
 
 /* ── 悬停预览选区的虚线框（这才是「横在选区上那道橙虚线」的真正来源）──
@@ -334,8 +364,9 @@ a:hover {
  *      扫不到它 —— 我就是因此连续两次漏掉，最后是 grep antd 源码里
  *      所有 `dashed` 字面量才定位到（date-picker/style/index.js 共 8 处）。
  *
- * 精确覆盖已在上面用 [class*='range-hover'] 一次盖全，这里不再逐个枚举
- * class 名 —— 枚举必然漏（antd 有 hover/hover-start/hover-end/edge-start/
+ * 精确覆盖已在下面用 [class*='range-hover'] 一次盖全（三个载体都要管，而且
+ * **必须与真实选区同色而不是设成透明** —— 见那条规则自己的注释），这里不再
+ * 逐个枚举 class 名 —— 枚举必然漏（antd 有 hover/hover-start/hover-end/edge-start/
  * edge-end 以及各自的 near-range 组合），这是我前两版反复漏网的直接原因。
  */
 
@@ -350,16 +381,21 @@ a:hover {
   color: var(--tk-text-muted) !important;
   background: transparent !important;
 }
-/* hover：浅灰。选区两端 hover 时保持实心 + 白字（antd 默认会把端点变浅，
- * 视觉上就「松开」了）。 */
-.ant-picker-cell:hover:not(.ant-picker-cell-range-start):not(.ant-picker-cell-range-end):not(.ant-picker-cell-selected) .ant-picker-cell-inner {
-  background: var(--tk-border) !important;
-}
-.ant-picker-cell-range-start:hover .ant-picker-cell-inner,
-.ant-picker-cell-range-end:hover .ant-picker-cell-inner,
-.ant-picker-cell-selected:hover .ant-picker-cell-inner {
-  background: var(--tk-text-secondary) !important;
-  color: #fff !important;
+/* hover 也一并平掉（2026-10-06）。
+ *
+ * 选区特效拆干净之后，鼠标停在某一天上还会留下一块浅灰圆角块 —— 那是
+ * antd 的 cell hover（我们自己也覆盖过一次，用的是 --tk-border）。
+ * 用户看到的就是"怎么还有选中特效"：那个方块落在**刚选中的那一天**上，
+ * 视觉上完全没法和选中态区分开。既然面板已经不表达选区了，
+ * hover 再单独涂一块颜色只会更像"选中"。整块一起清掉。
+ *
+ * 一条 ``:hover .inner`` 盖全即可，不需要再排开 selected/in-range ——
+ * 那些状态本身已经不涂底色了。
+ */
+.ant-picker-cell:hover .ant-picker-cell-inner {
+  background: transparent !important;
+  color: inherit !important;
+  box-shadow: none !important;
 }
 .ant-picker-header,
 .ant-picker-header-view,

@@ -1931,5 +1931,512 @@ class TestMappedIpsAreFoldedIntoDomain(IsolatedAsyncioTestCase):
         )
 
 
+class TestDomainRowsCarryWorstSeverity(IsolatedAsyncioTestCase):
+    """**域名行的 severity 列**（2026-10-06 新增）。
+
+    ## 背景：这一列之前压根不存在，「风险」列是死的
+
+    资产管理页写死 ``severity = asset_type === 'findings' ? extra : null``，
+    而页面只查 ``domains,ips`` —— 于是那一列每格都是横线，库里 145 条
+    finding 一条都没露出来（真机实测：``extra`` 非空 0 行）。
+
+    ## 为什么要单开一列而不是复用 extra
+
+    ``extra`` 是"每类型特有的那一个值"：``ips`` 装**反查域名**、
+    ``technologies`` 装识别证据。前端图省事读 ``extra`` 当 severity，IP 行
+    就会把域名串显示到「风险」列里。独立一列读错的机会就没了。
+
+    ## 夹具为什么必须是"混合 severity"
+
+    真机数据里每个域名的 finding **severity 全都一样**（要么 10 条 info、
+    要么 6 条 medium），所以"取最坏"那段 ORDER BY 在真实数据上**恒等于取任意
+    一条** —— 不构造混合夹具，测了也证明不了排序是对的。下面的
+    ``test_worst_severity_wins_over_info`` 专门补这个洞。
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.storage = await make_storage()
+        self.sid = await self.storage.create_scan(
+            targets=["example.com"], preset="t"
+        )
+        for d in ("plain.example.com", "mixed.example.com", "crit.example.com"):
+            await self.storage.project(
+                self.sid, Event(type=EventType.DNS_NAME, data=d, module="m")
+            )
+
+    async def asyncTearDown(self) -> None:
+        await drop_storage(self.storage)
+
+    async def _finding(self, target: str, severity: str, kind: str = "probe") -> None:
+        await self.storage.project(
+            self.sid,
+            Event(
+                type=EventType.FINDING,
+                data=target,
+                module="m",
+                tags={"kind": kind, "severity": severity, "detail": ""},
+            ),
+        )
+
+    async def _severity_of(self, domain: str) -> object:
+        flat = await self.storage.search_flat(
+            domain, types=["domains"], limit=20, live=False
+        )
+        for r in flat["rows"]:
+            if r["asset_key"] == domain:
+                return r["severity"]
+        return "<域名行没搜到>"
+
+    async def test_domain_without_finding_has_null_severity(self) -> None:
+        """没有 finding 的域名必须是 ``None``，不是空串也不是 'info'。
+
+        空串会让前端 ``v-if="record.severity"`` 判成真、渲染出一个空标签；
+        写成 'info' 则是**凭空捏造**一条结论。
+        """
+        self.assertIsNone(
+            await self._severity_of("plain.example.com"),
+            "没有 finding 的域名不该有 severity",
+        )
+
+    async def test_severity_reaches_the_domain_row(self) -> None:
+        await self._finding("mixed.example.com", "medium")
+        self.assertEqual(
+            await self._severity_of("mixed.example.com"), "medium",
+            "域名行没拿到 severity —— 「风险」列仍然是死的",
+        )
+
+    async def test_target_with_port_and_path_is_normalised(self) -> None:
+        """``https://host:8443/a/b`` 必须归一到 ``host``。
+
+        真机实测 target 有 108 条 URL / 32 条裸域名 / 5 条 host:port，
+        其中大量带端口。不剥端口的话去重后 81 个 host 只有 18 个对得上
+        domain.name（22%），剥完 38 个 host 里对得上 26 个（68%）。
+        """
+        await self._finding("https://porty.example.com:8443/a/b", "high")
+        # 先把域名建出来
+        await self.storage.project(
+            self.sid, Event(type=EventType.DNS_NAME, data="porty.example.com", module="m")
+        )
+        self.assertEqual(
+            await self._severity_of("porty.example.com"), "high",
+            "带端口/路径的 target 没归一到裸域名 —— 命中率为 22% 的那个坑",
+        )
+
+    async def test_worst_severity_wins_over_info(self) -> None:
+        """同一域名上 info 与 high 混着时，**必须**取 high。
+
+        这条是整个改动里最容易写错的地方：按 created_at 或不排序地取
+        ``LIMIT 1``，在真机数据上（每域名 severity 都相同）照样全绿。
+        """
+        await self._finding("mixed.example.com", "info", kind="k_info")
+        await self._finding("https://mixed.example.com:443/x", "high", kind="k_high")
+        self.assertEqual(
+            await self._severity_of("mixed.example.com"), "high",
+            "info 与 high 混着时没取最坏的那条",
+        )
+
+    async def test_critical_outranks_high(self) -> None:
+        """critical > high > medium > low > info，顺序不能错。"""
+        for sev in ("info", "low", "medium", "high"):
+            await self._finding(f"crit.example.com", sev, kind=f"k_{sev}")
+        await self._finding("crit.example.com", "critical", kind="k_critical")
+        self.assertEqual(
+            await self._severity_of("crit.example.com"), "critical",
+            "critical 没有压过 high —— 排序表写错了",
+        )
+
+    async def test_ip_rows_keep_severity_null(self) -> None:
+        """**IP 行的 severity 必须是 None**，哪怕它确实挂着 finding。
+
+        IP 行的 ``extra`` 装的是**反查域名**。如果哪天有人图省事把 severity
+        也从 extra 取，这一列就会开始显示域名串 —— 这条就是那个回归的哨兵。
+        """
+        await self.storage.project(
+            self.sid,
+            Event(type=EventType.IP_ADDRESS, data="10.0.0.7", module="m"),
+        )
+        await self._finding("10.0.0.7:443", "high", kind="k_ip")
+        flat = await self.storage.search_flat(
+            "", types=["ips"], limit=20, live=False
+        )
+        for r in flat["rows"]:
+            self.assertIsNone(
+                r["severity"],
+                f"IP 行 {r['asset_key']} 的 severity 不该有值"
+                f"（extra={r['extra']!r}，那是反查域名）",
+            )
+
+    async def test_all_six_branches_emit_the_column(self) -> None:
+        """六条分支的列数必须一致 —— 少一条 UNION ALL 直接报错。
+
+        ``type=all`` 会把六条分支全拼上，是唯一能一次性验到列数对齐的入口。
+        """
+        flat = await self.storage.search_flat(
+            "", types=None, limit=200, live=False
+        )
+        self.assertTrue(flat["rows"], "夹具失效：一条行都没搜出来")
+        for r in flat["rows"]:
+            self.assertIn(
+                "severity", r,
+                f"{r['asset_type']} 分支漏了 severity 列 —— "
+                f"UNION ALL 的列数不一致",
+            )
+
+    def test_index_expression_matches_the_query(self) -> None:
+        """**索引表达式与查询表达式必须一致** —— 最阴的一种回归。
+
+        ``idx_finding_norm_host`` 是表达式索引，PG 对文本敏感：查询里那段
+        ``regexp_replace(...)`` 与索引定义差一个空格或换行，索引就**静默用不上**，
+        计划悄悄退回对 finding 全表扫。功能测试**照样全绿**，只有量性能或
+        EXPLAIN 才看得出来 —— 实测没有索引时 20,145 条 finding 要 2,622 ms，
+        建了索引是 95 ms。
+
+        所以这条不测行为、只测**两边文本对得上**：把 ``_FLAT_SEVERITY_EXPR``
+        里 domains 那段抠出来，与 schema.sql 的索引定义逐字比对（忽略空白）。
+        """
+        from core.storage.postgres import PostgresStorage as PS
+
+        expr = PS._FLAT_SEVERITY_EXPR["domains"]
+        m = re.search(r"regexp_replace\(.*?= t\.name", expr, re.S)
+        self.assertIsNotNone(m, f"没在 domains 表达式里找到 regexp_replace：{expr}")
+        query_norm = re.sub(r"\s+", "", m.group(0)).replace("=t.name", "")
+        # 查询里是 ``f.target``（子查询给 finding 起了别名 f），索引定义里是
+        # ``target``。PG 会把表达式索引的表别名归一掉，所以这是**同一个**
+        # 表达式 —— 比文本时必须先把别名剥了，否则这条测试会永远红。
+        # （别名归一这件事是 EXPLAIN 实测确认的：建索引前 Seq Scan on finding，
+        #  建索引后 SubPlan 走索引、0.013 ms/loop。）
+        query_norm = query_norm.replace("f.target", "target")
+
+        schema = (
+            Path(__file__).resolve().parents[1]
+            / "core" / "storage" / "schema.sql"
+        ).read_text(encoding="utf-8")
+        idx = re.search(
+            r"CREATE INDEX IF NOT EXISTS idx_finding_norm_host.*?;", schema, re.S
+        )
+        self.assertIsNotNone(idx, "schema.sql 里没有 idx_finding_norm_host")
+        idx_norm = re.sub(r"\s+", "", idx.group(0))
+
+        self.assertIn(
+            query_norm, idx_norm,
+            "索引表达式与查询表达式对不上 —— 索引会静默失效，"
+            "资产页在 finding 变多后从 95 ms 退化到秒级。"
+            f"\n查询: {query_norm}\n索引: {idx_norm}",
+        )
+
+
+class TestResolveStateTellsFailureFromNonexistence(IsolatedAsyncioTestCase):
+    """``domain.resolve_state`` —— **解析失败 ≠ 域名不存在**。
+
+    ## 为什么要这一列
+
+    以前这两种情况都表现为"没有 ``domain_ip`` 行"，界面上完全分不开。
+    实测 2026-10-07 现场重解析：当时判成"不存在"的 58 个域名里有 **1 个**
+    又能解析了（``ors.label-yai.yealink.com.cn`` -> 183.251.103.227）——
+    那一条其实是**查询失败被固化成了事实**。
+
+    ``dns_resolve`` 一直分得清（``no_records`` / ``unresolved_due_to_failure``），
+    但那组计数器**从来没进过 stats_json**，所以"分得清"只存在于内存里。
+
+    ## 三个结论必须保持可区分
+
+    ``ok``       解析成功      —— 进资产列表
+    ``nxdomain`` 确认没有 A 记录 —— **也进**列表（那是事实，不是故障）
+    ``failed``   解析器无应答   —— **不进**列表（那是未知，可重试）
+    ``NULL``     没查过        —— 进列表
+    """
+
+    RESOLVE_FAIL = "resolvefail.example.com"
+    NX = "nx.example.com"
+    OK1 = "ok.example.com"
+    SHARED = "shared.example.com"
+    FRESH = "fresh.example.com"
+    ALL = [RESOLVE_FAIL, NX, OK1, SHARED, FRESH]
+
+    async def asyncSetUp(self) -> None:
+        self.storage = await make_storage()
+        self.sid = await self.storage.create_scan(
+            targets=["example.com"], preset="t"
+        )
+        for d in self.ALL:
+            await self.storage.project(
+                self.sid, Event(type=EventType.DNS_NAME, data=d, module="m")
+            )
+        # 两个域名解析成功，共用同一个 IP（vhost 场景）
+        for d in (self.OK1, self.SHARED):
+            await self.storage.project(
+                self.sid,
+                Event(type=EventType.IP_ADDRESS, data="10.9.9.9", module="m",
+                      parent_data=d),
+            )
+
+    async def asyncTearDown(self) -> None:
+        await drop_storage(self.storage)
+
+    async def _finding(self, target: str, kind: str) -> None:
+        await self.storage.project(
+            self.sid,
+            Event(type=EventType.FINDING, data=target, module="m",
+                  tags={"kind": kind, "severity": "info", "detail": "x"}),
+        )
+
+    async def _state(self, name: str):
+        row = await self.storage._fetchone(
+            "SELECT resolve_state FROM domain WHERE name = ?", (name,)
+        )
+        return row["resolve_state"] if row else "<没有这一行>"
+
+    async def test_states_are_written_and_distinguishable(self) -> None:
+        await self._finding(self.RESOLVE_FAIL, "dns_resolve_failed")
+        await self._finding(self.NX, "dns_nxdomain")
+        self.assertEqual(await self._state(self.RESOLVE_FAIL), "failed")
+        self.assertEqual(await self._state(self.NX), "nxdomain")
+        self.assertEqual(await self._state(self.OK1), "ok")
+        self.assertEqual(await self._state(self.SHARED), "ok")
+        self.assertIsNone(await self._state(self.FRESH))
+
+    async def test_only_failed_is_hidden_from_the_asset_list(self) -> None:
+        """**只有 failed 被排除。** nxdomain 是事实，照样是资产。"""
+        await self._finding(self.RESOLVE_FAIL, "dns_resolve_failed")
+        await self._finding(self.NX, "dns_nxdomain")
+        flat = await self.storage.search_flat(
+            "", types=["domains"], limit=50, live=False
+        )
+        keys = {r["asset_key"] for r in flat["rows"]}
+        self.assertNotIn(
+            self.RESOLVE_FAIL, keys,
+            "解析失败的域名是**未知**不是不存在，不该占资产列表的名额",
+        )
+        for keep in (self.NX, self.OK1, self.SHARED, self.FRESH):
+            self.assertIn(keep, keys, f"{keep} 不该被排除")
+        self.assertEqual(
+            flat["total"], len(flat["rows"]),
+            "排除条件必须同时作用在计数上，否则翻页出现空洞",
+        )
+
+    async def test_ok_is_never_downgraded_to_failed(self) -> None:
+        """``ok`` 的优先级最高：解析成功过就永远是成功过。
+
+        某个域名上一轮因为解析器全挂被标成 failed，这一轮解析成功了，
+        绝不能被**同一轮里晚到的 finding** 覆盖回去。
+        """
+        await self._finding(self.RESOLVE_FAIL, "dns_resolve_failed")
+        self.assertEqual(await self._state(self.RESOLVE_FAIL), "failed")
+        await self.storage.project(
+            self.sid,
+            Event(type=EventType.IP_ADDRESS, data="10.9.9.9", module="m",
+                  parent_data=self.RESOLVE_FAIL),
+        )
+        self.assertEqual(
+            await self._state(self.RESOLVE_FAIL), "ok",
+            "解析成功后 resolve_state 没有升到 ok",
+        )
+        # 升级之后晚到的 failed finding 也盖不回去
+        await self._finding(self.RESOLVE_FAIL, "dns_resolve_failed")
+        self.assertEqual(
+            await self._state(self.RESOLVE_FAIL), "ok",
+            "已经解析成功的域名被 finding 降级回 failed 了",
+        )
+        flat = await self.storage.search_flat(
+            "", types=["domains"], limit=50, live=False
+        )
+        self.assertIn(
+            self.RESOLVE_FAIL, {r["asset_key"] for r in flat["rows"]},
+            "升级成 ok 之后仍然不在资产列表里 —— 它已经解析成功了",
+        )
+
+    async def test_excluded_domain_is_still_findable_in_detail(self) -> None:
+        """**排除了不能等于查不到。**
+
+        用户的要求：解析失败的域名不进资产列表，但要能在详情里看到并标记。
+        这条钉住"还能按名字查得到" —— 否则那批域名就是真丢了。
+        """
+        await self._finding(self.RESOLVE_FAIL, "dns_resolve_failed")
+        det = await self.storage.host_detail(self.RESOLVE_FAIL)
+        self.assertIsNotNone(det, "解析失败的域名按名字查不到 —— 数据丢了")
+        self.assertEqual(
+            det["domain"]["resolve_state"], "failed",
+            "详情里没有带上解析状态，前端没法标「解析失败」",
+        )
+
+    async def test_related_domains_uses_root_not_shared_ip(self) -> None:
+        """**必须按根域关联，不能按共享 IP。**
+
+        ``failed`` 的域名压根没有 ``domain_ip`` 行（它没解析出 IP），按 IP
+        关联时它们一条都进不来 —— 而这个区块存在的意义就是收留它们。
+        """
+        await self._finding(self.RESOLVE_FAIL, "dns_resolve_failed")
+        await self._finding(self.NX, "dns_nxdomain")
+        det = await self.storage.host_detail(self.OK1)
+        rel = {r["name"]: r for r in det["related_domains"]}
+        self.assertEqual(
+            sorted(rel), sorted(set(self.ALL) - {self.OK1}),
+            f"同根域的域名没列全：{sorted(rel)}",
+        )
+        self.assertIn(
+            self.RESOLVE_FAIL, rel,
+            "解析失败的域名没进 related_domains —— 它没有 IP，按 IP 关联不到",
+        )
+        self.assertTrue(
+            rel[self.SHARED]["same_ip"],
+            "共用同一台机器的兄弟域名没被标出来（vhost 场景的入口）",
+        )
+        self.assertFalse(rel[self.FRESH]["same_ip"])
+        self.assertEqual(
+            det["counts"]["related_domains_unresolved"], 1,
+            "未解析计数不对 —— 界面上会少报一个需要人工看的域名",
+        )
+
+    async def test_unresolved_domains_sort_first(self) -> None:
+        """failed 排最前（唯一需要人工判断的一类）。
+
+        ⚠️ 这条钉的是 ``ORDER BY`` 的 **NULL 行为**：写成
+        ``(resolve_state = 'failed') DESC`` 时，"没查过"（NULL）的行会因为
+        ``ORDER BY ... DESC`` 默认 NULL 排最前而抢到第一行。
+        """
+        await self._finding(self.RESOLVE_FAIL, "dns_resolve_failed")
+        det = await self.storage.host_detail(self.OK1)
+        names = [r["name"] for r in det["related_domains"]]
+        self.assertEqual(
+            names[0], self.RESOLVE_FAIL,
+            f"解析失败的域名没排最前，实际第一行是 {names[0]}",
+        )
+
+    async def test_ops_findings_do_not_pollute_the_risk_column(self) -> None:
+        """``dns_nxdomain`` / ``dns_resolve_failed`` 是**运维事实不是风险**。
+
+        喂进 severity 会让整个域名列表挂满灰色「信息」标签，把真正的
+        medium/high 淹掉。
+        """
+        await self._finding(self.NX, "dns_nxdomain")
+        await self._finding(self.RESOLVE_FAIL, "dns_resolve_failed")
+        flat = await self.storage.search_flat(
+            "", types=["domains"], limit=50, live=False
+        )
+        sev = {r["asset_key"]: r["severity"] for r in flat["rows"]}
+        self.assertIsNone(
+            sev.get(self.NX), "nxdomain 让「风险」列冒出了信息标签"
+        )
+        # 真有风险时仍然要显示出来
+        await self.storage.project(
+            self.sid,
+            Event(type=EventType.FINDING, data=self.NX, module="m",
+                  tags={"kind": "admin_plane", "severity": "high", "detail": "x"}),
+        )
+        flat2 = await self.storage.search_flat(
+            self.NX, types=["domains"], limit=50, live=False
+        )
+        self.assertEqual(
+            flat2["rows"][0]["severity"], "high",
+            "真风险被运维类 finding 挤掉了",
+        )
+
+
+class TestWildcardDerivedNamesAreNotAssets(IsolatedAsyncioTestCase):
+    """**泛解析造出来的幻影域名不进资产列表，也不占 vhost 探活额度。**
+
+    ## 问题长什么样
+
+    泛解析 ``*.label-yai.yealink.com.cn`` 会把**任意**名字都解析到同一台机器。
+    实测那台 ``117.28.234.46`` 上因此挂着 **21 个** ``*.label-yai.*`` ——
+    它们不是 21 个不同的子域，而是同一个泛解析区造出来的幻影。"能解析"这件事
+    毫无信息量，却有两个实际代价：
+
+    * 资产列表里全是它们（实测占 domain 表 121 行中的 23 行）
+    * ``port_scan.max_hosts_per_ip``（默认 20）的额度被**按字母序吃光**：
+      ``adm`` / ``admin`` / ``ai`` / ``alpha`` 排在真实域名 ``tech-user`` /
+      ``waf`` / ``ycrm-uat-h5`` 前面，真正值得探的反而被挡在门外（长期 7 个域名
+      探不到）。
+
+    ## 判据
+
+    父域被标记了泛解析（``is_wildcard``，由 ``wildcard_detect`` 检出后经 finding
+    回写）。真机实测：排除 23 个、全是幻影，真实域名**零误伤**。
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.storage = await make_storage()
+        self.sid = await self.storage.create_scan(
+            targets=["example.com"], preset="t")
+        # 泛解析区根域 + 三个幻影（DNS 上确实能解析，但不代表是真实子域）
+        for d in ("label", "adm.label", "admin.label", "zzz.label"):
+            await self.storage.project(
+                self.sid, Event(type=EventType.DNS_NAME, data=d + ".example.com",
+                                module="m"))
+        # 真实域名：与幻影共用同一台机器
+        for d in ("real.example.com", "other.example.com"):
+            await self.storage.project(
+                self.sid, Event(type=EventType.DNS_NAME, data=d, module="m"))
+            await self.storage.project(
+                self.sid, Event(type=EventType.IP_ADDRESS, data="93.184.216.34",
+                                module="m", parent_data=d))
+        # 标记泛解析（wildcard_detect 的回写路径）
+        await self.storage.project(
+            self.sid,
+            Event(type=EventType.FINDING, data="label.example.com", module="m",
+                  tags={"kind": "wildcard", "severity": "low", "detail": "泛解析"}))
+
+    async def asyncTearDown(self) -> None:
+        await drop_storage(self.storage)
+
+    async def _keys(self) -> set[str]:
+        flat = await self.storage.search_flat(
+            "", types=["domains"], limit=50, live=False)
+        return {r["asset_key"] for r in flat["rows"]}
+
+    async def test_phantom_names_are_excluded_from_the_asset_list(self) -> None:
+        keys = await self._keys()
+        for phantom in ("adm.label.example.com", "admin.label.example.com",
+                        "zzz.label.example.com"):
+            self.assertNotIn(
+                phantom, keys,
+                f"{phantom} 是泛解析幻影，不该出现在资产列表里",
+            )
+        self.assertIn("real.example.com", keys, "真实域名被误伤了")
+        self.assertIn("other.example.com", keys, "真实域名被误伤了")
+
+    async def test_the_wildcard_root_itself_is_kept(self) -> None:
+        """泛解析的**根域自己必须保留**。
+
+        它是个真实存在的 DNS 名字，而且**正是它那条记录标记了整个泛解析区** ——
+        把它排除掉的话，这个区会连带把自己的定义删掉，下次泛解析检测就再也标不出
+        新的一批了（实测踩过：根域被一起滤掉后，幻影还在、根域没了）。
+        """
+        self.assertIn(
+            "label.example.com", await self._keys(),
+            "泛解析根域被自己的规则滤掉了 —— 下次泛解析就再也标不出新的一批",
+        )
+
+    async def test_sibling_lookup_skips_phantoms(self) -> None:
+        """vhost 反查要跳过幻影 —— 否则额度被它们吃光。
+
+        这条钉的是第二处的 SQL：``_NOT_WILDCARD_DERIVED`` 必须与资产列表共用
+        同一份。抄成两份的话症状是「列表里没有了但还是占着探活额度」。
+        """
+        await self.storage.project(
+            self.sid,
+            Event(type=EventType.IP_ADDRESS, data="93.184.216.34", module="m",
+                  parent_data="adm.label.example.com"))
+        sibs = await self.storage.sibling_domains_on("93.184.216.34")
+        self.assertNotIn("adm.label.example.com", sibs,
+                         "幻影进了 vhost 反查结果 —— 它会吃掉 max_hosts_per_ip 的额度")
+        self.assertEqual(
+            sorted(sibs), ["other.example.com", "real.example.com"],
+            f"兄弟域名列表不对：{sibs}",
+        )
+
+    async def test_sibling_lookup_excludes_the_requested_host(self) -> None:
+        sibs = await self.storage.sibling_domains_on(
+            "93.184.216.34", exclude="real.example.com")
+        self.assertNotIn("real.example.com", sibs)
+        self.assertIn("other.example.com", sibs)
+
+    async def test_total_still_matches_rows(self) -> None:
+        """过滤条件必须同时作用在计数上，否则翻页出空洞。"""
+        flat = await self.storage.search_flat(
+            "", types=["domains"], limit=50, live=False)
+        self.assertEqual(flat["total"], len(flat["rows"]))
+
+
 if __name__ == "__main__":
     unittest.main()

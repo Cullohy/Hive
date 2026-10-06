@@ -93,19 +93,6 @@
         />
       </a-form-item>
     </a-form>
-
-    <!-- 主动/被动预告：发包之前必须让人看清楚 -->
-    <div class="mode-bar" :class="modeClass">
-      <div class="mode-main">
-        <span class="mode-tag">{{ modeText }}</span>
-        <span class="mode-desc">{{ modeHint }}</span>
-      </div>
-      <div class="mode-stats">
-        <span>启用模块 <b>{{ moduleCount }}</b></span>
-        <span>主动模块 <b>{{ activeCount }}</b></span>
-        <span>高噪声 <b>{{ loudCount }}</b></span>
-      </div>
-    </div>
   </a-modal>
 </template>
 
@@ -127,12 +114,7 @@ const name = ref('')
 const preset = ref('passive')
 const overrides = ref('')
 const presets = ref([])
-const mode = ref('unknown')
-const activeModules = ref([])
-const loudModules = ref([])
 const starting = ref(false)
-//: 启用/主动/高噪声的条数 —— 模块明细不展示了，但数字还要放在预告条上
-const enabledCount = ref(0)
 //: **会消耗 API 额度的源**（flags 含 metered）。默认一个都不勾 ——
 //: 额度不该是默认行为，要人主动选。
 const meteredModules = ref([])
@@ -145,41 +127,9 @@ const targetList = computed(() =>
 const canStart = computed(
   () => targetList.value.length > 0 && name.value.trim().length > 0 && !starting.value,
 )
-const moduleCount = computed(() => enabledCount.value + meteredChecked.value.length)
-const activeCount = computed(() => activeModules.value.length)
-const loudCount = computed(() => loudModules.value.length)
-
-//: 主动/被动**由预设决定**，不是由模块 flags 推出来的。
-//:
-//: 后端那个 flag 推导出来的 `mode` 现在对 `passive` 也会报 active ——
-//: 因为 DNS 解析 / 证书抓取确实会向目标发包，**报得没错**。但用户选的是
-//: 「预设」，不是「flags 的并集」，在这里显示成"主动模式"只会让人以为自己
-//: 选错了。flag 的真相留给下面的「主动模块 / 高噪声」两个计数去说。
-const modeText = computed(() =>
-  preset.value === 'active' ? '主动模式'
-    : preset.value === 'passive' ? '被动模式'
-      : preset.value,
-)
-const modeHint = computed(() => {
-  if (preset.value === 'active') {
-    return '会向目标发送 DNS 查询、TCP 连接与 HTTP 请求。请确认你已获得授权。'
-  }
-  if (preset.value === 'passive') {
-    return '不扫端口、不探活、不爆破；只做 DNS 解析 + PTR 反查 + 证书 SAN + 第三方源查询。'
-  }
-  return '自定义预设：以「启用模块 / 主动模块 / 高噪声」三个计数为准。'
-})
-const modeClass = computed(() =>
-  preset.value === 'active' ? 'is-active' : preset.value === 'passive' ? 'is-passive' : '',
-)
-
 async function loadPresetInfo() {
   try {
     const info = await getModules(preset.value)
-    enabledCount.value = (info.modules || []).length
-    mode.value = info.mode || 'unknown'
-    activeModules.value = info.active || []
-    loudModules.value = info.loud || []
     // 换了预设就把勾选清掉：不同预设下可选项可能不同，
     // 留着旧勾选会出现"勾了这个但当前预设根本没有它"的鬼状态。
     meteredModules.value = info.metered || []
@@ -261,43 +211,5 @@ async function start() {
 }
 .preset-desc {
   font-size: 12px;
-}
-.mode-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  flex-wrap: wrap;
-  border-radius: 6px;
-  padding: 10px 14px;
-  border: 1px solid #f0f0f0;
-  background: #fafafa;
-}
-.mode-bar.is-active {
-  border-color: #ffbb96;
-  background: #fff2e8;
-}
-.mode-bar.is-passive {
-  border-color: #adc6ff;
-  background: #f0f5ff;
-}
-.mode-main {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-.mode-tag {
-  font-weight: 600;
-}
-.mode-desc {
-  font-size: 12px;
-  color: #8c8c8c;
-}
-.mode-stats {
-  display: flex;
-  gap: 16px;
-  font-size: 12px;
-  color: #595959;
 }
 </style>

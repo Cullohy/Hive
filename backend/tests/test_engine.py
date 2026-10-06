@@ -203,7 +203,13 @@ class TestEventChain(EngineTestCase):
             targets=["example.com"], include=["chain_a", "chain_b"]
         )
 
-        self.assertEqual(summary["events_new"], 4)  # SEED + a. + b. + 10.0.0.1
+        # SEED + a. + b. + **10.0.0.1 ×2**。
+        # 2026-10-07 起 IP_ADDRESS 的去重键带上了 parent_data（见
+        # :meth:`Event.key` 与 ``TestSharedIpVhostProbing``）—— 同一个 IP 被两个
+        # 域名解析到时是两个**独立**事件，而不是一个。所以这里是 5 不是 4。
+        # 换来的东西是下面那两行：两个域名仍然都关联到这台机器，而且各自能
+        # 带着自己的 Host 往下走（端口扫描/探活）。
+        self.assertEqual(summary["events_new"], 5)
         self.assertIn("chain_a", summary["modules_enabled"])
         self.assertIn("chain_b", summary["modules_enabled"])
 
@@ -211,7 +217,8 @@ class TestEventChain(EngineTestCase):
         # 根域名自身也是一条资产, 所以是 3 条
         self.assertEqual(assets["domains"], 3)      # example.com, a., b.
         self.assertEqual(assets["ips"], 1)          # 只有一个不同的 IP
-        # 关键: IP 事件被去重了, 但两个域名都应关联到它
+        # 关键: IP 事件**按父域名**各发一条，但**投影**仍然把两个域名都关联到
+        # 同一个 IP（投影走的是扫描前的路径，不受去重键影响）
         self.assertEqual(assets["domain_ip"], 2)
 
     async def test_event_provenance_is_recorded(self) -> None:
@@ -1299,6 +1306,394 @@ class TestCleanupSurvivesRepeatedCancel(EngineTestCase):
             "cleanup", seen,
             f"模块清理没有执行：{seen} —— Chromium 会留在系统里",
         )
+
+
+class TestSharedIpVhostProbing(unittest.IsolatedAsyncioTestCase):
+    """**同一个 IP 上的每个域名都要被单独探一次活**（2026-10-07）。
+
+    ## 缺陷长什么样
+
+    共享 IP 是最常见的形态（CDN / 多租户 / 共享主机）。原先
+    ``Event.key()`` 对 IP_ADDRESS 只用 ``(type, data)``，于是 27 个域名解析
+    到同一个 IP 时，第 2..N 个事件**不会分发到模块** ——
+    ``port_scan`` 只能给"第一个"域名发 ``OPEN_TCP_PORT``，``http_probe``
+    只能用那一个 Host 头去问。
+
+    而"第一个"是谁由 **DNS 并发解析的完成顺序**决定。实测 5 次目标完全相同
+    的扫描里被探中的名字每次都不一样（partner / ycrm / partner / ticket /
+    ors）。**随机不是限流，是漏。**
+
+    ## 为什么这一块最重要
+
+    同一台机器用不同 Host 头会返回完全不同的内容 —— 可能一个是官网、
+    另一个是内部后台。只探一个名字，等于把另一个整片漏掉。
+
+    ## 成本控制
+
+    端口表**只扫一遍**（``port_scan`` 的缓存），只有 ``OPEN_TCP_PORT`` 事件
+    按域名数放大；再由 ``max_hosts_per_ip`` 给 CDN 场景封顶。
+    """
+
+    @staticmethod
+    def _mk_module(scanner_obj, config: dict | None = None):
+        """按 ``test_coerce.py`` 的路子造一个能跑的最小模块实例。"""
+        from core.domains.web_hunter.port_scan import port_scan
+        from core.util.coerce import as_bool, as_list
+        from core.util.net import EXTRA_BLOCKED_NETS, parse_ports
+
+        class _Log:
+            def __getattr__(self, _):
+                return lambda *a, **k: None
+
+        m = port_scan.__new__(port_scan)
+        m.config = config or {}
+        m.name = "port_scan"
+        m._engine = None
+        m.stats = {}
+        m.log = _Log()
+        m.allow_private = as_bool(m.cfg("allow_private", False))
+        m.blocked_nets = tuple(m.cfg("blocked_nets", EXTRA_BLOCKED_NETS) or ())
+        m.max_ips = int(m.cfg("max_ips", 0) or 0)
+        m.max_hosts_per_ip = int(m.cfg("max_hosts_per_ip", 20) or 0) or 20
+        m.ports = list(parse_ports(m.cfg("ports"), default="top100"))
+        exclude = m.cfg("exclude_ports")
+        m.exclude_ports = set()
+        for item in as_list(exclude) or ([] if exclude is None else [exclude]):
+            if item:
+                m.exclude_ports.update(parse_ports(str(item), default="top10"))
+        m.port_scanner = scanner_obj
+        m._open_ports = {}
+        m._hosts_done = {}
+        m._over_limit_reported = set()
+        m._blocked_ips = set()
+        m._ip_count = 0
+        m._blocked = {}
+        m._reported_reasons = set()
+        m._limit_reported = False
+        return m
+
+    class _FakePortScanner:
+        def __init__(self, open_ports=(80, 443)):
+            self.calls: list[str] = []
+            self.open_ports = list(open_ports)
+
+        async def scan(self, ip, ports, on_open=None):
+            self.calls.append(ip)
+            for p in self.open_ports:
+                if on_open:
+                    await on_open(p)
+            return list(self.open_ports)
+
+    @staticmethod
+    def _sink(m):
+        out: list[tuple] = []
+        finds: list[tuple] = []
+
+        async def emit_event(data, etype, *, parent=None, tags=None):
+            out.append((str(data), etype, dict(tags or {})))
+
+        async def emit_finding(kind, detail, *, parent=None,
+                               severity="info", target=None):
+            finds.append((kind, detail))
+
+        m.emit_event = emit_event
+        m.emit_finding = emit_finding
+        return out, finds
+
+    @staticmethod
+    def _ev(ip: str, parent: str):
+        from core.engine.event import Event, EventType
+        return Event(type=EventType.IP_ADDRESS, data=ip, module="m",
+                     parent_data=parent)
+
+    async def test_ip_address_key_includes_parent(self) -> None:
+        """去重键必须带 ``parent_data``，但**同一个域名仍然要去重**。"""
+        a = self._ev("1.2.3.4", "a.example.com")
+        b = self._ev("1.2.3.4", "b.example.com")
+        c = self._ev("1.2.3.4", "a.example.com")
+        self.assertNotEqual(
+            a.key(), b.key(),
+            "两个域名解析到同一个 IP，去重键却相同 —— 第二个域名的 vhost "
+            "永远探不到（这是本测试存在的原因）",
+        )
+        self.assertEqual(
+            a.key(), c.key(),
+            "同域名重复事件仍应被去重，否则同一台机器会被反复扫",
+        )
+
+    async def test_open_tcp_port_key_includes_the_domain(self) -> None:
+        """**这一条才是 vhost 枚举真正被堵住的那一环。**
+
+        端口事件的 ``data`` 是 ``f"{ip}:{port}"``，同一台机器上 N 个域名发出来
+        的 data **逐字相同**；``parent_data`` 是父事件（IP_ADDRESS）的 data，
+        也就是那个 IP，同样相同。所以去重键必须取 ``tags["domain"]``。
+
+        实测 2026-10-07：``port_scan`` 已经把 20 个兄弟域名的端口事件都补发出
+        去了、闸门也按预期触发（两条 ``vhost_probe_limited``），但那两个共享 IP
+        上仍然只有 **1 个** host 拿到端点 —— 19 个在分发前就被引擎去重掉了。
+        """
+        from core.engine.event import Event, EventType
+
+        def mk(host: str) -> Event:
+            return Event(
+                type=EventType.OPEN_TCP_PORT, data="117.28.234.46:80",
+                module="port_scan", parent_data="117.28.234.46",
+                tags={"ip": "117.28.234.46", "port": 80, "domain": host,
+                      "proto": "tcp"},
+            )
+
+        a, b, a2 = mk("a.example.com"), mk("b.example.com"), mk("a.example.com")
+        self.assertNotEqual(
+            a.key(), b.key(),
+            "同一 IP:80 上的两个域名去重键相同 —— 后一个的 vhost 探不到",
+        )
+        self.assertEqual(a.key(), a2.key(), "同域名重复仍要去重")
+
+    async def test_every_host_on_a_shared_ip_gets_probe_events(self) -> None:
+        sc = self._FakePortScanner()
+        m = self._mk_module(sc)
+        out, _ = self._sink(m)
+        domains = [f"h{i}.example.com" for i in range(5)]
+        for d in domains:
+            await m.handle_event(self._ev("1.2.3.4", d))
+        hosts = sorted({t["domain"] for _, _, t in out})
+        self.assertEqual(
+            len(sc.calls), 1,
+            f"端口表被重复扫了 {len(sc.calls)} 次 —— 共享 IP 上要白打 N 倍",
+        )
+        self.assertEqual(
+            hosts, domains,
+            f"只有 {len(hosts)}/{len(domains)} 个域名拿到了事件",
+        )
+        self.assertEqual(len(out), len(domains) * 2, "80+443 每个域名各一条")
+
+    async def test_ip_with_no_open_port_is_still_not_rescanned(self) -> None:
+        """零开放端口也要进缓存。
+
+        不进的话第二个域名来了会把整份端口清单**重扫一遍** —— 那不是"补发"，
+        是白打一轮全端口。
+        """
+        sc = self._FakePortScanner(open_ports=())
+        m = self._mk_module(sc)
+        out, _ = self._sink(m)
+        for d in ("a.example.com", "b.example.com", "c.example.com"):
+            await m.handle_event(self._ev("5.6.7.8", d))
+        self.assertEqual(len(sc.calls), 1, "零端口的 IP 被重复扫了")
+        self.assertEqual(out, [], "没有开放端口时不该发出事件")
+
+    async def test_max_hosts_per_ip_caps_and_leaves_a_trace(self) -> None:
+        """CDN 闸门：**超限要留痕**，不能静默丢。
+
+        几百个域名挂一个 IP 时，请求数 = 域名数 × 端口数 × 2，没有闸门
+        一次扫描能打出去几十万条。
+        """
+        sc = self._FakePortScanner(open_ports=(80,))
+        m = self._mk_module(sc, {"max_hosts_per_ip": 3})
+        out, finds = self._sink(m)
+        for i in range(10):
+            await m.handle_event(self._ev("9.9.9.9", f"h{i}.example.com"))
+        self.assertEqual(
+            len({t["domain"] for _, _, t in out}), 3,
+            "max_hosts_per_ip 没生效",
+        )
+        self.assertEqual(
+            [k for k, _ in finds], ["vhost_probe_limited"],
+            "超限没有留痕 —— 用户会以为那 7 个域名都被探过了",
+        )
+
+    async def test_distinct_ips_are_independent(self) -> None:
+        sc = self._FakePortScanner(open_ports=(80,))
+        m = self._mk_module(sc)
+        out, _ = self._sink(m)
+        await m.handle_event(self._ev("1.1.1.1", "x.example.com"))
+        await m.handle_event(self._ev("2.2.2.2", "y.example.com"))
+        self.assertEqual(sorted(sc.calls), ["1.1.1.1", "2.2.2.2"])
+        self.assertEqual(len(out), 2)
+
+    async def test_known_siblings_on_the_same_ip_are_also_probed(self) -> None:
+        """**老域名也要被探** —— 这是共享 IP 场景真正缺的半步。
+
+        带上 parent_data 之后，「同一次扫描里**新发现**的多个域名落到同一 IP」
+        已经有各自的端口事件了。但**早已在库的域名不会被重新解析**
+        （``dns_resolve`` 只处理 DNS_NAME 事件），拿不到 IP_ADDRESS、也就永远
+        轮不到探活。
+
+        实测 2026-10-07：``117.28.234.46`` 上 9 个真实域名，扫描日志里这台机器
+        只拿到 **1 个** domain 标签 —— ``sso`` / ``tech-user`` / ``ycrm-uat-h5``
+        这些最该探的全漏了。所以这里钉的是"**主动反查同 IP 的兄弟域名**"。
+        """
+        from core.engine.event import Event, EventType
+        from tests.pgutil import drop_storage, make_storage
+
+        storage = await make_storage()
+        try:
+            sid = await storage.create_scan(targets=["example.com"], preset="t")
+            for d in ("a.example.com", "b.example.com", "c.example.com"):
+                await storage.project(
+                    sid, Event(type=EventType.DNS_NAME, data=d, module="m"))
+            # a 与 b 共用一台机器；c 在另一台上（不该被带出来）
+            for d in ("a.example.com", "b.example.com"):
+                await storage.project(
+                    sid, Event(type=EventType.IP_ADDRESS, data="93.184.216.34",
+                                module="m", parent_data=d))
+            await storage.project(
+                sid, Event(type=EventType.IP_ADDRESS, data="93.184.216.35",
+                            module="m", parent_data="c.example.com"))
+
+            sc = self._FakePortScanner(open_ports=(80, 443))
+            m = self._mk_module(sc)
+            m._engine = type("E", (), {"storage": storage})()
+            out, _ = self._sink(m)
+
+            # 只喂 a 的事件 —— b 必须靠反查被带出来
+            await m.handle_event(self._ev("93.184.216.34", "a.example.com"))
+
+            hosts = sorted({t["domain"] for _, _, t in out})
+            self.assertEqual(
+                hosts, ["a.example.com", "b.example.com"],
+                f"同 IP 的兄弟域名没被补探：{hosts}",
+            )
+            self.assertEqual(
+                len(sc.calls), 1,
+                "反查不能触发第二次端口扫描 —— 那就是白打一轮全端口",
+            )
+            # 另一台机器上的 c 不能被带过来
+            self.assertNotIn("c.example.com", hosts)
+
+            # 重复事件不能重复发：同一域名走两条路（自身 + 反查）只发一次
+            out.clear()
+            m2 = self._mk_module(self._FakePortScanner(open_ports=(80,)))
+            m2._engine = type("E", (), {"storage": storage})()
+            out2, _ = self._sink(m2)
+            await m2.handle_event(self._ev("93.184.216.34", "a.example.com"))
+            await m2.handle_event(self._ev("93.184.216.34", "a.example.com"))
+            per_host = {}
+            for _, _, t in out2:
+                per_host[t["domain"]] = per_host.get(t["domain"], 0) + 1
+            self.assertEqual(
+                per_host.get("a.example.com"), 1,
+                f"同一个域名被发了两遍：{per_host}",
+            )
+        finally:
+            await drop_storage(storage)
+
+
+class TestCertForeignNamespace(unittest.IsolatedAsyncioTestCase):
+    """**证书签给了别的根域** —— 范围内的域名 DNS 指向了范围外的资产（2026-10-07）。
+
+    SAN 里的域外名字只是"我们不扩面过去"，那是范围纪律，安静丢掉是对的。
+    **反向**的情况不一样：范围内的 ``device.ymcs.yealink.com.cn`` 解析到某台
+    机器，而那台机器 443 上出示的证书是 ``*.ymcs.ylcloud.com`` —— 这张证书
+    压根不是为我们的命名空间签的。
+
+    实测就是这么抓到的：那两台机器上 ``*.ymcs.yealink.com.cn`` 的域名按
+    自己的名字去问没响应，因为它们只服务 ``*.ymcs.ylcloud.com``。
+    """
+
+    class _FakeScanner:
+        """只提供 ``root_domain_of``（tls_cert 用到的唯一引擎能力）。"""
+
+        def __init__(self, targets):
+            self.targets = list(targets)
+
+        def root_domain_of(self, data):
+            d = data.strip().lower().rstrip(".")
+            for t in self.targets:
+                if d == t or d.endswith("." + t):
+                    return t
+            return None
+
+    class _FakeInfo:
+        def __init__(self, cn: str = "", san=()):
+            self.common_name = cn
+            self.san = list(san)
+
+    @staticmethod
+    def _module(targets=("yealink.com.cn",)):
+        from core.domains.web_hunter.tls_cert import tls_cert
+
+        m = tls_cert.__new__(tls_cert)
+        m.config = {}
+        m.name = "tls_cert"
+        m.stats = {}
+        m.log = None
+        m._engine = TestCertForeignNamespace._FakeScanner(targets)
+        m.max_san = 100
+        m._ignored_san = 0
+        m._san_reported = False
+        return m
+
+    @staticmethod
+    def _sink(m):
+        finds = []
+
+        async def emit_finding(kind, detail, *, parent=None, severity="info",
+                               target=None):
+            finds.append((kind, detail, target))
+
+        async def emit_event(*a, **k):
+            return None
+
+        m.emit_finding = emit_finding
+        m.emit_event = emit_event
+        return finds
+
+    def _ev(self):
+        from core.engine.event import Event, EventType
+        return Event(type=EventType.OPEN_TCP_PORT, data="1.2.3.4:443",
+                     module="port_scan", tags={"ip": "1.2.3.4", "port": 443,
+                                               "domain": "device.ymcs.yealink.com.cn"})
+
+    async def test_cert_for_another_root_is_reported(self) -> None:
+        m = self._module()
+        finds = self._sink(m)
+        await m._report_foreign_cert(
+            self._ev(), "106.15.224.116", 443, "device.ymcs.yealink.com.cn",
+            self._FakeInfo("*.ymcs.ylcloud.com", ["*.ymcs.ylcloud.com",
+                                                   "ymcs.ylcloud.com"]))
+        self.assertEqual([k for k, _, _ in finds], ["cert_foreign_namespace"])
+        detail = finds[0][1]
+        self.assertIn("ymcs.ylcloud.com", detail)
+        self.assertIn("yealink.com.cn", detail)
+
+    async def test_cert_covering_our_root_is_not_reported(self) -> None:
+        """CDN 证书动辄几百个 SAN，其中总会有我们的 —— 那不是异常，别误报。"""
+        m = self._module()
+        finds = self._sink(m)
+        await m._report_foreign_cert(
+            self._ev(), "1.2.3.4", 443, "partner.yealink.com.cn",
+            self._FakeInfo("*.yealink.com.cn",
+                           ["*.yealink.com.cn", "www.qq.com", "a.b.com.cn"]))
+        self.assertEqual(finds, [], "证书里明明覆盖了我们的根域，却报了跨命名空间")
+
+    async def test_ip_sni_is_skipped(self) -> None:
+        """用 IP 做的 SNI 没有"范围"可言，不能报。"""
+        m = self._module()
+        finds = self._sink(m)
+        await m._report_foreign_cert(
+            self._ev(), "1.2.3.4", 443, "1.2.3.4",
+            self._FakeInfo("*.someone-else.com", ["*.someone-else.com"]))
+        self.assertEqual(finds, [])
+
+    async def test_no_names_means_nothing_to_compare(self) -> None:
+        m = self._module()
+        finds = self._sink(m)
+        await m._report_foreign_cert(
+            self._ev(), "1.2.3.4", 443, "x.yealink.com.cn", self._FakeInfo())
+        self.assertEqual(finds, [])
+
+    async def test_finding_targets_the_queried_domain(self) -> None:
+        """target 要是**被查的那个域名**，它才挂得到资产行上、界面上点得开。
+
+        写成证书里的域外名字（``*.ymcs.ylcloud.com``）的话，界面上会显示一个
+        不存在的资产，详情也查不到 —— 这正是资产观察类 finding 最容易犯的错。
+        """
+        m = self._module()
+        finds = self._sink(m)
+        await m._report_foreign_cert(
+            self._ev(), "106.15.224.116", 443, "device.ymcs.yealink.com.cn",
+            self._FakeInfo("*.ymcs.ylcloud.com", ["*.ymcs.ylcloud.com"]))
+        self.assertEqual(finds[0][2], "device.ymcs.yealink.com.cn")
 
 
 if __name__ == "__main__":

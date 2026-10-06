@@ -53,7 +53,7 @@
           </template>
 
           <template v-else-if="column.key === 'created_at'">
-            <span class="tk-muted">{{ (record.created_at || '').slice(0, 10) }}</span>
+            <span class="tk-muted">{{ cnDate(record.created_at) }}</span>
           </template>
 
           <template v-else-if="column.key === 'actions'">
@@ -214,7 +214,7 @@
                   <span class="tk-muted tk-small">{{ record.url || '-' }}</span>
                 </template>
                 <template v-else-if="column.key === 'first_seen'">
-                  <span class="tk-muted">{{ (record.first_seen || '').slice(0, 19).replace('T', ' ') }}</span>
+                  <span class="tk-muted">{{ cnDateTime(record.first_seen) }}</span>
                 </template>
               </template>
             </a-table>
@@ -239,6 +239,7 @@ import {
   listScans,
   updateGroup,
 } from '@/api'
+import { cnDate, cnDateTime } from '@/utils/time'
 
 /** 资产类型 → 展示名。顺序即 tab 顺序。
  *

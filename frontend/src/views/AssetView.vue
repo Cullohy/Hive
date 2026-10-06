@@ -123,6 +123,7 @@
         size="small"
         :custom-row="onRowClick"
         :pagination="false"
+        table-layout="fixed"
       >
         <template #bodyCell="{ column, record }">
           <template v-if="column.key === 'asset'">
@@ -131,16 +132,17 @@
               :href="record.asset_key"
               target="_blank"
               rel="noreferrer"
-              class="tk-mono"
+              class="tk-mono asset-main"
+              :title="record.asset_key"
             >{{ record.asset_key }}</a>
-            <span v-else class="tk-mono">{{ primaryOf(record) }}</span>
+            <span v-else class="tk-mono asset-main" :title="primaryOf(record)">{{ primaryOf(record) }}</span>
             <!-- 副标题：光有 IP / 技术名看不出这是谁的，补一行上下文 -->
             <div v-if="subtitleOf(record)" class="type-label">{{ subtitleOf(record) }}</div>
             <div v-else class="type-label">{{ assetLabel(record._type) }}</div>
           </template>
 
           <template v-else-if="column.key === 'alive'">
-            <!-- 只给一个健康标记，状态码挪到「标题 · 状态」列 ——
+            <!-- 只给一个健康标记，状态码挪到「标题 / 状态」列 ——
                  状态码放在这里等于把同一份信息显示两遍。
 
                  绿 = 响应正常（status < 400）；灰 = 其余两种完全不同的情形：
@@ -158,12 +160,15 @@
           <template v-else-if="column.key === 'ports'">
             <!-- 端口由后端折进行里（域名两跳、IP 一跳），这里只渲染。
                  全空显示「—」而不是 0：那说明这台机器没扫到端口，
-                 与"扫了但一个都没开"是两回事。 -->
-            <span v-if="portListOf(record).length" :title="portListOf(record).join(', ')">
+                 与"扫了但一个都没开"是两回事。
+
+                 ⚠️ **只显示个数**，具体端口交给 tooltip。原先还截前 3 个摆在外面
+                 （"80 443 8880 …"），一行下来最长的能把整行撑开，而且那串数字
+                 挤在列里谁也读不出重点 —— 真正要看的是"开了几个"，具体是哪些
+                 属于点开详情/悬停再看的东西。 -->
+            <a-tooltip v-if="portListOf(record).length" :title="portListOf(record).join(', ')">
               <span class="port-chip">{{ portListOf(record).length }}</span>
-              <span class="port-sample">{{ portListOf(record).slice(0, 3).join(' ') }}</span>
-              <span v-if="portListOf(record).length > 3" class="tk-muted">…</span>
-            </span>
+            </a-tooltip>
             <span v-else class="tk-muted">—</span>
           </template>
 
@@ -201,7 +206,10 @@
           </template>
 
           <template v-else-if="column.key === 'first_seen'">
-            <span class="tk-muted first-seen">{{ shortTime(record.first_seen) }}</span>
+            <!-- ⚠️ **不要 tk-muted。** 那一列现在带完整年月日（16 个字符），
+                 再叠一个 11px 的浅灰等宽字就发虚了 —— 灰色该留给"次要信息"
+                 （来源、路径数），而时间戳是这一行的身份信息之一。 -->
+            <span class="first-seen">{{ shortTime(record.first_seen) }}</span>
           </template>
 
           <template v-else-if="column.key === 'scan'">
@@ -280,6 +288,59 @@
             </div>
           </section>
 
+          <!-- 同域名空间下的其他域名。紧跟「基本信息」是因为它决定了这个域名在
+               整张攻击面里的位置 —— 哪些兄弟域名没解析出来、哪些和它共用
+               一台机器，都是一眼要看到的东西。 -->
+          <section
+            v-if="detail.related_domains && detail.related_domains.length"
+            class="d-section"
+          >
+            <h4 class="d-head">
+              同域名空间的其他域名 ({{ detail.counts.related_domains }})
+              <span
+                v-if="detail.counts.related_domains_unresolved"
+                class="d-head-warn"
+              >{{ detail.counts.related_domains_unresolved }} 个解析失败</span>
+            </h4>
+            <a-table
+              :columns="relatedDomainColumns"
+              :data-source="detail.related_domains"
+              row-key="name"
+              size="small"
+              :pagination="{ pageSize: 8, showSizeChanger: false }"
+              :custom-row="onRowClick"
+            >
+              <template #bodyCell="{ column, record }">
+                <template v-if="column.key === 'name'">
+                  <span class="tk-mono">{{ record.name }}</span>
+                  <!-- 共用同一台机器 = vhost 场景：不同 Host 头会返回不同
+                       内容，只探过其中一个就等于其余的全没看过 -->
+                  <a-tag v-if="record.same_ip" color="blue" class="same-ip-tag">
+                    同机器
+                  </a-tag>
+                </template>
+
+                <template v-else-if="column.key === 'resolve'">
+                  <a-tag v-if="record.resolve_state === 'failed'" color="orange">
+                    解析失败
+                  </a-tag>
+                  <a-tag v-else-if="record.resolve_state === 'nxdomain'" color="default">
+                    无 A 记录
+                  </a-tag>
+                  <span v-else-if="record.resolve_state === 'ok'" class="tk-resolved">
+                    正常
+                  </span>
+                  <span v-else class="tk-muted">未查询</span>
+                </template>
+
+                <template v-else-if="column.key === 'probed'">
+                  <span v-if="record.probed" class="tk-resolved">已探活</span>
+                  <span v-else class="tk-muted">—</span>
+                </template>
+              </template>
+            </a-table>
+          </section>
+
           <!-- 技术栈 -->
           <section v-if="detail.technologies.length" class="d-section">
             <h4 class="d-head">技术栈 ({{ detail.counts.technologies }})</h4>
@@ -308,7 +369,7 @@
               <a-descriptions-item v-if="primaryEndpoint?.content_length" label="长度">
                 {{ primaryEndpoint.content_length }}
               </a-descriptions-item>
-              <a-descriptions-item label="首见">
+              <a-descriptions-item label="入库时间">
                 {{ shortTime(detail.domain.first_seen) }}
               </a-descriptions-item>
             </a-descriptions>
@@ -393,6 +454,7 @@ import { useRouter } from 'vue-router'
 import dayjs from 'dayjs'
 
 import { listGroups, getHostDetail, searchAssetsFlat, listScans } from '@/api'
+import { cnDateTime } from '@/utils/time'
 
 const router = useRouter()
 
@@ -630,25 +692,27 @@ const currentGroupName = computed(
 // 之前撤过一次，症状是"请求发出、服务端 200，但 Promise 不 settle、按钮卡在
 // loading，页面被反复重建"。
 //
-// ⚠️ **当前状态：请求层已验证通过，渲染层未通过，根因仍未定位。** 别把任何
-// 猜测当结论 —— 2026-10-06 排查时推翻过两个假设（见下），都不成立。
+// ✅ **2026-10-06 已定位：不是应用 bug，是 headless 浏览器在从缓存反复重载页面。**
 //
-// 已验证成立的（服务端日志 + 接口直调为证）：
-//   · 挂载时确实发出请求、参数正确：
-//     ``GET /api/search/flat?q=&type=domains,ips&limit=50&offset=0&live=false``
-//   · 后端返回 200、响应体正常（50 行、total=219，字段齐全）
-//   · 构建产物里 ``loadPage`` 确实被 onMounted 调用且函数体逐句正确
-//     （编译成 ``Fe(()=>{Ke()...,T()})``，``T`` 就是 loadPage）
-//   · 同一次加载里 ``/api/groups`` 被调 3 次而 ``/api/search/flat`` 只有 1 次
-//     → **组件挂载了多次**，而最终活着那个实例的 loading 一直为 true
+// 判据（服务端 access log，25 秒静置、零操作）：
+//   · 收到 **5 次** `/api/search/flat` + 5 次 `/api/groups` + 大量 `/api/health`
+//   · 但**一条 `GET /assets` 文档请求都没有**，JS/CSS 也一条都没有
+//     → 文档与 bundle 全部命中缓存，只有 XHR 走网络 —— 说明是**重新加载**，
+//       不是组件被重建（重建不会重新拉文档，但会重新发 XHR，两者比例对不上）
+//   · 每个周期：AssetView 重新挂载 → loadPage() 发出 → 200 返回 → 表格还没
+//     渲染出来就被下一次重载换掉。所以「表格时有时无」「按钮一会儿转一会儿不转」
+//     「刚填的搜索词又变空」全是同一个原因。
 //
-// 已验证**不成立**的猜测（都实测过，别再重复）：
-//   1. "空关键词让 trigram 索引失效所以慢" —— 实测该查询 2ms；且 120s 的 axios
+// ❌ **已证伪、不要再去查的三个猜测**：
+//   1. "组件挂载了 3 次" —— 静置实测每个周期各请求 1 次，比例正常。
+//   2. "空关键词让 trigram 索引失效所以慢" —— 实测该查询 2ms；且 120s 的 axios
 //      超时早该触发却没触发，说明不是慢。
-//   2. "常驻的 a-drawer 打断 patch" —— 给它加 ``v-if`` 后症状完全不变。
+//   3. "常驻的 a-drawer 打断 patch" —— 给它加 ``v-if`` 后症状完全不变。
 //
-// **下次要查就从"为什么一次加载挂载 3 次"入手。** 想退回"不自动加载"的话，
-// 删掉下面那行 loadPage() 即可。
+// ⚠️ **本环境的 `wait` 会假阳性**：等 `.port-chip` / 「匹配」都在 ~200ms 返回，
+// 比一次网络往返+渲染快一个量级，**不能拿它当"表格渲染出来了"的证据**。
+// 截图/query 才是实拍。端口列的 tooltip 改用 `frontend/repro/?mode=port`
+// 单独验（那个页面没有轮询和 XHR，不受重载影响）。
 onMounted(() => {
   // 分组列表 —— 失败不该让页面不可用，搜索本身不依赖它
   listGroups()
@@ -661,20 +725,65 @@ onMounted(() => {
 })
 
 const columns = [
-  { title: '资产', key: 'asset' },
+  // 「资产」和「标题 / 状态」这两列原来**没有 width**，它们会吸收全部剩余空间。
+  // 在 antd 默认的 `table-layout: auto` 下，没写 width 的列由**内容**决定宽度，
+  // 于是同一个表在不同任务里比例会飘 —— 实测（repro 页量真实 antd 表格）：
+  //   TS1XRYVZ  资产 423px(34.5%) / 标题 392px(32.0%)
+  //   G5EMSM1K  资产 491px(40.1%) / 标题 324px(26.4%)   ← 差 5.53 个百分点
+  // （G5EMSM1K 的 asset_key 平均 45.5 字符，TS1XRYVZ 是 38.0。）
+  //
+  // 现在这两列给**百分比**，比例直接取用户指定的标准任务 TS1XRYVZ 的实测占比。
+  // 配合 `table-layout="fixed"`，浏览器先兑现下面 5 个 px 列
+  // （60+60+70+80+140 = 410），剩下的空间再按 34.53 : 32.00 分给这两列：
+  //   容器 1225 → 资产 423、标题 392（**精确复现标准任务的比例**）
+  //   容器 1005 → 资产 309、标题 286
+  //   两个任务实测偏差 0.00 百分点
+  //
+  // 为什么不直接写 px：写死 px 的总和一旦超过可用宽度就会溢出，而百分比
+  // 永远装得下。**要比例统一就别写 px** —— 比例和宽度必须解耦。
+  //
+  // 下面 5 列保持 px 不动：它们的内容是定长的（端口 chip 占 34px、
+  // 入库时间「2026-10-06 20:45」在 12px 等宽下 140px 刚好），缩小就会截字。
+  { title: '资产', key: 'asset', width: '34.53%' },
   // 「健康」而不是原来的「存活」：这一列按 ``status < 400`` 染绿，量的其实是
   // "**响应是否正常**"，不是"这台机器活不活"。开着 3306 的数据库主机当然是活的，
   // 但它没有 Web 响应、圆点必然是灰的 —— 叫「存活」会把它说成死的。
   { title: '健康', key: 'alive', width: 60 },
-  // 「开放端口」而不是「端口」：这一列折进行里的全是 port 表的记录，而
-  // port 表**只记扫到开放端口的**（closed/filtered 不入表）。叫「端口」会
-  // 让人以为列的是"这台机器理论上有哪些端口"。空值显示「—」也表示
-  // "没扫到开放端口"，与标题正好对上。
-  { title: '开放端口', key: 'ports', width: 150 },
+  // 「端口」而不是「开放端口」：这一列只有**个数**，具体端口在悬停的
+  // tooltip 里。原先标题带「开放」两个字是为了强调"这里只记真开着的"
+  // （port 表不收 closed/filtered），但现在列里根本看不到端口本身，
+  // 「开放」二字挂在个数字上反而费解。
+  //
+  // 宽 60（原 90，2026-10-06 收窄）：列里只有一个计数 chip，90 撑出来的
+  // 是空白。60 有实测依据，不是随手取的整数 ——
+  // 用 `frontend/repro/?mode=port` 渲染**真正的 a-table size="small"**
+  // （列定义与 chip 样式逐字照抄本文件）量 getBoundingClientRect：
+  //   antd colgroup → (无) | 60px | 60px | 70px | (无) | 80px | 140px
+  //   端口列 th/td 实测 = 60px（每一行都是）
+  //   chip 实测：1 位 18px、2 位 22px、3 位 28px
+  //   加单元格左右 padding 各 8（antd size="small" = tablePaddingHorizontalSmall
+  //   = sizeXS = sizeUnit 4 × (sizeStep 4 − 2) = 8，见 table/style/size.js）
+  //   → 占用 34 / 38 / 44 px，**三位数都还有 16px 余量**
+  // 表头「端口」两个汉字 14px = 28px + 16px padding = 44px，也不更高。
+  //
+  // ⚠️ antd 把列宽写进 **colgroup 的 `<col style>`**（vc-table/ColGroup.js），
+  // 不是写进 `<th>` 的行内样式。别因为"th 上没有 width"就以为列宽没生效 ——
+  // 上一版我就是这么误判的，DOM 查询返回的是光秃秃的 `<col>`，那是序列化器
+  // 省掉了 void 元素的 style，不是 antd 没写。
+  //
+  // 反过来也别加 `scroll.x`：ColGroup 是在 Table.js:394 无条件渲染的，
+  // 列宽本来就不依赖 scroll.x，加了只会平白引入横向滚动。
+  { title: '端口', key: 'ports', width: 60 },
   { title: '路径', key: 'paths', width: 70, sorter: (a, b) => (a.path_count || 0) - (b.path_count || 0) },
-  { title: '标题 · 状态', key: 'title' },
+  // 比例取自标准任务 TS1XRYVZ 的实测值 392/1225 = 32.0%，理由见上面「资产」列。
+  { title: '标题 / 状态', key: 'title', width: '32%' },
   { title: '风险', key: 'risk', width: 80 },
-  { title: '首见', key: 'first_seen', width: 110 },
+  // 「入库时间」而不是「首见」：这一列的 first_seen 记的是这条资产**被写进
+  // 资产表的那一刻**，跨任务去重之后它只会有一个值 —— 叫"首见"会让人以为是
+  // "第一次在这次扫描里看到"，而那个含义在多任务库里是不成立的。
+  // 列宽 140 = 「2026-10-06 20:45」在 **12px** 等宽字体下放得下的宽度
+  // （11px 时 130 就够，但字放大到 12px 后不够，会截成「2026-10-06 20:0」）。
+  { title: '入库时间', key: 'first_seen', width: 140 },
 ]
 
 /** 后端已 UNION 好并排好序，这里只做展示层的字段整形。
@@ -692,8 +801,14 @@ const rows = computed(() =>
       ...r,
       _type: r.asset_type,
       rowKey: `${r.asset_type}-${r.asset_key}-${i}`,
-      // findings 的 extra 列装的是 severity（见后端 _FLAT_SPECS 注释）
-      severity: r.asset_type === 'findings' ? r.extra : null,
+      // severity 是后端**独立的一列**（不是从 extra 里猜的）。
+      // 2026-10-06 之前这里是 `r.asset_type === 'findings' ? r.extra : null`，
+      // 而页面只查 domains,ips —— 于是「风险」列每一格都是横线，145 条 finding
+      // 一条都没显示出来。后端补上 severity 列后直接读它。
+      //
+      // ⚠️ **不要退回读 extra**：extra 在 ip 分支装的是**反查域名**，拿它当
+      // severity 会把域名串显示到「风险」列里。后端注释里有完整原因。
+      severity: r.severity ?? null,
     })),
 )
 
@@ -789,10 +904,17 @@ function severityColor(s) {
   return { critical: 'red', high: 'orange', medium: 'gold', low: 'blue', info: 'default' }[s] || 'default'
 }
 
-/** ISO 时间 → "09-08 19:43"（面板空间小，年份不重要） */
+/** ISO 时间 → "2026-10-06 20:45"（**北京时区**）。
+ *
+ * 原来这里是 ``String(iso).slice(5, 16).replace('T', ' ')`` —— 直接切 ISO
+ * 串，切出来的是 UTC 墙钟却当北京时间显示，整个界面慢 8 小时。
+ * 统一走 utils/time.js，三处视图共用一份，别再各切各的。
+ *
+ * ⚠️ **带年份**。原先只显示「10-06 20:45」，但这一列表是**跨所有扫描**的，
+ * 12 月和 1 月的记录会挨在一起 —— 不带年份分不出跨年，看着像同一天。
+ * 列宽已经为此从 110 放到 130。 */
 function shortTime(iso) {
-  if (!iso) return '—'
-  return String(iso).slice(5, 16).replace('T', ' ')
+  return cnDateTime(iso)
 }
 
 // ── 详情面板的派生数据 ──────────────────────────────────────────────
@@ -872,6 +994,19 @@ const pathColumns = [
   { title: '标题', dataIndex: 'title', key: 'title', ellipsis: true },
 ]
 
+// 同域名空间下的其他域名（后端 related_domains）。
+//
+// **为什么这块表在详情里而不是主列表**：主列表只放"验证过且存活"的资产，
+// 而 ``resolve_state = 'failed'`` 的域名（解析器当时全部无应答，是**不确定**
+// 而不是"不存在"）被后端排除在列表之外 —— 排除了却查不到才是真的丢了。
+// 它们在这里有唯一去处，标记列直接写「解析失败」。
+const relatedDomainColumns = [
+  { title: '域名', key: 'name' },
+  { title: '解析', key: 'resolve', width: 100 },
+  { title: '探活', key: 'probed', width: 70 },
+  { title: 'IP', dataIndex: 'ips', key: 'ips', ellipsis: true },
+]
+
 /** 点一行开详情。只有域名有详情接口 —— IP/URL 行的 host 也能查。 */
 function onRowClick(record) {
   return {
@@ -907,7 +1042,10 @@ function detailHostOf(record) {
     case 'findings': return record.host
     case 'ips': return record.host
     case 'ports': return record.host
-    default: return null
+    // 详情面板里「同域名空间的其他域名」那几行：没有 _type（它们不是
+    // 扁平表的行，是 host_detail 单独返回的），但 name 就是域名本身。
+    // 少了这一支，点那一列整行没反应 —— 看起来像表格坏了。
+    default: return record.name || null
   }
 }
 
@@ -1009,6 +1147,20 @@ function onPageChange(page, size) {
   font-size: 11px;
   color: var(--tk-muted);
   margin-top: 1px;
+}
+/* 资产名：单行省略号，**不要折行**。
+ *
+ * `table-layout: fixed` 之后列宽是定死的，内容比列宽长时只有两条路：折行或截断。
+ * 折行会让长 URL 的行高变成三行、行与行参差 —— 那比列宽漂移更难看。
+ * 所以截断，跟 `.title-cell` 用的是同一套。
+ *
+ * 完整值不丢：模板里给 `<a>`/`<span>` 都加了 `:title`，悬停能看到；
+ * `urls` 类型那行本身还是可点的新窗口链接，右侧详情面板也有完整 URL。 */
+.asset-main {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 /* 详情抽屉路径表的状态码。与资产表的 .code-chip 同源（同样避开伪粗体），
    只是这里给到 36px 最小宽度，让窄列里的 200/301/404 也齐平。 */
@@ -1160,12 +1312,18 @@ function onPageChange(page, size) {
   font-variant-numeric: tabular-nums;
   -webkit-font-smoothing: antialiased;
 }
-/* 端口：个数用强调色（一眼看出"这台开得多"），样本用等宽小字 */
+/* 端口：只有个数。强调色让"这台开得多"一眼可见；
+   具体端口在 tooltip 里，所以这里不需要等宽字体去对齐端口串。
+
+   实测宽度（repro 页量真实渲染）：1 位 18px、2 位 22px、3 位 28px。
+   真实数据里端口最多的是 13 个（两位数），三位数只在压力测试里出现过。 */
 .port-chip {
   display: inline-block;
   min-width: 18px;
   padding: 0 5px;
-  margin-right: 6px;
+  /* margin-right 已删（2026-10-06）：它是 `.port-sample` 的遗留 —— 那个元素
+     已经删了，chip 后面再没有任何兄弟节点，这个 margin 现在纯粹是死空白，
+     而它恰好落在"这一列要收窄"的位置上。 */
   border-radius: 8px;
   color: #fff;
   background: var(--tk-accent);
@@ -1175,15 +1333,28 @@ function onPageChange(page, size) {
   text-align: center;
   font-variant-numeric: tabular-nums;
 }
-.port-sample {
-  color: var(--tk-text-sub);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 11px;
-}
+/* `.port-sample` 已删 —— 端口串搬进 tooltip 之后，列里不再有第二个元素。 */
 .risk-tag { font-size: 11px; }
-.first-seen { font-size: 11px; font-family: var(--tk-mono, monospace); }
+/* 入库时间：12px（不是 11px）+ 正常字色。等宽是为了让一列时间上下对齐，
+   好扫读"哪几行是同一次扫描进来的"。 */
+.first-seen {
+  font-size: 12px;
+  font-family: var(--tk-mono, monospace);
+  color: var(--tk-text);
+  font-variant-numeric: tabular-nums;
+}
 
 /* ── 详情抽屉 ── */
+/* 同域名空间表：解析状态那一列是这张表的重点，标签要显眼。 */
+.d-head-warn {
+  margin-left: 8px;
+  color: #c2410c;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.same-ip-tag { margin-left: 6px; font-size: 11px; }
+.tk-resolved { color: var(--tk-text-muted); font-size: 12px; }
 .detail-title { font-size: 15px; font-weight: 600; }
 .d-section { margin-bottom: 20px; }
 .d-head {
@@ -1201,7 +1372,7 @@ function onPageChange(page, size) {
   flex-wrap: wrap;
   margin-bottom: 8px;
 }
-/* 存活列的小圆点 —— 只表达"活着/没活着"，具体状态码在「标题 · 状态」列 */
+/* 存活列的小圆点 —— 只表达"活着/没活着"，具体状态码在「标题 / 状态」列 */
 .alive-dot {
   display: inline-block;
   width: 8px;
@@ -1228,6 +1399,12 @@ function onPageChange(page, size) {
 .finding-item {
   display: flex;
   gap: 8px;
+  /* ⚠️ **必须写 flex-start。** flex 的 align-items 默认是 ``stretch``，
+   * 于是「中危」那个 a-tag（inline-block）会被拉满整行高度 —— 左边挂一个
+   * 竖长条、右边五六行字，看着像布局坏了。
+   * 发现条目的正文长度差别很大（有的两行、有的五行），所以两侧都不该
+   * 跟着对方的高度走。 */
+  align-items: flex-start;
   padding: 8px 0;
   border-bottom: 1px solid var(--tk-border);
 }

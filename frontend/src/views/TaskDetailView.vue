@@ -151,6 +151,9 @@
                 <template v-else-if="column.key === 'source'">
                   <span class="tk-muted">{{ record.source }}</span>
                 </template>
+                <template v-else-if="column.key === 'last_seen'">
+                  <span class="tk-muted">{{ cnDateTime(record.last_seen) }}</span>
+                </template>
               </template>
             </a-table>
           </a-tab-pane>
@@ -220,6 +223,9 @@
                   <a-tag v-if="record.is_wildcard" color="red">泛解析</a-tag>
                   <a-tag v-if="record.is_cdn" color="purple">CDN</a-tag>
                   <a-tag v-if="record.is_cloud" color="cyan">云</a-tag>
+                </template>
+                <template v-else-if="column.key === 'last_seen'">
+                  <span class="tk-muted">{{ cnDateTime(record.last_seen) }}</span>
                 </template>
               </template>
             </a-table>
@@ -703,6 +709,7 @@ import {
   getResponseBody,
   stopScan,
 } from '@/api'
+import { cnDateTime } from '@/utils/time'
 import { openProgressStream } from '@/api/stream'
 
 const route = useRoute()
