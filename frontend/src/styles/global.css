@@ -209,6 +209,36 @@ a:hover {
  *      （用户第二次贴图说「还是好丑，你看看这个虚线」）。
  * ──────────────────────────────────────────────────────────────────── */
 
+/* ══ 兜底：悬停预览选区**不允许出现任何虚线** ══
+ *
+ * 放在最前面**故意如此** —— 它靠特异性（0,1,0 + 伪元素）低于下面那些
+ * 精确规则（0,2,0 及以上），所以即使同文件里在后面，两者也不打架。
+ *
+ * 为什么需要兜底：antd 在 date-picker 里用 dashed 画了**不止一处**（源码
+ * `es/date-picker/style/index.js` 里 grep 到 8 处），载体有 ::before/::after、
+ * 触发条件有 today / range-hover / edge-start / edge-end，而且**只在鼠标
+ * 悬停时**才出现。我前两版都是「枚举一部分 class 覆盖」，连着漏了两次
+ * （先漏 today 的 ::before，再漏 range-hover 的 ::after）。
+ *
+ * ⚠️ 这里**只能用 border:none，不能用 border-style:solid** ——
+ *    solid 会让原本 border-width:0 的元素也显形出边框，整个面板变成一堆
+ *    黑框（试过，很丑）。none 是「本来就什么都没有」的语义，天然安全。
+ *
+ * 用 [class*="range-hover"] 属性选择器而不是逐个枚举 class 名：
+ * antd 的变体很多（hover / hover-start / hover-end / edge-start /
+ * edge-end / 各 near-range 组合），枚举必然漏，属性选择器一次盖全，
+ * 且不影响普通格子（普通格子的 class 里没有 range-hover）。
+ */
+.ant-picker-cell[class*='range-hover']::before,
+.ant-picker-cell[class*='range-hover']::after {
+  border: none !important;
+}
+/* today 的虚线 ::before（前一版已处理，这里作为兜底再钉一次） */
+.ant-picker-cell-today::before,
+.ant-picker-cell-today::after {
+  border: none !important;
+}
+
 /* 区间中段：底色带在 ::before 上，必须改伪元素。 */
 .ant-picker-cell-in-range::before,
 .ant-picker-cell-range-start:not(.ant-picker-cell-range-start-single)::before,
@@ -253,6 +283,26 @@ a:hover {
 .ant-picker-cell-selected .ant-picker-cell-inner::before {
   border: none !important;
 }
+
+/* ── 悬停预览选区的虚线框（这才是「横在选区上那道橙虚线」的真正来源）──
+ *
+ * antd 画它用的是 **::after**，四条边全是 dashed：
+ *   borderTop / borderBottom                     —— 上下两条横线
+ *   borderInlineStart（Edge start）/ borderInlineEnd（Edge end） —— 左右两条竖线
+ * 合起来是一个虚线矩形，颜色 ``pickerDateHoverRangeBorderColor``（跟随主色，
+ * 所以看起来是橙红）。
+ *
+ * ⚠️ 两个关键点（我前两次都漏了）：
+ *   1. 载体是 **::after**，不是 ::before。前面那几条 today/两端规则全打在
+ *      ::before 上，对它一点用都没有。
+ *   2. 只在**鼠标悬停**时出现（class 名带 ``range-hover``）。静态扫 DOM
+ *      扫不到它 —— 我就是因此连续两次漏掉，最后是 grep antd 源码里
+ *      所有 `dashed` 字面量才定位到（date-picker/style/index.js 共 8 处）。
+ *
+ * 精确覆盖已在上面用 [class*='range-hover'] 一次盖全，这里不再逐个枚举
+ * class 名 —— 枚举必然漏（antd 有 hover/hover-start/hover-end/edge-start/
+ * edge-end 以及各自的 near-range 组合），这是我前两版反复漏网的直接原因。
+ */
 
 /* 非本月/非本年的占位格（上一月尾、下月头）：淡灰无底色。
  * 必须排开选区相关 class —— 跨面板时左面板里也会画出 10-01..10-06 那几格，
