@@ -385,6 +385,46 @@ class TestSeedAsset(unittest.TestCase):
             f"IPv6 没被完整识别: {events}",
         )
 
+    def test_cidr_seed_becomes_many_ip_addresses(self) -> None:
+        """**网段目标 = ARL 的「任务目标支持 IP 段」。**
+
+        用户明确下发一个段，等于**明确授权了这个段** —— 比"从域名自动推归属段"
+        干净得多，后者是我们替用户做授权决定，而我们只能拦内网（``scan_allowed``），
+        拦不住公网上的第三方。
+        """
+        events = self._run("93.184.216.0/29")
+        ips = {d for t, d in events if t == "IP_ADDRESS"}
+        self.assertEqual(
+            ips,
+            {f"93.184.216.{i}" for i in range(1, 7)},
+            f"/29 应产出 .1~.6 六个地址: {sorted(ips)}",
+        )
+
+    def test_network_and_broadcast_are_not_scanned(self) -> None:
+        """``.0`` / ``.255`` 不是主机，对它们扫端口纯属浪费。
+
+        2026-10-07 之前 CIDR 被当成裸 IP 时，扫的正是 ``.0``，还在 domain 表里
+        造出一条 IP 冒充域名的垃圾行。
+        """
+        ips = {d for t, d in self._run("93.184.216.0/24") if t == "IP_ADDRESS"}
+        self.assertNotIn("93.184.216.0", ips, "网络地址不该被扫")
+        self.assertNotIn("93.184.216.255", ips, "广播地址不该被扫")
+        self.assertIn("93.184.216.1", ips)
+
+    # ⚠️ 「大网段截断」「IPv6 网段拒绝」**不在这里**。
+    #
+    # 本类的每条用例都走一次完整 ``Scanner.scan()``：目标进事件总线 → 落库 →
+    # 投影 → ``key()`` 去重。而这两条各要发 1024 个 ``IP_ADDRESS``（大网段）或
+    # 拒掉一个 2^96 的段，单跑就把本类拖到 **900 秒以上**，把变异验证本身都
+    # 跑到超时 —— 于是「测试抓不住」和「环境太慢」长得一模一样，分不清。
+    #
+    # 所以它们在 ``test_netblock_seed.py::TestSeedNetblockUnit``：直接调
+    # ``handle_event``、``emit_event`` 换成收集器，断言的是**同一份代码**，
+    # 只是不付那 1000 个事件的代价。
+    #
+    # 这里**不留** ``assertTrue(True)`` 的占位用例 —— 它会顶着和真用例一模一样的
+    # 名字出现在测试报告里，让人以为已经覆盖了。
+
 
 class TestTargetNormalization(unittest.TestCase):
     """种子目标的归一化。
@@ -413,6 +453,33 @@ class TestTargetNormalization(unittest.TestCase):
         self.assertEqual(self._norm(addr), addr)
         self.assertEqual(self._norm(f"[{addr}]:8443"), addr)
         self.assertEqual(self._norm("[::1]"), "::1")
+
+    def test_cidr_mask_survives(self) -> None:
+        """**CIDR 的斜杠是掩码，不是 URL 路径。**
+
+        原来这里是无条件 ``.split("/")[0]``，于是 ``117.28.234.0/24`` 被砍成
+        ``117.28.234.0`` —— 网段目标**静默降级成一个 IP**，接下来按"一台主机"
+        扫的是**网络地址 .0**，``ip_ptr`` 还会对它做 PTR 反查，最后在 ``domain``
+        表里多出一条 IP 冒充域名的垃圾行。
+
+        最坏的点：它**看起来是成功的** —— 任务 finished、资产数不为零，与"用户
+        真填了个裸 IP"完全无法区分。
+        """
+        for raw in ("117.28.234.0/24", "10.0.0.0/8", "1.2.3.4/32",
+                    "2001:db8::/32"):
+            self.assertEqual(
+                self._norm(raw), raw,
+                f"CIDR 目标 {raw!r} 的掩码被砍掉了 —— 会退化成扫单个 IP",
+            )
+
+    def test_path_is_still_stripped(self) -> None:
+        """加了 CIDR 判断**不能**把砍路径的能力弄丢。"""
+        for raw, want in (
+            ("example.com/path", "example.com"),
+            ("https://example.com/a/b?x=1", "example.com"),
+            ("example.com/", "example.com"),
+        ):
+            self.assertEqual(self._norm(raw), want)
 
 
 class TestJsAssets(unittest.TestCase):

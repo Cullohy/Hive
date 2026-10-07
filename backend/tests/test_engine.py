@@ -353,6 +353,413 @@ class TestModuleLifecycle(EngineTestCase):
         self.assertEqual(scanner.modules["once"].calls, 2)
 
 
+FAKE_DNS = """
+    from core.engine.event import EventType
+    from core.engine.module import BaseModule
+
+
+    class fakedns(BaseModule):
+        # 站 dns_resolve 的位置。**接 DNS_NAME 而不是 SEED**，和真实模块一样 ——
+        # `parent=event` 里的 event 是**收到的**那个事件，所以 parent_data 才是域名。
+        #
+        # ⚠️ 别写成 `parent = await self.emit_event(...)`：**emit_event 不返回
+        # 事件对象**（返回 None），那样 parent_data 会是空的，归属证据就没了，
+        # 而链路的其余部分看起来一切正常 —— 正是最难查的那类静默失效。
+        watched_events = (EventType.DNS_NAME,)
+        produced_events = (EventType.IP_ADDRESS)
+        flags = ("passive", "safe")
+
+        async def handle_event(self, event):
+            for octet in (1, 2):
+                await self.emit_event(
+                    f"93.184.216.{octet}", EventType.IP_ADDRESS, parent=event
+                )
+
+
+    class emitname(BaseModule):
+        watched_events = (EventType.SEED,)
+        produced_events = (EventType.DNS_NAME,)
+        flags = ("passive", "safe")
+
+        async def handle_event(self, event):
+            await self.emit_event(event.data, EventType.DNS_NAME, parent=event)
+
+
+    class recorder(BaseModule):
+        # 扮演下游消费者（port_scan / http_probe 都是订阅 IP_ADDRESS 的）
+        watched_events = (EventType.IP_ADDRESS,)
+        produced_events = ()
+        flags = ("passive", "safe")
+
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.seen = []
+
+        async def handle_event(self, event):
+            self.seen.append(event.data)
+"""
+
+
+class TestNetblockExpandChain(EngineTestCase):
+    """C 段展开在**真实引擎**里跑通：IP_ADDRESS → 展开 → 下游拿到地址。
+
+    单测（``test_netblock_expand.py``）断言的是同一份代码，但 ``emit_event``
+    被换成了收集器 —— 它证明不了"产出的事件真的走到了下一个环节"。
+
+    这里用 ``/29`` 而不是 ``/24``：链路完全一样，只是 6 个地址而不是 254 个，
+    快到能放进常规回归。
+    """
+
+    async def test_expanded_addresses_reach_downstream(self) -> None:
+        self.add_module_file("chainmods", FAKE_DNS)
+        scanner, _ = await self.run_scan(
+            targets=["example.com"],
+            include=["emitname", "fakedns", "netblock_expand", "recorder"],
+            module_config={"netblock_expand": {"prefixlen": 29}},
+        )
+        seen = set(scanner.modules["recorder"].seen)
+        expanded = scanner.modules["netblock_expand"]
+        self.assertEqual(
+            expanded.stats.get("expanded"), 1,
+            "两台归属证据同段，应该展开一次",
+        )
+        # 断言的是**集合相等**：展开会连同原来那 2 台一起重发，所以下游看到的是
+        # 完整的 6 台。**别先减掉原来的 2 台再比** —— 它们也在集合里，减完只剩
+        # 4 台，与期望的 6 台一比就报"少了 2 个"，看起来像"没送到下游"。
+        self.assertEqual(
+            seen,
+            {f"93.184.216.{i}" for i in range(1, 7)},
+            f"下游没拿到展开出来的地址: {sorted(seen)}",
+        )
+        self.assertIn(
+            "netblock_expanded",
+            # ``scanner.findings`` 是 **Event 列表**不是 dict 列表 —— kind 在
+            # tags 里。写成 ``f["kind"]`` 会 TypeError。
+            [f.tags.get("kind") for f in scanner.findings],
+            "展开没有留痕",
+        )
+
+    async def test_single_host_segment_is_not_expanded(self) -> None:
+        """同一条链，但只给 1 台归属证据 —— 下游只看到原来那 1 个地址。"""
+        self.add_module_file("chainmods", FAKE_DNS.replace(
+            "for octet in (1, 2):", "for octet in (1,):"
+        ))
+        scanner, _ = await self.run_scan(
+            targets=["example.com"],
+            include=["emitname", "fakedns", "netblock_expand", "recorder"],
+            module_config={"netblock_expand": {"prefixlen": 29}},
+        )
+        self.assertEqual(
+            scanner.modules["netblock_expand"].stats.get("expanded", 0), 0,
+            "只有 1 台证据却展开了",
+        )
+        self.assertEqual(set(scanner.modules["recorder"].seen), {"93.184.216.1"})
+
+    async def test_bare_ip_seed_expands_without_dns(self) -> None:
+        """**裸 IP 种子走的是同一段流水线，只是省掉 DNS。**
+
+        ``seed_asset`` 把种子 IP 变成 ``IP_ADDRESS`` → ``netblock_expand``
+        认得它是种子目标 → 直接展开 → ``recorder``（扮演 port_scan）拿到整段。
+
+        这里刻意**不挂** ``fakedns``：域名种子那条路才需要 DNS 解析出证据，
+        裸 IP 种子自己就是授权。
+        """
+        self.add_module_file("chainmods", FAKE_DNS)
+        scanner, _ = await self.run_scan(
+            targets=["93.184.216.1"],
+            include=["seed_asset", "netblock_expand", "recorder"],
+            module_config={"netblock_expand": {"prefixlen": 29}},
+        )
+        self.assertEqual(
+            scanner.modules["netblock_expand"].stats.get("expanded"), 1,
+            "裸 IP 种子没能展开它的段",
+        )
+        self.assertEqual(
+            set(scanner.modules["recorder"].seen),
+            {f"93.184.216.{i}" for i in range(1, 7)},
+            "展开出来的地址没走到下游",
+        )
+
+    async def test_seed_netblock_is_left_to_seed_asset(self) -> None:
+        """用户直接下发网段时，**只有** ``seed_asset`` 展开那一次。
+
+        ``netblock_expand`` 看到 ``seed_asset`` 产出的 IP 时，父事件是 SEED、
+        ``parent_data`` 正好等于网段串 —— 不挡的话它会把同一个段再展开一遍：
+        白跑一轮 emit，还多出一条看起来像第二次发现的 finding。
+        """
+        self.add_module_file("chainmods", FAKE_DNS)
+        scanner, _ = await self.run_scan(
+            targets=["93.184.216.0/29"],
+            include=["seed_asset", "netblock_expand", "recorder"],
+        )
+        self.assertEqual(
+            set(scanner.modules["recorder"].seen),
+            {f"93.184.216.{i}" for i in range(1, 7)},
+            "seed_asset 没把网段枚举出来",
+        )
+        self.assertEqual(
+            scanner.modules["netblock_expand"].stats.get("expanded", 0), 0,
+            "同一段被展开了两次",
+        )
+
+
+REQUIRES_DOMAIN = """
+    from core.engine.event import EventType
+    from core.engine.module import BaseModule
+
+
+    class bydomain(BaseModule):
+        watched_events = (EventType.SEED, EventType.DNS_NAME)
+        produced_events = ()
+        flags = ("passive", "safe")
+        requires_domain = True
+
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.seen = []
+
+        async def handle_event(self, event):
+            self.seen.append(event.data)
+
+
+    class oddnames(BaseModule):
+        watched_events = (EventType.SEED,)
+        produced_events = (EventType.DNS_NAME,)
+        flags = ("passive", "safe")
+
+        async def handle_event(self, event):
+            # 第三方被动源真的会返回这两种形态
+            await self.emit_event(event.data + ".", EventType.DNS_NAME, parent=event)
+            await self.emit_event("*." + event.data, EventType.DNS_NAME, parent=event)
+
+
+    class byanything(BaseModule):
+        watched_events = (EventType.SEED,)
+        produced_events = ()
+        flags = ("passive", "safe")
+
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.seen = []
+
+        async def handle_event(self, event):
+            self.seen.append(event.data)
+"""
+
+
+class TestParentDataIsNotAlwaysADomain(EngineTestCase):
+    """``parent_data`` 是"父事件的数据"，**不保证是域名**。
+
+    ## 这个 bug 的形状
+
+    ``port_scan`` 原来写的是 ``domain = event.parent_data or ""``，无条件
+    把 ``parent_data`` 当域名，塞进 ``OPEN_TCP_PORT`` 的 ``tags["domain"]``；
+    而 ``http_probe`` 的 ``host = domain or ip`` 会**优先用那个 domain**。
+
+    ``netblock_expand`` 发的 ``IP_ADDRESS`` 父事件是**触发的那个 IP** ——
+    于是 C 段扫出来的邻居，端口被记成"域名 = 另一台机器的 IP"，
+    ``http_probe`` 就**拿着错的机器去探**。
+
+    实测 2026-10-07：端点表里留下 ``ip=111.48.166.3 / host=111.48.166.18``
+    这种 ``ip≠host`` 的行（**资产表里存的是假记录**），那一轮 32 个邻居里
+    30 个一个 HTTP 端点都没有。
+
+    判据该用 :func:`is_valid_domain`：裸 IP、IPv6、网段串全部出局，
+    留空让 ``http_probe`` 回落到 ``host = ip``。
+    """
+
+    def _scan(self, parent_data: str):
+        return """
+    from core.engine.event import Event, EventType
+    from core.engine.module import BaseModule
+
+
+    class spawn(BaseModule):
+        watched_events = (EventType.SEED,)
+        produced_events = (EventType.IP_ADDRESS)
+        flags = ("passive", "safe")
+
+        async def handle_event(self, event):
+            await self.emit_event(
+                "93.184.216.7", EventType.IP_ADDRESS, parent=event
+            )
+"""
+        # 直接构造带 parent_data 的 IP_ADDRESS：spawn 那一步在单元层太绕，
+        # 而要验的判据只在 port_scan 这一行。
+        return parent_data
+
+    async def test_ip_parent_data_does_not_become_a_domain(self) -> None:
+        import ipaddress
+
+        from core.domains.web_hunter.port_scan import port_scan
+        from core.util.domain import is_valid_domain
+
+        # 判据本身：IP / IPv6 / 网段串都不是域名
+        for junk in ("93.184.216.7", "2606:2800:220:1::1", "93.184.216.0/24"):
+            self.assertFalse(
+                is_valid_domain(junk), f"{junk} 被当成了域名"
+            )
+        self.assertTrue(is_valid_domain("www.example.com"))
+        # port_scan 用的是同一把尺子
+        self.assertTrue(hasattr(port_scan, "handle_event"))
+
+    async def test_captured_domain_field_comes_out_empty_for_ip_parent(self) -> None:
+        """把 ``handle_event`` 里那行的实际效果直接跑出来。"""
+        from core.domains.web_hunter import port_scan as ps
+
+        captured: list[str] = []
+
+        async def fake_emit_for_host(ip, ports, domain, event):
+            captured.append(domain)
+
+        m = ps.port_scan.__new__(ps.port_scan)
+        m.log = type("L", (), {"info": lambda *a, **k: None,
+                               "debug": lambda *a, **k: None,
+                               "warning": lambda *a, **k: None})()
+        m._open_ports = {"93.184.216.7": {80, 443}}
+        m._emit_for_host = fake_emit_for_host
+        m._engine = type("S", (), {})()
+
+        from core.engine.event import Event, EventType
+        ev = Event(type=EventType.IP_ADDRESS, data="93.184.216.7",
+                   parent_data="93.184.216.18")
+
+        await ps.port_scan.handle_event(m, ev)
+        self.assertEqual(
+            captured, [""],
+            "IP 形式的 parent_data 又被当成域名发出去了 —— "
+            "http_probe 会拿着这台机器的 IP 当 Host 去探",
+        )
+
+    async def test_real_domain_parent_data_is_still_used(self) -> None:
+        """别把好使的也一起砍了：真域名父事件仍要补发 vhost 探活。"""
+        from core.domains.web_hunter import port_scan as ps
+        from core.engine.event import Event, EventType
+
+        captured: list[str] = []
+
+        async def fake_emit_for_host(ip, ports, domain, event):
+            captured.append(domain)
+
+        m = ps.port_scan.__new__(ps.port_scan)
+        m.log = type("L", (), {"info": lambda *a, **k: None,
+                               "debug": lambda *a, **k: None,
+                               "warning": lambda *a, **k: None})()
+        m._open_ports = {"93.184.216.7": {443}}
+        m._emit_for_host = fake_emit_for_host
+        m._engine = type("S", (), {})()
+
+        ev = Event(type=EventType.IP_ADDRESS, data="93.184.216.7",
+                   parent_data="www.example.com")
+        await ps.port_scan.handle_event(m, ev)
+        self.assertEqual(captured, ["www.example.com"])
+
+
+class TestRequiresDomainGate(EngineTestCase):
+    """``requires_domain``：网段 / 裸 IP 不是域名，别让它们进按域名写就的模块。
+
+    ## 这条闸门是被一次实跑逼出来的
+
+    扫 ``203.0.113.0/24`` 时 ``seed_asset`` 正确产出了 254 个 IP_ADDRESS
+    （网段功能本身是对的），但同一批种子里还有一条 ``SEED(203.0.113.0/24)``，
+    而好几个模块 ``watched_events = (EventType.SEED,)`` 且**直接把
+    ``event.data`` 当根域名用**：
+
+    * ``dns_brute`` 拼出 ``www.203.0.113.0/24`` —— 词表 19706 条
+    * ``wildcard_detect`` 拿它探泛解析
+    * ``passive_*`` 十来个第三方源把这段垃圾当域名发给外部 API
+
+    这不是"省流量"性质的过滤：这些请求**从来就没能命中过任何东西**，
+    而被动源那边还会记下一个我们压根不认识的"域名"。
+
+    ## 为什么不靠 per_domain_only 顺手拦掉
+
+    因为它拦不住。``per_domain_only`` 问的是"这个域名我见过了吗"，
+    而网段压根不是域名 —— 那次调用是靠一条语义不对的规则"蒙对"的，
+    一旦模块顺序变化就露馅。所以是**独立的一条判据**，且判在它之前。
+    """
+
+    async def test_domain_target_runs(self) -> None:
+        self.add_module_file("req_domain", REQUIRES_DOMAIN)
+        scanner, _ = await self.run_scan(
+            targets=["example.com"], include=["bydomain", "byanything"]
+        )
+        self.assertEqual(scanner.modules["bydomain"].seen, ["example.com"])
+        self.assertEqual(scanner.modules["byanything"].seen, ["example.com"])
+
+    async def test_netblock_target_is_not_treated_as_a_domain(self) -> None:
+        self.add_module_file("req_domain", REQUIRES_DOMAIN)
+        scanner, _ = await self.run_scan(
+            targets=["203.0.113.0/24"], include=["bydomain", "byanything"]
+        )
+        self.assertEqual(
+            scanner.modules["bydomain"].seen, [],
+            "网段被当成根域名放行了 —— dns_brute 会去查 www.203.0.113.0/24",
+        )
+        self.assertEqual(
+            scanner.modules["byanything"].seen, ["203.0.113.0/24"],
+            "不声明 requires_domain 的模块必须照常收到种子 —— "
+            "这条闸门不能变成全局过滤",
+        )
+
+    async def test_bare_ip_target_is_not_treated_as_a_domain(self) -> None:
+        """裸 IP 种子同理 —— 它比网段更早就走这条路，只是没人注意。"""
+        self.add_module_file("req_domain", REQUIRES_DOMAIN)
+        scanner, _ = await self.run_scan(
+            targets=["93.184.216.34"], include=["bydomain"]
+        )
+        self.assertEqual(scanner.modules["bydomain"].seen, [])
+
+    async def test_ipv6_target_is_not_treated_as_a_domain(self) -> None:
+        self.add_module_file("req_domain", REQUIRES_DOMAIN)
+        scanner, _ = await self.run_scan(
+            targets=["2606:2800:220:1:248:1893:25c8:1946"],
+            include=["bydomain"],
+        )
+        self.assertEqual(scanner.modules["bydomain"].seen, [])
+
+    async def test_trailing_dot_and_wildcard_are_still_domains(self) -> None:
+        """**闸门不能把真域名判没。**
+
+        直接拿原始串判 ``is_valid_domain`` 的话，这两种会被误杀：
+
+        * ``example.com.`` —— 最后一个标签是空串，标签正则不匹配
+        * ``*.example.com`` —— ``*`` 在非法字符集里
+
+        而它们是第三方被动源**真的会返回**的形态，代表真实存在的子域。
+        一条闸门把资产判没了，比多发几个请求严重得多。
+
+        ⚠️ 走的是 ``DNS_NAME`` 而不是 ``SEED``：引擎在建种子事件**之前**就
+        调过 ``_normalize_target``（里面就有 ``strip("*.")``），所以种子永远
+        不会是这两种形态 —— 拿种子来测这条会得到"通过"的假结论，
+        真正的风险路径根本没被覆盖。
+        """
+        self.add_module_file("req_domain", REQUIRES_DOMAIN)
+        scanner, _ = await self.run_scan(
+            targets=["example.com"], include=["oddnames", "bydomain"]
+        )
+        self.assertEqual(
+            sorted(scanner.modules["bydomain"].seen),
+            ["*.example.com", "example.com", "example.com."],
+        )
+
+    async def test_skip_is_counted_as_skipped(self) -> None:
+        """被闸门挡下要**留痕**，否则"这模块怎么一次都没跑"无从排查。
+
+        ⚠️ 记在 ``stats["module.<名>.skipped"]``，**不是** ``summary["modules_skipped"]``
+        —— 后者是**预设级**跳过（"这个预设没勾它"），两回事。断言指错地方会得到
+        一个看着像"闸门没生效"的假失败。
+        """
+        self.add_module_file("req_domain", REQUIRES_DOMAIN)
+        _, summary = await self.run_scan(
+            targets=["203.0.113.0/24"], include=["bydomain"]
+        )
+        self.assertEqual(
+            summary["stats"].get("module.bydomain.skipped"), 1,
+            "闸门挡住了却没计数 —— 模块静默不跑，界面上与'没产出'无法区分",
+        )
+
+
 class TestBatchErrorsAreCounted(EngineTestCase):
     """批内失败必须留下痕迹。
 
@@ -898,6 +1305,15 @@ class TestModuleDiscovery(unittest.TestCase):
             「允许任意客户端拉全区域」本身就是一条该写进报告的发现。此前全仓
             没有做过 AXFR（``grep axfr|dns.zone`` 零命中），它只需要 dnspython
             现成的 ``dns.query.xfr``，**不引任何新依赖**。
+          * 32 → 33：新增 ``netblock_expand``（2026-10-07）。C 段展开 ——
+            ``IP_ADDRESS`` → 整段 ``IP_ADDRESS``，下一步自然走端口扫描与探活。
+            位置在 ``resolve/``：它按 IP 工作，和 ``ip_ptr`` / ``dns_resolve``
+            同属"把一个名字/地址落实成事实"这一类。
+          * 33 → 34：新增 ``url_verify``（2026-10-07）。验证 ``url_extract``
+            从正文里抽出的链接 —— 实测 82 条抽出来只有 4 条被验证过，
+            剩下 78 条躺在 ``url`` 表里标着"已知存在"却从没被请求过。
+            验证动作与 ``dir_brute`` / ``js_assets`` 共用
+            ``_lib/urlverify.py``，只有策略不同。
         """
         import asyncio
 
@@ -913,7 +1329,7 @@ class TestModuleDiscovery(unittest.TestCase):
             return sorted(scanner.modules)
 
         names = asyncio.run(go())
-        self.assertEqual(len(names), 32, f"模块数变了: {names}")
+        self.assertEqual(len(names), 34, f"模块数变了: {names}")
         # 库文件绝不能被当成模块
         for lib in ("resolver", "resolver_pool", "dnsgen", "dns_query",
                     "ports", "tls", "extract", "sweep"):
@@ -996,7 +1412,8 @@ class TestModuleDiscovery(unittest.TestCase):
                     "passive_hunter", "passive_quake", "passive_rapiddns",
                     "passive_subdomaincenter", "passive_urlscan", "passive_wayback",
                 ]),
-                "resolve": ["asn_enrich", "dns_resolve", "ip_ptr", "zone_transfer"],
+                "resolve": ["asn_enrich", "dns_resolve", "ip_ptr",
+                            "netblock_expand", "zone_transfer"],
                 "fingerprint": ["fingerprint"],
                 # 2026-10-04：原 probe/ + urls/ + fuzz/ 三个域合并成 web_hunter/。
                 # 2026-10-05：port_scan 也并进来（OPEN_TCP_PORT 是 http_probe 与
@@ -1011,7 +1428,8 @@ class TestModuleDiscovery(unittest.TestCase):
                 # 静态标题非空时压根不跑），所以模块名和 flags 都是有意换的。
                 "web_hunter": sorted([
                     "http_probe", "page_title", "soft404_probe", "tls_cert",
-                    "js_assets", "url_extract", "dir_brute", "port_scan",
+                    "js_assets", "url_extract", "url_verify",
+                    "dir_brute", "port_scan",
                 ]),
             },
         )

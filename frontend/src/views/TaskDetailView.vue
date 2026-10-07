@@ -231,6 +231,109 @@
             </a-table>
           </a-tab-pane>
 
+          <!--
+            C 段探测。**放在「域名」和「IP」之间**是刻意的：它的输入是 IP
+            （按 /24 聚合来的），但它的问题域比单个 IP 大 —— 一个 C 段就是
+            一次独立授权的扫描任务。紧挨着「IP」放，用户看完 IP 就能往下扫。
+
+            **为什么值得单独一页签而不是塞进「IP」表**：口径完全不同。IP 表是
+            "这次扫到的主机"，C 段表是"这段上还有多少我们没碰过的东西"——
+            `111.1.168.0/24` 本次 4 台、全库 7 台，差出来的 3 台就是还没探过的
+            邻接资产。把两种行混在一张表里，两个数字会互相冒充。
+          -->
+          <a-tab-pane
+            key="netblocks"
+            :tab="`C段探测 (${(assets.netblocks || []).length})`"
+          >
+            <a-alert
+              type="info"
+              show-icon
+              style="margin-bottom: 12px"
+              message="按 /24 聚合本任务看到的 IP —— 归属证据是 netblock_expand 的展开闸门"
+            >
+              <template #description>
+                <b>归属证据</b> = 这一段里挂在<b>你自己域名</b>下的机器台数。
+                <code>netblock_expand</code> 默认 <code>min_owned=2</code>，
+                够格才把整段展开成 IP_ADDRESS 送进端口扫描与探活。<br />
+                证据不足的段<b>没有被动过</b> —— 那是刻意为之：一个 C 段里往往
+                混着同段其它租户（云主机邻居占库里已知 IP 的 25%），无条件展开
+                等于对第三方发扫描。<br />
+                想要整段无条件扫，点「扫描」直接用该 C 段建一个 <code>active</code>
+                任务（254 个地址的端口扫描，即刻生效）—— 用户显式下发一个段
+                即视为明确授权该段，这也是 ARL「任务目标支持 IP 段」的做法。
+              </template>
+            </a-alert>
+            <a-table
+              :columns="netblockColumns"
+              :data-source="assets.netblocks || []"
+              row-key="cidr"
+              size="small"
+              :pagination="{ pageSize: 20, showSizeChanger: false }"
+            >
+              <template #bodyCell="{ column, record }">
+                <template v-if="column.key === 'cidr'">
+                  <span class="tk-mono">{{ record.cidr }}</span>
+                </template>
+                <template v-else-if="column.key === 'owned_hosts'">
+                  <!-- 归属证据：这一段里有多少台是目标自己的域名解析出来的。
+                       netblock_expand 默认 ≥2 才展开 —— 所以 0/1 的段是
+                       **故意没扫**，不是"扫了没东西"。 -->
+                  <a-tag v-if="record.owned_hosts >= 2" color="green">
+                    {{ record.owned_hosts }} 台
+                  </a-tag>
+                  <a-tooltip
+                    v-else
+                    placement="topLeft"
+                    :title="`只有 ${record.owned_hosts} 台挂在目标域名下，低于 netblock_expand.min_owned（默认 2），本轮**没有自动展开**这一段。`"
+                  >
+                    <a-tag color="default">{{ record.owned_hosts }} 台 · 未展开</a-tag>
+                  </a-tooltip>
+                </template>
+                <template v-else-if="column.key === 'expanded_hosts'">
+                  <a-tag v-if="record.expanded_hosts" color="purple">
+                    {{ record.expanded_hosts }}
+                  </a-tag>
+                  <span v-else class="tk-muted">—</span>
+                </template>
+                <template v-else-if="column.key === 'hosts_found'">
+                  <span class="tk-mono">{{ record.hosts_found }}</span>
+                </template>
+                <template v-else-if="column.key === 'known_hosts'">
+                  <!-- 差值 = 还没碰过的邻接资产。这是这一页唯一要人动手的数 -->
+                  <a-tag v-if="record.known_hosts > record.hosts_found" color="orange">
+                    {{ record.known_hosts - record.hosts_found }}
+                  </a-tag>
+                  <span class="tk-muted">{{ record.known_hosts }}</span>
+                </template>
+                <template v-else-if="column.key === 'domain_count'">
+                  <span class="tk-mono">{{ record.domain_count }}</span>
+                </template>
+                <template v-else-if="column.key === 'probed_hosts'">
+                  <a-tag v-if="record.probed_hosts" color="green">
+                    {{ record.probed_hosts }}
+                  </a-tag>
+                  <span v-else class="tk-muted">—</span>
+                </template>
+                <template v-else-if="column.key === 'sample_ips'">
+                  <span class="tk-mono ports-cell" :title="record.sample_ips">
+                    {{ record.sample_ips }}
+                  </span>
+                </template>
+                <template v-else-if="column.key === 'action'">
+                  <a-button
+                    size="small"
+                    type="primary"
+                    ghost
+                    :loading="scanningCidr === record.cidr"
+                    @click.stop="scanNetblock(record)"
+                  >
+                    扫描
+                  </a-button>
+                </template>
+              </template>
+            </a-table>
+          </a-tab-pane>
+
           <a-tab-pane key="ips" :tab="`IP (${tabCount('ips')})`">
             <a-table
               :columns="ipColumns"
@@ -265,7 +368,21 @@
                 </template>
                 <template v-else-if="column.key === 'tags'">
                   <a-tag v-if="record.is_cloud" color="cyan">云</a-tag>
-                  <span v-else class="tk-muted">—</span>
+                  <!--
+                    「C 段」这个标记回答的是"这台机器**怎么进来看的**"。
+
+                    没有它，一个 C 段展开出来的邻居（没有任何域名）在列表里
+                    就是一个裸 IP —— 和"目标某个子域解析出来的"长得一样，
+                    但分量完全不同：后者是范围内的资产，前者是自动扩面
+                    出去的边角。看到标记才知道该拿哪台去细看。
+                  -->
+                  <a-tooltip
+                    v-if="record.netblock"
+                    placement="topLeft"
+                    :title="`C 段扫描带出来的：来自 ${record.netblock}`"
+                  >
+                    <a-tag color="purple">C 段</a-tag>
+                  </a-tooltip>
                 </template>
               </template>
             </a-table>
@@ -699,6 +816,7 @@ import { message } from 'ant-design-vue'
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
+  createScan,
   deleteScan,
   downloadExport,
   getAssets,
@@ -774,6 +892,27 @@ const domainColumns = [
   { title: '来源', dataIndex: 'source', key: 'source', width: 130, ellipsis: true },
   { title: '标记', key: 'tags', width: 150 },
   { title: '最近发现', dataIndex: 'last_seen', key: 'last_seen', width: 170 },
+]
+// C 段探测的列（后端 storage.netblocks 按 /24 聚合，见那里「为什么要跨扫描统计」）。
+//
+// 「已知主机」是全库口径：本次只扫到 4 台、全库 7 台时，差出来的 3 台就是
+// 还没探过的邻接资产。**别把这两个数合成一个** —— 合成之后就看不出"这段还有
+// 东西没扫"，而那恰恰是这一页存在的唯一理由。
+const netblockColumns = [
+  { title: 'C段', key: 'cidr', width: 170 },
+  // 归属证据 —— `netblock_expand` 就是按这一列决定展不展开（默认 ≥2）。
+  // 它必须排在「已知主机」前面：先看到"凭什么认为是你的"，再看"还有什么没扫"。
+  { title: '归属证据', key: 'owned_hosts', width: 90 },
+  // 本段被 C 段扫描新捞出来的台数。与「归属证据」的差 = 扫到但没有任何归属
+  // 线索的机器 —— 通常全是空地址，只要有一台开着端口，它就是这段里最值得
+  // 人看的那台，所以单列出来而不是混进「已知主机」。
+  { title: '本段扫出', key: 'expanded_hosts', width: 90 },
+  { title: '本次发现', key: 'hosts_found', width: 90 },
+  { title: '已知主机', key: 'known_hosts', width: 90 },
+  { title: '域名', key: 'domain_count', width: 70 },
+  { title: '已探活', key: 'probed_hosts', width: 80 },
+  { title: '样例 IP', dataIndex: 'sample_ips', key: 'sample_ips', ellipsis: true },
+  { title: '操作', key: 'action', width: 90 },
 ]
 const ipColumns = [
   { title: 'IP', key: 'addr', width: 150 },
@@ -1117,6 +1256,49 @@ const probedCount = computed(() => mergedUrls.value.filter((u) => u.probed).leng
 /** 切到某个资产页签（域名行里的端口数点一下跳过去）。 */
 function gotoTab(key) {
   tab.value = key
+}
+
+// ---------------------------------------------------------------- C 段探测
+
+/** 正在开扫的 C 段。请求期间只锁这一行的按钮，不锁整页。 */
+const scanningCidr = ref('')
+
+/**
+ * 用该 C 段建一个 `active` 任务开扫。
+ *
+ * ## 默认直接启用，不弹确认框
+ *
+ * 这一页的语义就是"人已经盯着这个段点下来的"，再弹一次确认等于让人确认
+ * 自己刚确认过的事。防误触靠的是**这一列只出现在任务详情里**，以及新任务
+ * 会立刻出现在「任务列表」上 —— 不是靠一个每次都要点掉的对话框。
+ *
+ * ## preset 必须是 active
+ *
+ * `passive` 里没有 port_scan / http_probe。对一个裸网段来说，那条链上
+ * 每个模块都会被 `requires_domain` 闸门正确挡下（网段不是域名）—— 于是
+ * 任务跑完状态 `finished`、资产数 0，看起来像"这段没东西"，
+ * 而实际上一条端口扫描都没发出去。这是最容易踩的静默失败。
+ */
+async function scanNetblock(record) {
+  const cidr = record.cidr
+  if (!cidr || scanningCidr.value) return
+  scanningCidr.value = cidr
+  try {
+    const res = await createScan({
+      name: `C段扫描 ${cidr}`,
+      targets: [cidr],
+      preset: 'active',
+      enable_sources: [],
+      overrides: [],
+    })
+    message.success(
+      `已开扫 ${cidr} —— 任务「${res.name}」（${res.task_code}）已进队列`,
+    )
+  } catch (e) {
+    message.error(e.message)
+  } finally {
+    scanningCidr.value = ''
+  }
 }
 
 /**
