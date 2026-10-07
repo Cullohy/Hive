@@ -146,7 +146,16 @@ class TestPortScan(EngineTestCase):
             )
         events, _ = await self.storage.events(scanner.scan_id, limit=200)
         opens = [e for e in events if e["type"] == "OPEN_TCP_PORT"]
-        self.assertEqual([e["data"] for e in opens], [f"{REAL_IP}:8080"])
+        # data 带域名（2026-10-07）：``uq_event(scan_id,type,data,kind)`` 不含
+        # tags，而 vhost 枚举要给同 IP 的每个域名各发一条 —— data 只有
+        # ``"ip:port"`` 时这 N 条会逐字相同、只有第一条落库，事件表里就查不到
+        # "这次探活是哪个域名触发的"。这条断言连带把新格式钉住。
+        self.assertEqual(
+            [e["data"] for e in opens],
+            [f"{REAL_IP}:8080|example.com"],
+            "端口事件的 data 必须带域名（父事件就是域名），否则同 IP 的多个"
+            "域名会在 event 表里撞成一条",
+        )
         self.assertGreaterEqual(summary["events_new"], 4)
 
 

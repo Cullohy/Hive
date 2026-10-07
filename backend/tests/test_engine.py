@@ -1449,6 +1449,53 @@ class TestSharedIpVhostProbing(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(a.key(), a2.key(), "同域名重复仍要去重")
 
+    async def test_open_tcp_port_data_carries_the_domain(self) -> None:
+        """data 里必须带域名，否则**账本查不全**。
+
+        ``uq_event(scan_id, type, data, kind)`` 不含 tags，所以 data 只有
+        ``"ip:port"`` 时，同 IP 上 N 个域名发出来的事件逐字相同，只有第一条落
+        库。功能不受影响（分发走引擎的 ``_visited``），但你在事件表里按域名
+        反查「是哪条端口事件触发了这次探活」会查不到。
+
+        实测扫描 #67：探到了 ``ors`` / ``tech-user`` 的端点，事件表里却没有。
+        """
+        sc = self._FakePortScanner(open_ports=(80, 443))
+        m = self._mk_module(sc)
+        out, _ = self._sink(m)
+        await m.handle_event(self._ev("117.28.234.46", "a.example.com"))
+        await m.handle_event(self._ev("117.28.234.46", "b.example.com"))
+
+        datas = [d for d, _, _ in out]
+        # ⚠️ 期望值必须**按 sorted 的结果写**：字符串排序里 '4' < '8'，
+        # 所以 ":443" 排在 ":80" **前面**。写成 80、443 的顺序会假失败
+        # （我第一版就是这么错的，排查了半天以为代码漏发了 80）。
+        self.assertEqual(
+            sorted(datas),
+            ["117.28.234.46:443|a.example.com",
+             "117.28.234.46:443|b.example.com",
+             "117.28.234.46:80|a.example.com",
+             "117.28.234.46:80|b.example.com"],
+            f"data 没带上域名，两个域名的事件在库里仍会撞成一条：{sorted(datas)}",
+        )
+        # tags 里的 ip/port 必须仍然是干净的裸值 —— _upsert_port / tls_cert /
+        # http_probe 全都读 tags，不读 data
+        for _, _, t in out:
+            self.assertEqual(t["ip"], "117.28.234.46")
+            self.assertIsInstance(t["port"], int)
+
+    async def test_open_tcp_port_data_has_no_tail_without_a_domain(self) -> None:
+        """用裸 IP 触发时不留空尾巴 ``"ip:port|"``。
+
+        ��意 IP 必须用**真实公网段** —— TEST-NET（203.0.113.x 之类）在
+        ``EXTRA_BLOCKED_NETS`` 里，会被内网闸门先拦掉，于是断言 0 条事件，
+        看起来像"代码没发"，其实是**根本没走到目标路径**。
+        """
+        sc = self._FakePortScanner(open_ports=(80,))
+        m = self._mk_module(sc)
+        out, _ = self._sink(m)
+        await m.handle_event(self._ev("117.28.234.45", ""))
+        self.assertEqual([d for d, _, _ in out], ["117.28.234.45:80"])
+
     async def test_every_host_on_a_shared_ip_gets_probe_events(self) -> None:
         sc = self._FakePortScanner()
         m = self._mk_module(sc)
