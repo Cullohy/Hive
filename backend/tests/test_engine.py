@@ -1314,6 +1314,18 @@ class TestModuleDiscovery(unittest.TestCase):
             剩下 78 条躺在 ``url`` 表里标着"已知存在"却从没被请求过。
             验证动作与 ``dir_brute`` / ``js_assets`` 共用
             ``_lib/urlverify.py``，只有策略不同。
+          * 34 → 35：新增 ``passive_shodan``（2026-10-07）。网络空间测绘引擎，
+            与 ``passive_fofa`` / ``passive_quake`` / ``passive_hunter`` 同一
+            套契约。⚠️ 计费比那三家都紧：Shodan **每条过滤式查询 1 个 credit、
+            每多翻一页再加 1 个**，所以默认 ``recursive=False``、
+            ``max_pages=1``。``test_shodan.py`` 里钉着这两条默认值。
+          * 35 → 36：新增 ``passive_virustotal``（2026-10-07）。⚠️ **它不是
+            测绘引擎** —— VT 索引的是文件/URL/域名/IP 的**关系图谱**，没有
+            按端口/产品/地理做全网查询的能力，归的是「关系图谱 / 威胁情报」
+            这一族（同 ``urlscan`` / ``commoncrawl``）。只是"从域名枚举子域"
+            这件事上与测绘引擎同形，才复用同一套 ``sub_domains`` 契约。
+            限速是全仓最紧的：免费档 **4 次/分钟、500 次/天** → 默认
+            ``interval=15`` / ``max_pages=1`` / ``recursive=False``。
         """
         import asyncio
 
@@ -1329,19 +1341,23 @@ class TestModuleDiscovery(unittest.TestCase):
             return sorted(scanner.modules)
 
         names = asyncio.run(go())
-        self.assertEqual(len(names), 34, f"模块数变了: {names}")
+        self.assertEqual(len(names), 36, f"模块数变了: {names}")
         # 库文件绝不能被当成模块
         for lib in ("resolver", "resolver_pool", "dnsgen", "dns_query",
                     "ports", "tls", "extract", "sweep"):
             self.assertNotIn(lib, names, f"{lib} 是库, 不该被注册成模块")
         # 抽象基类不能出现
         self.assertNotIn("passivesourcemodule", names)
-        # 7 个被动源一个都不能少
+        # 免 key 的被动源一个都不能少
         for src in (
             "passive_anubis", "passive_certspotter", "passive_commoncrawl",
             "passive_crtsh", "passive_hackertarget", "passive_rapiddns",
             "passive_subdomaincenter", "passive_urlscan",
         ):
+            self.assertIn(src, names)
+        # 需要 key 的测绘引擎 / 图谱源：缺 Key 时**软失败**，这里仍要注册
+        for src in ("passive_fofa", "passive_quake", "passive_hunter",
+                    "passive_shodan", "passive_virustotal"):
             self.assertIn(src, names)
         # 实测不可用而被删掉的源不该复活
         self.assertNotIn("passive_otx", names)
@@ -1410,6 +1426,13 @@ class TestModuleDiscovery(unittest.TestCase):
                     "passive_anubis", "passive_certspotter", "passive_commoncrawl",
                     "passive_crtsh", "passive_fofa", "passive_hackertarget",
                     "passive_hunter", "passive_quake", "passive_rapiddns",
+                    # 2026-10-07：接 Shodan 与 VirusTotal。两者都属
+                    # 「查询即作用域」的形态（不是脏源），但**不是同一类**：
+                    # Shodan 是测绘引擎（端口/banner 全网索引），
+                    # VirusTotal 是关系图谱（文件/URL/域名/IP 的关系）。
+                    # 因此 Shodan 收裸 IP，VirusTotal 不收
+                    # （它的 resolutions 是 passive DNS 历史）。
+                    "passive_shodan", "passive_virustotal",
                     "passive_subdomaincenter", "passive_urlscan", "passive_wayback",
                 ]),
                 "resolve": ["asn_enrich", "dns_resolve", "ip_ptr",

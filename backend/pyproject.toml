@@ -51,4 +51,13 @@ testpaths = ["tests"]
 # 提到 error 之后它当场失败，问题一眼可见。
 filterwarnings = [
     "error::RuntimeWarning",
+    # ⚠️ **光有上面那条抓不全。** 实测（2026-10-07，写 passive_virustotal 时）
+    # 同一个错误**绕过去了**：pytest 把那条 RuntimeWarning 包进
+    # ``PytestUnraisableExceptionWarning`` 再发出来，于是 filter 匹配不上、
+    # 降级成普通 warning，5 条 async 用例照样「全绿」而一次都没跑。
+    #
+    # 所以这里把 pytest 自己包的那层也提为 error。两层都要在，是因为
+    # 一次没跑的用例**伪装成通过**，比它响亮地红起来危险得多 ——
+    # 而 warnings summary 里那 12 条 warning 就是唯一的线索，不能靠人眼。
+    "error::pytest.PytestUnraisableExceptionWarning",
 ]
