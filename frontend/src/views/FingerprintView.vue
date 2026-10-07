@@ -1,7 +1,7 @@
 <template>
   <div class="tk-page">
     <div class="tk-card">
-      <h3 class="tk-card-title"><DeploymentUnitOutlined /> 指纹库</h3>
+      <h3 class="tk-card-title"><DeploymentUnitOutlined /> 指纹规则</h3>
 
       <div class="stat-row">
         <div class="stat">

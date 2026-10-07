@@ -1,12 +1,5 @@
 <template>
   <div class="tk-page">
-    <div class="tk-stat-grid" style="margin-bottom: 16px">
-      <div v-for="card in cards" :key="card.label" class="tk-stat">
-        <div class="tk-stat-label">{{ card.label }}</div>
-        <div class="tk-stat-value" :class="{ accent: card.accent }">{{ card.value }}</div>
-      </div>
-    </div>
-
     <div class="search-bar">
       <a-input
         v-model:value="filterText"
@@ -33,6 +26,20 @@
     <div class="tk-card">
       <div class="toolbar">
         <h3 class="tk-card-title" style="margin: 0">任务列表</h3>
+        <!-- 统计从原来页面顶部的三块卡片挪到这一行（2026-10-07）。
+             两个数字是**全局**的（stats.*），不是当前筛选出来的条数 ——
+             删卡片时别顺手改成 filteredScans.length，那会跟下面表格的分页对不上。
+             「运行中」>0 时染强调色，沿用原来卡片上的 accent 规则。
+
+             ⚠️ 「启用中的监控」按要求去掉了（原来是第三个数字）。
+             监控列表走的是**另一个接口** `/api/monitors`（`listMonitors()`），
+             不经过 `stats`，所以去掉这个数字不影响别处；`stats.monitors`
+             现在只是 `/api/stats` 响应里没人读的字段，后端留着即可。 -->
+        <span class="list-stats">
+          任务总数 <b>{{ stats.scans ?? 0 }}</b>
+          <span class="sep">/</span>
+          运行中 <b :class="{ accent: (stats.scans_running ?? 0) > 0 }">{{ stats.scans_running ?? 0 }}</b>
+        </span>
         <span class="grow" />
         <a-button type="primary" @click="showCreate = true">
           <PlusOutlined /> 创建任务
@@ -163,11 +170,9 @@ const columns = [
   { title: '操作', key: 'actions', width: 170, fixed: 'right' },
 ]
 
-const cards = computed(() => [
-  { label: '扫描总数', value: stats.value.scans ?? 0 },
-  { label: '正在运行', value: stats.value.scans_running ?? 0, accent: (stats.value.scans_running ?? 0) > 0 },
-  { label: '启用中的监控', value: stats.value.monitors ?? 0 },
-])
+// 原来给页面顶部三块统计卡片用的 `cards` computed 已删（2026-10-07）——
+// 数字改成在「任务列表」那一行内联展示（见模板 .list-stats），卡片结构没了，
+// 这个 computed 就成了死代码。数据源仍是 `stats`。
 
 function statusBadge(status) {
   if (status === 'finished') return 'success'
@@ -296,4 +301,6 @@ onUnmounted(() => timer && clearInterval(timer))
 .grow {
   flex: 1;
 }
+/* `.list-stats` 已提到 global.css（2026-10-07）—— 资产分组页用同一套写法，
+   两处逐字相同，留在本文件的 scoped 块里等于复制一份等着漂。 */
 </style>

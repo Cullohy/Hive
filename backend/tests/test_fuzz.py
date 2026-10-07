@@ -3252,6 +3252,27 @@ class TestSoft404ThreeLayer(unittest.TestCase):
         ))
 
 
+def _is_waf_probe(host: str, url: str) -> bool:
+    """这条请求是 ``netblock_expand`` 的 **WAF 主动探测载荷**吗？
+
+    ## 为什么不能用「URL 以 ``/?`` 开头」来认
+
+    载荷**按请求形态**分组（query / path / path_param / header），路径形态
+    打出来的是 ``{host}/../../etc/passwd``、``{host}/admin;x=1`` 这种
+    **长得像字典路径**的 URL —— 用前缀猜的话，路径那几条会被误算成
+    「绕过变体」，让「每条路径的变体数有上限」那条用例平白变红。
+
+    直接按 ``AttackProbe.url()`` 的定义反推，与实现同源，不靠猜。
+    """
+    from core.domains.web_hunter._lib.wafdet import ATTACK_PROBES
+
+    for probe in ATTACK_PROBES:
+        for param in ("q0", "q1", "q2", "q3", "q4", "q5", "q6", "q7"):
+            if url == probe.url(host, param):
+                return True
+    return False
+
+
 class TestAuthStatusAndBypass(EngineTestCase):
     """401/403 的记账、命中，以及绕过尝试。
 
@@ -3499,9 +3520,8 @@ class TestAuthStatusAndBypass(EngineTestCase):
         # 前 2 条是软 404 校准（probes=2，顺序确定），随机 token 没法预先枚举
         calib = {u for u, _ in seen[:2]}
         skip = dict_paths | {f"{self.HOST}/"} | calib
-        root_q = f"{self.HOST}/?"
         variants = [u for u, h in seen
-                    if not u.startswith(root_q) and (u not in skip or h)]
+                    if not _is_waf_probe(self.HOST, u) and (u not in skip or h)]
         self.assertEqual(
             variants, [],
             f"404 路径也发了绕过变体: {variants}",
@@ -3593,12 +3613,11 @@ class TestAuthStatusAndBypass(EngineTestCase):
                          bypass_max_per_path=3, forbidden_ratio=1.0,
                          forbidden_min=999)
         # 前 2 条是软 404 校准（probes=2，顺序确定）；全站 403 还会触发
-        # WAF 主动探测（根路径上的 `?载荷`）—— 那些也不是"绕过变体"。
+        # WAF 主动探测 —— 那些也不是"绕过变体"。
         calib = {u for u, _ in seen[:2]}
         skip = dict_paths | {f"{self.HOST}/"} | calib
-        root_q = f"{self.HOST}/?"
         variants = [u for u, h in seen
-                    if not u.startswith(root_q) and (u not in skip or h)]
+                    if not _is_waf_probe(self.HOST, u) and (u not in skip or h)]
         self.assertLessEqual(
             len(variants), 3,
             f"上限 1 条路径 × 3 档 = 最多 3 个变体，实际 {len(variants)}: {variants}",

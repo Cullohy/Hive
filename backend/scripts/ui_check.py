@@ -24,12 +24,12 @@ OUT = Path(sys.argv[2] if len(sys.argv) > 2 else ".shots")
 ROUTES = [
     ("taskList", "任务管理"),
     ("search", "资产搜索"),
-    ("fingerprints", "指纹库"),
+    ("fingerprints", "指纹规则"),
 ]
 
 #: 每个路由可见文本的**最少字数**。空白页/渲染崩溃的直接症状就是文本极少，
 #: 而它未必伴随 console 报错 —— 所以要有独立的一条断言守着。
-#: （踩过一次：指纹库页因为多解构了一层 `response.data` 而整片空白。）
+#: （踩过一次：指纹规则页因为多解构了一层 `response.data` 而整片空白。）
 MIN_TEXT = {
     # 任务列表现在还要放得下「创建任务」按钮，正文比原来的列表页多
     "taskList": 40,

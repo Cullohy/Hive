@@ -1073,7 +1073,7 @@ function assetLabel(key) {
 }
 
 // 技术栈分类的中文名。slug 由后端指纹库给出（cms / framework / cdn …），
-// 与「指纹库」页用的是同一套标签。
+// 与「指纹规则」页用的是同一套标签（2026-10-07 该页由「指纹库」改名）。
 const CATEGORY_LABELS = {
   server: 'Web 服务器',
   language: '编程语言',

@@ -31,10 +31,11 @@
               <SettingOutlined />
               <span v-if="!collapsed" class="footer-text">系统设置</span>
             </a-button>
-            <div class="health" :class="{ collapsed }">
-              <span class="dot" :class="healthClass" />
-              <span v-if="!collapsed" class="footer-text">{{ healthText }}</span>
-            </div>
+            <!-- 侧栏底部只留版本号（2026-10-07）。
+                 「运行中 N/4」**在顶栏右上角，不在这里** —— 它是实时心跳，
+                 要一眼可见；版本号是静态署名，压在角落就够。两者别再互换。
+                 折叠时整行不渲染：版本号没有图标可留，留一行空白没意义。 -->
+            <div v-if="!collapsed" class="footer-version">v{{ version }}</div>
           </div>
         </div>
       </a-layout-sider>
@@ -47,8 +48,15 @@
             </div>
             <h2 class="header-title">{{ currentTitle }}</h2>
           </div>
+          <!-- 「运行中 N/4」——心跳放顶栏右上角，一眼可见。
+               ⚠️ 字色用 `--tk-text-secondary`：顶栏是**白底**，
+               侧栏那套 `--tk-side-text`（深底反色）搬过来几乎看不见（踩过一次）。
+               「后端离线」时圆点变红 —— 这是唯一的排查入口，别删。 -->
           <div class="header-right">
-            <span class="header-version">v{{ version }}</span>
+            <div class="health">
+              <span class="dot" :class="healthClass" />
+              <span>{{ healthText }}</span>
+            </div>
           </div>
         </a-layout-header>
 
@@ -117,7 +125,7 @@ const menuItems = [
   { key: 'task', label: '任务管理', icon: AppstoreOutlined, path: '/taskList' },
   { key: 'assets', label: '资产管理', icon: DatabaseOutlined, path: '/assets' },
   { key: 'asset-groups', label: '资产分组', icon: ClusterOutlined, path: '/asset-groups' },
-  { key: 'fingerprints', label: '指纹库', icon: DeploymentUnitOutlined, path: '/fingerprints' },
+  { key: 'fingerprints', label: '指纹规则', icon: DeploymentUnitOutlined, path: '/fingerprints' },
 ]
 
 const selectedKey = computed(() => route.meta?.menu || 'task')
@@ -295,17 +303,22 @@ onUnmounted(() => {
   font-size: 13px;
   white-space: nowrap;
 }
+/* 「运行中 N/4」——**顶栏右上角**（2026-10-07 最终位置）。
+   字色是 `--tk-text-secondary`：顶栏白底。要是哪天又把它搬回侧栏，
+   **字色必须一起换成 `--tk-side-text`**，两套颜色不能混用
+   （深底反色搬到白底上几乎看不见 —— 这次已经来回踩过两轮）。 */
 .health {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 16px 10px 24px;
-  color: var(--tk-side-text);
-  font-size: 12px;
+  color: var(--tk-text-secondary);
+  font-size: 12.5px;
 }
-.health.collapsed {
-  justify-content: center;
-  padding: 6px 0 10px;
+/* 版本号在**侧栏底部**，缩进跟「系统设置」对齐；折叠时整行不渲染。 */
+.footer-version {
+  padding: 0 16px 10px 24px;
+  color: var(--tk-side-text);
+  font-size: 11.5px;
 }
 .dot {
   width: 7px;
@@ -370,10 +383,8 @@ onUnmounted(() => {
   align-items: center;
   gap: 10px;
 }
-.header-version {
-  color: var(--tk-text-muted);
-  font-size: 12.5px;
-}
+/* 版本号**不在顶栏**（2026-10-07 挪到侧栏底部 `.footer-version`），
+   顶栏右边只剩「运行中 N/4」。 */
 
 /* ── 内容区 ── */
 .content {

@@ -207,7 +207,7 @@ a:hover {
  *
  * 它是 antd「焦点在哪个输入框」的指示条：选了起始日就画在起始那一段下面。
  * 先是主色橙红（在一排灰白输入框里像划了一道红线），改成灰的之后更确认了一件事：
- * **这条线本来就不带信息**。焦点在哪个输入框，看光标在哪、看的��"结束日期"
+ * **这条线本来就不带信息**。焦点在哪个输入框，看光标在哪、看的是"结束日期"
  * 这个占位符有没有被替换掉，都不需要靠一条线来说；选中结果已经明明白白写在
  * 输入框里了（"2026-10-06"）。所以与其挑一个不刺眼的颜色，不如直接不画。
  *
@@ -510,4 +510,30 @@ a:hover {
 }
 .tk-stat-value.accent {
   color: var(--tk-accent);
+}
+
+/* 「列表标题右侧的行内统计」——`.tk-stat-*` 那套大卡片的轻量替代（2026-10-07）。
+ *
+ * 放在 global.css 而不是各视图的 scoped 块里：任务管理（任务总数 / 运行中）
+ * 与资产分组（分组数 / 归集域名 / IP / 资产）两处**逐字同款**，第三个页面
+ * 再复制一遍只会开始漂。紧挨着 `.tk-stat-*` 是因为它就是那些卡片的替代品。
+ *
+ * 结构：`.sep` 是分隔符（`/`），靠 v-for 的 index 判断首项不带。
+ * 数字用 tabular-nums，一列数字上下才对齐。 */
+.list-stats {
+  font-size: 12.5px;
+  color: var(--tk-text-secondary);
+  white-space: nowrap;
+}
+.list-stats b {
+  color: var(--tk-text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.list-stats b.accent {
+  color: var(--tk-accent);
+}
+.list-stats .sep {
+  margin: 0 7px;
+  color: var(--tk-text-muted);
 }

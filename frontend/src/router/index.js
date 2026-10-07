@@ -39,7 +39,7 @@ const routes = [
     path: '/fingerprints',
     name: 'fingerprints',
     component: FingerprintView,
-    meta: { title: '指纹库', menu: 'fingerprints' },
+    meta: { title: '指纹规则', menu: 'fingerprints' },
   },
   // 兜底：未知路径回任务列表
   { path: '/:pathMatch(.*)*', redirect: '/taskList' },

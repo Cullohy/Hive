@@ -1,17 +1,19 @@
 <template>
   <div class="tk-page">
-    <!-- ── 概览 ── -->
-    <div class="tk-stat-grid" style="margin-bottom: 16px">
-      <div v-for="card in statCards" :key="card.label" class="tk-stat">
-        <div class="tk-stat-label">{{ card.label }}</div>
-        <div class="tk-stat-value" :class="{ accent: card.accent }">{{ card.value }}</div>
-      </div>
-    </div>
-
     <!-- ── 分组列表 ── -->
     <div class="tk-card">
       <div class="toolbar">
         <h3 class="tk-card-title" style="margin: 0">资产分组</h3>
+        <!-- 概览从原来页面顶部的四块卡片挪到「资产分组」这一行（2026-10-07），
+             与任务管理页同一套写法（那边是「任务总数 N / 运行中 N」）。
+             数字是**全部分组的合计**，不是当前表格里的行数 ——
+             别顺手改成 groups.length，那会和下面的表格对不上。 -->
+        <span class="list-stats">
+          <template v-for="(card, i) in statCards" :key="card.label">
+            <span class="sep" v-if="i">/</span>
+            {{ card.label }} <b :class="{ accent: card.accent }">{{ card.value }}</b>
+          </template>
+        </span>
         <span class="grow" />
         <a-button type="primary" @click="openCreate">
           <PlusOutlined /> 新建分组
@@ -265,12 +267,11 @@ const loading = ref(false)
 
 const statCards = computed(() => [
   { label: '分组数', value: groups.value.length, accent: true },
-  {
-    label: '归集域名',
-    value: groups.value.reduce((n, g) => n + (g.domain_count || 0), 0),
-  },
-  { label: '归集 IP', value: groups.value.reduce((n, g) => n + (g.ip_count || 0), 0) },
-  { label: '归集资产', value: groups.value.reduce((n, g) => n + assetTotalOf(g), 0) },
+  // 2026-10-07 去掉「归集」二字：这一行已经跟在「资产分组」标题后面了，
+  // 上下文就是"归集到什么"，再写一遍是同义反复。
+  { label: '域名', value: groups.value.reduce((n, g) => n + (g.domain_count || 0), 0) },
+  { label: 'IP', value: groups.value.reduce((n, g) => n + (g.ip_count || 0), 0) },
+  { label: '资产', value: groups.value.reduce((n, g) => n + assetTotalOf(g), 0) },
 ])
 
 const groupColumns = [

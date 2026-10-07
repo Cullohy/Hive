@@ -405,11 +405,25 @@ class TestLiveFilterShape(unittest.TestCase):
 
         这是整类 bug 的机械防线：``d.scan_id`` / ``i.scan_id`` / ``u.scan_id``
         和 ``e.scan_id`` 现在都只是"首个发现者"，任何比较都不成立。
+
+        ⚠️ **``ports`` 是恒真片段，不查任何表**（2026-10-07 改）——
+        ``port`` 表里一行就代表"这个端口开着"（``port_scan`` 只在 ``on_open``
+        里写），拿它去要求 HTTP 观测等于要求邮件端口也得吐 HTTP，实测把
+        16245 行里的 15055 行误杀。所以它**不参与**下面这条查表断言。
+
+        但"恒真"不等于"可以随便写"：仍然要防它被改回 ``e.scan_id`` 那种
+        写法，所以 scan_id 比较那条对所有 key 都查。
         """
         for key, (sql, extra) in _LIVE_SQL.items():
             with self.subTest(key=key):
-                self.assertIn("scan_asset", sql)
-                self.assertEqual(sql.count("?"), extra)
+                if key == "ports":
+                    # 恒真：不查表、不吃占位符，但也不许出现 scan_id 比较
+                    self.assertEqual(sql.strip().upper(), "TRUE",
+                                     "ports 的 live 片段应当恒真")
+                    self.assertEqual(extra, 0, "恒真片段不吃 scan_id 参数")
+                else:
+                    self.assertIn("scan_asset", sql)
+                    self.assertEqual(sql.count("?"), extra)
                 for alias in ("e", "d", "i", "p", "u"):
                     self.assertIsNone(
                         re.search(rf"\b{alias}\.scan_id\b", sql),
@@ -425,6 +439,10 @@ class TestLiveFilterShape(unittest.TestCase):
         另外：有 ``live`` 就必须有 ``live_any`` —— 跨扫描检索（``scan_id=None``）
         时没有"这次扫描"可谈，缺了兜底条件会**静默地不过滤**（返回一堆
         从没探过的资产，而界面上什么都不会说）。
+
+        ⚠️ **``ports`` 走恒真片段，不查表**（2026-10-07）—— 端口行本身的
+        存在就代表端口开着。其余类型仍必须走 ``scan_asset``（它带
+        "哪次扫描"的语义，是这条断言真正要防的东西）。
         """
         for key, spec in _SEARCH_SPECS.items():
             with self.subTest(key=key):
@@ -433,7 +451,12 @@ class TestLiveFilterShape(unittest.TestCase):
                 if spec.live:
                     self.assertTrue(spec.live_any, f"{key}: 缺 live_any 兜底")
                     self.assertEqual(spec.live_any.count("?"), 0)
-                    self.assertIn("scan_asset", spec.live)
+                    if key == "ports":
+                        # 恒真：不查表，但也不许退回按 HTTP 观测判
+                        self.assertEqual(spec.live.strip().upper(), "TRUE")
+                        self.assertEqual(spec.live_params, 0)
+                    else:
+                        self.assertIn("scan_asset", spec.live)
                 else:
                     self.assertEqual(spec.live_params, 0)
 
@@ -830,12 +853,17 @@ class TestRealDatabase(unittest.IsolatedAsyncioTestCase):
                          "'_' 被当成了单字符通配符")
 
     async def test_host_detail_findings_count_is_not_the_list_length(self) -> None:
-        """详情面板的"发现"数必须是**真实总数**，不是截断后的列表长度。
+        """详情面板的"发现"数必须是**真实总数**，不是折叠/截断后的列表长度。
 
         ``target LIKE '%name%'`` 会把子域的证书 / WAF 结论一起捞进来，几十条
         很常见。曾经 ``counts["findings"] = len(findings)`` 而列表固定
         ``LIMIT 50`` —— 于是面板写 50、概览写 312，用户以为还有 262 条没加载。
         这正是 ``global_stats`` 注释里写的"计数与列表必须一致"。
+
+        ⚠️ 60 条的 detail 必须**各不相同**（2026-10-07 改）。折叠是按
+        「抹掉数字后的 detail」判同的，而 ``d0``~``d59`` 抹完全一样
+        → 60 条折成 1 条，这条测试就变成在测折叠、没在测截断了。
+        真实场景里 60 条发现是不同的证书 / 不同的主机，每条 detail 各异。
         """
         from core.engine.event import Event, EventType
 
@@ -845,9 +873,18 @@ class TestRealDatabase(unittest.IsolatedAsyncioTestCase):
         await self.storage.project(
             sid, Event(type=EventType.DNS_NAME, data=HOST, module="m", tags={})
         )
+        # ⚠️ detail 里必须有**非数字**的差异。折叠按「抹掉数字后」判同，
+        # 而 ``'d' || i || '-unique-' || (1000+i)`` 抹完是 ``d#-unique-#``，
+        # 60 条仍然全部相同 → 折成 1 条，这条测试就变成在测折叠了。
+        # 用 ``md5`` 给出十六进制串（含 a-f 字母），数字抹不掉。
+        # ⚠️ ``{i}`` 由 ``_insert_finding`` 在 **Python 端**替换（.format），
+        # 不是 SQL 的 generate_series —— 写成裸 ``i`` 会报「字段 i 不存在」。
+        # 而这一段整体是 f-string，所以要写成 ``{{i}}`` 才轮到 .format 那一层
+        # 去替换（实测栽过：写成 ``'{i}'`` 被 f-string 先吃掉，直接 NameError）。
         await self._insert_finding(
             f"INSERT INTO finding (scan_id, kind, target, detail, severity, created_at)"
-            f" VALUES ({sid}, 'cdn', '{HOST}', 'd{{i}}', 'info', '2026-01-01')",
+            f" VALUES ({sid}, 'cdn', '{HOST}',"
+            f" 'd{{i}}-cdn-' || md5('{{i}}'), 'info', '2026-01-01')",
             total,
         )
 
@@ -1852,6 +1889,587 @@ class TestGroupSyncCountsAndGlobalStats(IsolatedAsyncioTestCase):
         self.assertEqual(
             stats["ports"], 2,
             "概览把 tcp/udp 合成一条了，与端口列表对不上",
+        )
+
+
+class TestStatusFilterIsNotSilentlyDropped(IsolatedAsyncioTestCase):
+    """``status`` 筛选字段**六种类型都要有**（2026-10-07）。
+
+    ## 为什么这条是机械断言
+
+    ``_build_filter_where`` 对**未知字段**是静默 ``continue`` —— 这是给
+    "前端加了新字段时后端不要 500" 留的兼容性设计。代价是：**字段没配就
+    等于没筛**，不报错、计数不变、界面上就是"下拉点了没反应"。
+
+    实测踩过两次：
+
+    * 只有 ``urls`` 配了 ``status`` 时，资产管理页的域名/IP 筛选完全无效
+      （40 → 40，一条没少）
+    * 补到四种后，``all`` 模式筛 2xx 仍混进 ``status=403`` 的行 ——
+      ``technologies`` / ``findings`` 也没配，放行了 31 条
+
+    所以这里**逐类型断言字段存在**，而不是只测"某个类型能筛"。
+    """
+
+    #: 与 ``_FLAT_SPECS`` 那列保持一致（都取 ``ep.status``）——
+    #: 筛选用的列和显示用的列必须是同一个，否则"筛出来的"和"看到的"对不上。
+    EXPECTED = {
+        "domains": "ep.status",
+        "ips": "ep.status",
+        "ports": "ep.status",
+        "urls": "e.status",
+        "technologies": "ep.status",
+        "findings": "ep.status",
+    }
+
+    async def asyncSetUp(self) -> None:
+        self.storage = await make_storage()
+
+    async def asyncTearDown(self) -> None:
+        await drop_storage(self.storage)
+
+    def test_every_type_can_filter_by_status(self) -> None:
+        from core.storage.postgres import _ASSET_FILTER_FIELDS
+
+        for atype, col in self.EXPECTED.items():
+            with self.subTest(atype=atype):
+                fields = _ASSET_FILTER_FIELDS.get(atype, {})
+                self.assertIn(
+                    "status", fields,
+                    f"{atype} 没配 status 筛选字段 → 筛选被静默丢弃，"
+                    f"界面上表现为「点了没反应」",
+                )
+                self.assertEqual(
+                    fields["status"], col,
+                    f"{atype} 的 status 列引用与 _FLAT_SPECS 不一致 —— "
+                    f"筛出来的行和显示的状态码会对不上",
+                )
+
+    def test_status_is_treated_as_a_numeric_column(self) -> None:
+        """``status`` 必须在数字列名单里。
+
+        不在的话 ``contains`` 之类会展开成 ``ILIKE``，拿 int 当模式喂给
+        asyncpg 直接报错；更重要的是范围比较（gte/lt）根本没法用 ——
+        而 2xx/3xx/4xx/5xx 正是靠两条范围条件实现的。
+        """
+        from core.storage.postgres import _NUMERIC_FILTER_FIELDS
+
+        self.assertIn("status", _NUMERIC_FILTER_FIELDS)
+
+    async def test_status_range_filter_never_leaks_other_buckets(self) -> None:
+        """按范围筛 2xx，返回的行**不能**混进 3xx/4xx/5xx。
+
+        这条是端到端版本：只断言"字段存在"不够 —— 列引用写错了（比如
+        指到另一张表的 status）字段照样存在，筛出来却是乱的。
+        """
+        from core.engine.event import Event, EventType
+
+        sid = await self.storage.create_scan(targets=["example.com"], preset="t")
+        d = Event(type=EventType.DNS_NAME, data="a.example.com", module="m")
+        await self.storage.save_event(sid, d)
+        await self.storage.project(sid, d)
+        # 三个不同档位各一个
+        for name, code in (("ok", 200), ("moved", 301), ("boom", 500)):
+            host = f"{name}.example.com"
+            e = Event(type=EventType.DNS_NAME, data=host, module="m")
+            await self.storage.save_event(sid, e)
+            await self.storage.project(sid, e)
+            ep = Event(
+                type=EventType.HTTP_RESPONSE, data=f"https://{host}/",
+                module="http_probe",
+                tags={"domain": host, "host": host, "ip": "203.0.113.7",
+                      "port": 443, "status": code, "scheme": "https"},
+            )
+            await self.storage.save_event(sid, ep)
+            await self.storage.project(sid, ep)
+
+        filt = [{"field": "status", "op": "gte", "value": 200},
+                {"field": "status", "op": "lt", "value": 300}]
+        got = await self.storage.search_flat(
+            "example.com", types=["domains"], live=True, limit=50,
+            filters=filt,
+        )
+        codes = sorted(r["status"] for r in got["rows"]
+                       if r["status"] is not None)
+        self.assertEqual(
+            codes, [200],
+            f"筛 2xx 却混进了别的档位：{codes}",
+        )
+
+
+class TestOwnershipStrengthIsExposed(IsolatedAsyncioTestCase):
+    """IP 行要能区分「真归属」与「同段邻居」（2026-10-07）。
+
+    ## 为什么这条要紧
+
+    C 段扫描会整段展开一个 /24，而段里**绝大多数机器属于别人**。实测
+    ``111.0.248.0/24``：254 个 IP 里只有 4 个真的解析到
+    ``www.yealink.com.cn``，另外 250 个是同一台 SLB 后面的其他租户 ——
+    它们返回一样的 ``Server: Tengine`` 和一样的 403，但那**不是**归属证据。
+
+    这两类平铺在同一张表里、标签一模一样时，用户只能靠"一大片 403 看着
+    像别人的"自己判断 —— 而同一台负载均衡后面的机器响应特征完全一致，
+    恰恰是最容易误判的地方。所以后端必须把这个区别**算出来**，
+    让界面能标出来。
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.storage = await make_storage()
+
+    async def asyncTearDown(self) -> None:
+        await drop_storage(self.storage)
+
+    async def test_neighbor_ips_are_kept_out_of_the_asset_list(self) -> None:
+        """归属只能推断的 IP **不进**资产列表（2026-10-07）。
+
+        C 段扫描展开出的 IP 里绝大多数属于别人（全库 803 个归属只是
+        "同段推断"）。它们留在主列表里，用户只能靠"一大片 403 看着像
+        别人的"自己判断 —— 而同一台负载均衡后面的机器响应特征完全一致，
+        这恰恰是最容易误判的地方。
+
+        **它们没有被丢弃**：任务详情的「C 段探测」页签按 /24 聚合展示
+        （归属证据 / 本段扫出 / 已知主机），那才是这个口径该待的地方。
+        """
+        from core.engine.event import Event, EventType
+
+        sid = await self.storage.create_scan(targets=["example.com"], preset="t")
+        # ⚠️ 必须先建域名行 —— ``domain_ip`` 关联要求 parent 那个域名**已存在**
+        # （``project`` 里是 ``SELECT id FROM domain WHERE name = ?`` 查到了才建）。
+        # 不建的话那两个 IP 压根没有域名映射，会掉进 ``none`` 档而不被本过滤命中。
+        d = Event(type=EventType.DNS_NAME, data="www.example.com", module="m")
+        await self.storage.save_event(sid, d)
+        await self.storage.project(sid, d)
+        # 两个 DNS 解析出来的 IP（真归属）
+        for ip in ("93.184.216.7", "93.184.216.8"):
+            e = Event(type=EventType.IP_ADDRESS, data=ip, module="m",
+                      parent_data="www.example.com")
+            await self.storage.save_event(sid, e)
+            await self.storage.project(sid, e)
+        # 三个只有 netblock 标记、没有域名映射的 —— 同段邻居
+        for n in (1, 2, 3):
+            e = Event(type=EventType.IP_ADDRESS, data=f"93.184.216.{n}",
+                      module="netblock_expand",
+                      tags={"netblock": "93.184.216.0/24"})
+            await self.storage.save_event(sid, e)
+            await self.storage.project(sid, e)
+
+        rows = (await self.storage.search_flat(
+            "93.184.216", types=["ips"], live=False, limit=50
+        ))["rows"]
+        own = {r["asset_key"]: r["ownership"] for r in rows
+               if r["asset_type"] == "ips"}
+
+        # 有域名映射的那两个**本来就不作为独立 ip 行列出**（信息挂在域名行上）
+        # 同段推断的那三个现在也不列出了 → 一条都不该剩
+        self.assertEqual(
+            own, {},
+            f"归属只靠推断的 IP 仍在资产列表里：{own}",
+        )
+
+    async def test_vhost_hit_survives_the_filter(self) -> None:
+        """带**域名** Host 头拿到响应的 IP 要留在列表里（归属的较强证据）。
+
+        ⚠️ 判据是「host 长得像域名」，**不是**「host 不是这个 IP」。
+        写成后者会把 C 段邻居之间的互相 vhost 探测算成命中 ——
+        ``port_scan._sibling_domains`` 会把裸 IP 也送去做 vhost 探测，
+        端点 host 记成同段另一个 IP，两边都不是域名（实测踩过）。
+        """
+        from core.engine.event import Event, EventType
+
+        sid = await self.storage.create_scan(targets=["example.com"], preset="t")
+        # 先建域名行（否则没有 domain_ip 关联，那些 IP 会掉进 ``none`` 档）
+        for h in ("www.example.com", "shop.example.com"):
+            d0 = Event(type=EventType.DNS_NAME, data=h, module="m")
+            await self.storage.save_event(sid, d0)
+            await self.storage.project(sid, d0)
+        # C 段邻居，但带**域名** Host 头应答过 → vhost 档
+        # ⚠️ 两条事件的 ``data`` 必须**不同**（比如带不同路径）。
+        # ``uq_event`` 按 ``(scan_id, type, data, kind)`` 去重，而两个 IP
+        # 探的是同一个 URL 的话，第二条会被静默吃掉 ——
+        # ``http_endpoint`` 表里就只剩一个 IP，测的就不是过滤而��去重了。
+        for n, path in ((9, "/a"), (10, "/b")):
+            e = Event(type=EventType.IP_ADDRESS, data=f"93.184.216.{n}",
+                      module="netblock_expand",
+                      tags={"netblock": "93.184.216.0/24"})
+            await self.storage.save_event(sid, e)
+            await self.storage.project(sid, e)
+            ep = Event(type=EventType.HTTP_RESPONSE,
+                       data=f"https://shop.example.com{path}",
+                       module="http_probe",
+                       tags={"domain": "shop.example.com",
+                             "host": "shop.example.com",
+                             "ip": f"93.184.216.{n}", "port": 443,
+                             "status": 200, "scheme": "https"})
+            await self.storage.save_event(sid, ep)
+            await self.storage.project(sid, ep)
+        # 对照：同段邻居之间互相探测（host 是**另一个 IP**）—— 不算命中
+        e = Event(type=EventType.IP_ADDRESS, data="93.184.216.20",
+                  module="netblock_expand",
+                  tags={"netblock": "93.184.216.0/24"})
+        await self.storage.save_event(sid, e)
+        await self.storage.project(sid, e)
+        ep = Event(type=EventType.HTTP_RESPONSE, data="http://93.184.216.21",
+                   module="http_probe",
+                   tags={"domain": "", "host": "93.184.216.21",
+                         "ip": "93.184.216.20", "port": 80,
+                         "status": 403, "scheme": "http"})
+        await self.storage.save_event(sid, ep)
+        await self.storage.project(sid, ep)
+
+        rows = (await self.storage.search_flat(
+            "93.184.216", types=["ips"], live=False, limit=50
+        ))["rows"]
+        own = {r["asset_key"]: r["ownership"] for r in rows
+               if r["asset_type"] == "ips"}
+        self.assertEqual(
+            set(own), {"93.184.216.9", "93.184.216.10"},
+            f"只有带域名 Host 头的该留下：{own}",
+        )
+        for a, o in own.items():
+            self.assertEqual(o, "vhost", f"{a} 归属档算错了")
+        self.assertNotIn(
+            "93.184.216.20", own,
+            "同段 IP 之间的互相探测被算成了 vhost 命中（host 也是 IP）",
+        )
+
+    def test_ownership_is_constant_for_the_five_non_ip_types(self) -> None:
+        """域名/URL/技术栈/发现/端口行的归属是**确定的**，不许出现 neighbor。
+
+        它们各自有名字或有 IP 依附，归属不需要推断。留成常量是为了前端
+        只需要处理两种取值。
+        """
+        from core.storage.postgres import PostgresStorage
+
+        exprs = PostgresStorage._FLAT_OWNER_EXPR
+        for atype in ("domains", "ports", "urls", "technologies", "findings"):
+            with self.subTest(atype=atype):
+                self.assertEqual(
+                    exprs[atype].strip().strip("'\""), "dns",
+                    f"{atype} 的归属恒为 dns，不该出现推断值",
+                )
+
+
+class TestLiveCountAgreesWithTheTabItLabels(IsolatedAsyncioTestCase):
+    """页签上的「存活 N / 总数 M」必须与那个页签列出来的行**同一口径**。
+
+    ## 这条是补一个自己造出来的不一致
+
+    归属过滤（零证据的 C 段邻居不进资产主列表）写进
+    ``_SearchSpec.always`` 之后，``_LIVE_COUNT_SQL`` 里那句
+    ``AND {always}`` 顺手把它也套到了**任务详情页签的存活计数**上 ——
+    而页签列表走 :meth:`PostgresStorage.ips`，那条路径只有
+    ``_seen_clause`` + ``_live_clause``，**没有** ``always``。
+
+    于是扫描 76 的页签写着「存活 **0** / 770」，同一次扫描明明有 4026 个
+    开放端口。这比数据缺失更坏：它把"扫到了"说成"什么都没扫到"，用户会
+    回头怀疑 C 段扫描白跑了。
+
+    ## 规则
+
+    **计数 ⊆ 列表**，且计数只表达"列出来的这些里有多少是活的"。
+    归属过滤要生效的地方是资产管理页，那边列表和计数走同一套
+    ``_SEARCH_SPECS``，天然一致。
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.storage = await make_storage()
+
+    async def asyncTearDown(self) -> None:
+        await drop_storage(self.storage)
+
+    async def _seed_csegment_scan(self) -> int:
+        """一次典型的 C 段扫描：1 台有域名归属 + 3 台纯邻居，各开两个端口。
+
+        纯邻居是**零归属证据**的形状 —— 正是归属过滤要排除的那种。
+        """
+        from core.engine.event import Event, EventType
+
+        sid = await self.storage.create_scan(targets=["example.com"], preset="t")
+        d = Event(type=EventType.DNS_NAME, data="www.example.com", module="m")
+        await self.storage.save_event(sid, d)
+        await self.storage.project(sid, d)
+        own = Event(type=EventType.IP_ADDRESS, data="93.184.216.7", module="m",
+                    parent_data="www.example.com")
+        await self.storage.save_event(sid, own)
+        await self.storage.project(sid, own)
+        for n in (1, 2, 3):
+            e = Event(type=EventType.IP_ADDRESS, data=f"93.184.216.{n}",
+                      module="netblock_expand",
+                      tags={"netblock": "93.184.216.0/24"})
+            await self.storage.save_event(sid, e)
+            await self.storage.project(sid, e)
+        for host in ("93.184.216.1", "93.184.216.2", "93.184.216.3",
+                     "93.184.216.7"):
+            for port in (80, 443):
+                pe = Event(type=EventType.OPEN_TCP_PORT,
+                           data=f"{host}:{port}", module="port_scan",
+                           tags={"ip": host, "port": port, "domain": "",
+                                 "proto": "tcp"})
+                await self.storage.save_event(sid, pe)
+                await self.storage.project(sid, pe)
+        return sid
+
+    async def test_neighbor_ips_still_count_as_live_in_the_scan_tab(self) -> None:
+        """纯邻居在**这次扫描**的 IP 页签里必须是"存活"的。
+
+        它们确实探到端口了 —— ``port`` 表里那些行就是证据。把它们算成
+        未探活，等于对"探活做完了"这件事撒谎。
+        """
+        sid = await self._seed_csegment_scan()
+        s = await self.storage.summary(sid)
+        self.assertEqual(s["ips"], 4, "夹具前提不对：这次扫描应看到 4 台 IP")
+        self.assertEqual(
+            s["ips_live"], 4,
+            f"页签写着「存活 {s['ips_live']} / {s['ips']}」—— "
+            f"4 台都有开放端口，全被判成未探活",
+        )
+
+    async def test_live_count_never_exceeds_the_rows_the_tab_lists(self) -> None:
+        """通用不变式：四种资产的存活计数都不得超过该页签列出的行数。
+
+        这条比"某个具体数字对不对"更耐改 —— 以后再有人给 ``_LIVE_COUNT_SQL``
+        加条件，它会立刻在这里现形。
+        """
+        sid = await self._seed_csegment_scan()
+        s = await self.storage.summary(sid)
+        for label, rows in (
+            ("ips_live", await self.storage.ips(sid)),
+            ("domains_live", await self.storage.domains(sid)),
+            ("ports_live", await self.storage.ports(sid)),
+        ):
+            with self.subTest(label=label):
+                self.assertLessEqual(
+                    s[label], len(rows),
+                    f"{label}={s[label]} 但该页签只列 {len(rows)} 行 —— "
+                    f"计数不在列表范围内，页签上的比例是编出来的",
+                )
+
+    async def test_asset_list_and_scan_tab_keep_their_own_admission_rules(
+        self,
+    ) -> None:
+        """两个地方**故意**用不同口径，别再有人把它们"统一"到一起。
+
+        * 资产管理页（跨扫描）：纯邻居**不出现** —— 它们是"可能属于别人"。
+        * 任务详情 IP 页签（单次扫描）：纯邻居**出现** —— 它们是"这次明确
+          扫过、且有观测结果"的机器，不因为归属存疑就假装没扫到。
+        """
+        sid = await self._seed_csegment_scan()
+
+        tab = await self.storage.ips(sid)
+        self.assertEqual(
+            {r["addr"] for r in tab},
+            {"93.184.216.1", "93.184.216.2", "93.184.216.3", "93.184.216.7"},
+            "任务详情的 IP 页签必须仍然列出全部 4 台",
+        )
+
+        flat = (await self.storage.search_flat(
+            "93.184.216", types=["ips"], live=False, limit=50))["rows"]
+        self.assertEqual(
+            [r for r in flat if r["asset_type"] == "ips"], [],
+            "资产主列表不该出现零归属证据的 IP",
+        )
+
+
+class TestRepeatedFindingsAreCollapsed(IsolatedAsyncioTestCase):
+    """同一结论被重复上报时，详情面板只列一条 + 标次数（2026-10-07）。
+
+    ## 根因
+
+    ``uq_finding`` 的唯一键是 ``(scan_id, kind, target, detail)`` ——
+    **detail 参与去重**。只要模块把会变的计数写进 detail
+    （"（18 条待验）"、"checked 312 条里有 12 条"），每来一条新观测就
+    产生一条**内容不同**的 finding，唯一键压不住。
+
+    实测 ``www.yealink.com.cn`` 39 条发现里，20 条是同一句
+    "疑似有 WAF 跳过 URL 验证"，只有括号里的数字在变。
+
+    折叠时按**抹掉数字后的** detail 比签名 —— 否则「18 条待验」与
+    「23 条待验」仍是两条不同的，那正是要消灭的情况。
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.storage = await make_storage()
+
+    async def asyncTearDown(self) -> None:
+        await drop_storage(self.storage)
+
+    async def _put(self, sid: int, kind: str, target: str, detail: str,
+                   severity: str = "info", created: str = "") -> None:
+        ev = Event(type=EventType.FINDING, data=target, module="m",
+                   tags={"kind": kind, "severity": severity, "detail": detail})
+        await self.storage.save_event(sid, ev)
+        await self.storage.project(sid, ev)
+        if created:
+            await self.storage._fetchall(
+                "UPDATE finding SET created_at = ? WHERE scan_id = ? "
+                "AND kind = ? AND target = ? AND detail = ?",
+                (created, sid, kind, target, detail),
+            )
+
+    async def _domain(self, sid: int, name: str) -> None:
+        """建一行 domain —— **不做这一步 ``host_detail`` 直接返回 None**。
+
+        域名视图的 ``host_detail`` 开头就是 ``SELECT ... FROM domain
+        WHERE name = ?``，查不到就 ``return None``（那时才会走裸 IP 分支）。
+        """
+        ev = Event(type=EventType.DNS_NAME, data=name, module="m", tags={})
+        await self.storage.save_event(sid, ev)
+        await self.storage.project(sid, ev)
+
+    async def test_same_conclusion_with_differing_counts_becomes_one(
+        self,
+    ) -> None:
+        sid = await self.storage.create_scan(targets=["example.com"], preset="t")
+        await self._domain(sid, "a.example.com")
+        for n in (18, 19, 20, 21, 22, 23):
+            await self._put(
+                sid, "疑似有 WAF", "https://a.example.com",
+                f"前面有 WAF，本轮没有逐条请求（{n} 条待验）。",
+                created=f"2026-01-01T00:00:{n:02d}",
+            )
+        # 另一条**真的不同**的结论，不该被合掉
+        await self._put(sid, "cdn", "a.example.com", "命中 CDN：阿里云",
+                        created="2026-01-01T00:01:00")
+
+        d = await self.storage.host_detail("a.example.com")
+        kinds = [f["kind"] for f in d["findings"]]
+        self.assertEqual(
+            kinds.count("疑似有 WAF"), 1,
+            f"同一句话说了 6 遍，列表里应只剩 1 条：{d['findings']}",
+        )
+        waf = next(f for f in d["findings"] if f["kind"] == "疑似有 WAF")
+        self.assertEqual(waf["repeat"], 6, "次数没标对")
+        self.assertEqual(kinds.count("cdn"), 1, "不同结论被误合了")
+        # 真实总数仍然是 7 —— 折叠只是展示层的事，账不能少记
+        self.assertEqual(d["counts"]["findings"], 7,
+                         "折叠后 counts 必须是真实总数，否则账目对不上")
+
+    async def test_genuinely_different_details_are_kept_apart(self) -> None:
+        """detail 里的**非数字**差异是真信息，不能合。
+
+        ⚠️ 5 张证书的 ``target`` 必须是**同一个**（证书过期是按
+        ``*.ucdl.pp.uc.cn`` 记的，实测 26 条全挂在同一个 target 上），
+        差异在 detail 的 CN 里。若把 target 写成 host0..host4，
+        ``target LIKE '%host0.example.com%'`` 只会匹配到 1 条 ——
+        那测的就不是折叠而是检索了。
+        """
+        sid = await self.storage.create_scan(targets=["example.com"], preset="t")
+        await self._domain(sid, "cdn.example.com")
+        # 5 张不同的过期证书，挂在同一个 target 上，CN 各不相同
+        for i in range(5):
+            await self._put(
+                sid, "cert_expired", "*.cdn.example.com",
+                f"证书已过期 (2020-01-0{i + 1}, CN=*.svc{i}.example.com)",
+                severity="medium",
+                created=f"2026-01-01T00:00:{i:02d}",
+            )
+        d = await self.storage.host_detail("cdn.example.com")
+        self.assertEqual(
+            d["counts"]["findings"], 5,
+            "5 张不同证书被折成一条了 —— 那是真信息，折叠等于丢信息",
+        )
+
+    async def test_http_and_https_targets_stay_separate(self) -> None:
+        """``http://x`` 与 ``https://x`` 是**两次不同的检测**，不该合。"""
+        sid = await self.storage.create_scan(targets=["example.com"], preset="t")
+        await self._domain(sid, "a.example.com")
+        for t in ("http://a.example.com", "https://a.example.com"):
+            await self._put(
+                sid, "识别到 WAF，跳过目录爆破", t,
+                "站点响应里有 WAF 特征（3 条），已放弃。",
+                created="2026-01-01T00:00:00",
+            )
+        d = await self.storage.host_detail("a.example.com")
+        self.assertEqual(
+            d["counts"]["findings"], 2,
+            "http 与 https 两次检测被合成一条了",
+        )
+
+
+class TestOpenPortsAreLiveByThemselves(IsolatedAsyncioTestCase):
+    """**端口开着就是活着** —— ``ports`` 的 live 片段恒真（2026-10-07）。
+
+    ## 为什么这条要单独占一个类
+
+    它需要 ``storage``（真跑一次查询），所以必须落在
+    ``IsolatedAsyncioTestCase`` 里。**写进同步的 ``TestLiveFilterShape``
+    会得到一条骗人的假绿**：pytest 只发一条 ``coroutine ... was never
+    awaited`` 的 RuntimeWarning，然后照常算它通过。（实测踩过，
+    114 passed 里混着一条根本没跑的用例。）
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.storage = await make_storage()
+
+    async def asyncTearDown(self) -> None:
+        await drop_storage(self.storage)
+
+    async def test_open_ports_survive_the_live_filter(self) -> None:
+        """开着但**不吐 HTTP** 的端口行必须留在存活列表里。
+
+        原口径是"这一行要有 http_endpoint 观测"，于是 25/110/143 这种
+        本来就不吐 HTTP 的端口整批被判成"未探活" —— 实测 16245 行里
+        只有 1190 行（7.3%）通过，2177 个 SMTP 与 2177 个 IMAP 全消失。
+
+        端口扫描**做了**、端口**确实开着**，那就是探活过且存活。
+        """
+        from core.engine.event import Event, EventType
+
+        sid = await self.storage.create_scan(targets=["example.com"], preset="t")
+        e = Event(type=EventType.IP_ADDRESS, data="203.0.113.30", module="t")
+        await self.storage.save_event(sid, e)
+        await self.storage.project(sid, e)
+        # 只有 25(SMTP) —— 邮件端口永远不会有 HTTP 观测
+        pe = Event(type=EventType.OPEN_TCP_PORT, data="203.0.113.30:25",
+                   module="port_scan",
+                   tags={"ip": "203.0.113.30", "port": 25, "domain": "",
+                         "proto": "tcp"})
+        await self.storage.save_event(sid, pe)
+        await self.storage.project(sid, pe)
+
+        # ⚠️ ``search_counts`` 是协程 —— 少一个 await 会得到
+        # ``TypeError: 'coroutine' object is not subscriptable``，
+        # 而它只在真的 await 之后才报错，所以写错了很难一眼看出是漏 await。
+        counts = await self.storage.search_counts(
+            "203.0.113", types=["ports"], live=True
+        )
+        self.assertEqual(
+            counts["ports"], 1,
+            "开着 SMTP 的端口行被判成未探活 —— 它确实开着，就是不发 HTTP",
+        )
+        # ``search_flat`` 走的是另一条 live（``_SEARCH_SPECS``），两处都要对
+        got = await self.storage.search_flat(
+            "203.0.113", types=["ports"], live=True, limit=10
+        )
+        self.assertEqual(got["total"], 1, "资产管理页那条路径漏改了")
+
+    def test_ports_live_is_consistent_in_both_places(self) -> None:
+        """``ports`` 的 live 判据在**两处**都必须恒真。
+
+        同一个概念有两个定义：``_LIVE_SQL``（任务详情页那几个列表）与
+        ``_SEARCH_SPECS['ports'].live``（资产管理页的 ``/api/search/flat``）。
+        改一处不改另一处**不会报错、不警告**，就是数据少了 ——
+        实测只改 ``_LIVE_SQL`` 时接口照旧返回 0 条，很难定位。
+
+        这条把两边钉在一起：任何一边单独改掉，另一边不动就会红。
+        """
+        from core.storage.postgres import _SEARCH_SPECS
+
+        self.assertEqual(
+            _LIVE_SQL["ports"][0].strip().upper(), "TRUE",
+            "_LIVE_SQL 里的 ports live 应恒真",
+        )
+        self.assertEqual(
+            _SEARCH_SPECS["ports"].live.strip().upper(), "TRUE",
+            "_SEARCH_SPECS 里的 ports live 应恒真（它管资产管理页）",
+        )
+        self.assertEqual(
+            _SEARCH_SPECS["ports"].live_params, 0,
+            "恒真片段不吃 scan_id 参数，多一个会整体错位",
+        )
+        self.assertEqual(
+            _SEARCH_SPECS["ports"].live_any.strip().upper(), "TRUE",
+            "跨扫描检索（scan_id=None）的兜底条件也要恒真",
         )
 
 

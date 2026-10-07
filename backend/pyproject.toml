@@ -41,3 +41,14 @@ include = ["core*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# ⚠️ **协程从未被 await 视为错误，而不是警告。**
+#
+# 往同步的 ``unittest.TestCase`` 里塞一个 ``async def`` 用例，pytest
+# 只会发一条 RuntimeWarning 然后**照常算它通过** —— 一条根本没跑的用例
+# 混在全绿的报告里，比失败危险得多（实测踩过：114 passed 里混着一条
+# 一次都没执行的端口存活用例）。
+#
+# 提到 error 之后它当场失败，问题一眼可见。
+filterwarnings = [
+    "error::RuntimeWarning",
+]

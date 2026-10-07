@@ -64,6 +64,28 @@
           </a-select-option>
         </a-select>
 
+        <!--
+          状态码档位。**单选**而不是多选：四个档位互斥，同时选 2xx 和 4xx
+          等于"只要有状态码的"，那不如不筛 —— 单选让每个选项都有明确含义。
+          留空 = 全部状态码（含"压根没有 HTTP 响应"的那些）。
+
+          放这个位置的理由：状态码是**看列表结果时的第二把尺**（第一把是
+          关键词），紧跟在"按哪个任务"之后、"什么时间段"之前 ——
+          先定范围（谁的、什么状态），再看细节（什么时候）。
+        -->
+        <a-select
+          v-model:value="statusBucket"
+          style="width: 150px; margin-left: 10px"
+          size="middle"
+          allow-clear
+          placeholder="全部状态码"
+          @change="onStatusClassChange"
+        >
+          <a-select-option v-for="c in STATUS_CLASSES" :key="c.value" :value="c.value">
+            {{ c.value }}
+          </a-select-option>
+        </a-select>
+
         <!-- 时间段：按「首见时间」筛。留空 = 全部时间（默认，与"默认显示全部"一致） -->
         <a-range-picker
           v-model:value="dateRange"
@@ -139,22 +161,57 @@
             <!-- 副标题：光有 IP / 技术名看不出这是谁的，补一行上下文 -->
             <div v-if="subtitleOf(record)" class="type-label">{{ subtitleOf(record) }}</div>
             <div v-else class="type-label">{{ assetLabel(record._type) }}</div>
+
+            <!-- 「vhost 命中」标签：带目标的 Host 头发请求并拿到了响应 ——
+                 对方确实在用这个域名服务，是归属的**较强证据**。
+                 与「有域名映射」（DNS 直接解析）不同但同样属于"算资产的"，
+                 所以留在主列表里，只标出来让人知道它的证据来自哪。 -->
+            <a-tooltip v-if="record.ownership === 'vhost'">
+              <template #title>
+                这台机器**带目标的 Host 头**响应过请求 —— 对方按那个 Host
+                应答了，说明它确实在服务这个域名。
+              </template>
+              <a-tag color="green" class="owner-tag">Host 头命中</a-tag>
+            </a-tooltip>
           </template>
 
           <template v-else-if="column.key === 'alive'">
-            <!-- 只给一个健康标记，状态码挪到「标题 / 状态」列 ——
+            <!-- 只给一个存活标记，状态码挪到「标题 / 状态」列 ——
                  状态码放在这里等于把同一份信息显示两遍。
 
-                 绿 = 响应正常（status < 400）；灰 = 其余两种完全不同的情形：
-                 「响应了但 4xx/5xx」与「压根没有 Web 响应」。tooltip 分开说，
-                 别让灰点一律读成"站点挂了"。 -->
+                 绿 = 有 Web 响应且正常（status < 400）；灰 = 这台机器
+                 有端口但**没有 Web 服务**。tooltip 要点明这一点 ——
+                 别让灰点一律读成"站点挂了"，开着 MySQL 的主机是活的。 -->
             <span
               class="alive-dot"
               :class="record.status != null && record.status < 400 ? 'on' : 'off'"
               :title="record.status == null
-                ? '无 Web 响应（没探到 http 服务）'
+                ? (serviceListOf(record).length
+                    ? `无 Web 服务，但开放了 ${serviceListOf(record).join('、')}`
+                    : '无 Web 响应')
                 : `HTTP ${record.status}${record.status >= 400 ? '（异常）' : ''}`"
             />
+          </template>
+
+          <template v-else-if="column.key === 'service'">
+            <!-- 第一个服务名 + `+N`，全串在 tooltip 里。
+                 只显示个数（2026-10-07 的版本）不行：「协议 5」和「端口 5」
+                 并排是两个一样的数字，一个字都没多出来。`HTTP +9` 至少一眼
+                 看得出这是台**开着 Web 服务**的机器 —— 而"有没有 Web"
+                 正是左边「存活」列绿灰的判据，两列互相印证。 -->
+            <a-tooltip
+              v-if="serviceListOf(record).length"
+              :title="serviceListOf(record).join(', ')"
+            >
+              <span class="svc-cell">
+                <span class="svc-main">{{ serviceListOf(record)[0] }}</span>
+                <span
+                  v-if="serviceListOf(record).length > 1"
+                  class="svc-more"
+                >+{{ serviceListOf(record).length - 1 }}</span>
+              </span>
+            </a-tooltip>
+            <span v-else class="tk-muted">—</span>
           </template>
 
           <template v-else-if="column.key === 'ports'">
@@ -186,10 +243,19 @@
 
           <template v-else-if="column.key === 'title'">
             <!-- 标题和状态码同一行（状态码在右）。标题过长时状态码优先保留，
-                 所以标题用 flex-shrink 让位，而不是把状态码挤到第二行。 -->
+                 所以标题用 flex-shrink 让位，而不是把状态码挤到第二行。
+
+                 ⚠️ **「无响应」和「—」不是一回事。**
+                 后端会给无 HTTP 端点的 IP 行填上开放端口摘要
+                 （``80 HTTP / 443 HTTPS``），所以 title 一般不为空；
+                 真正落到这里的要么是没扫到、要么是扫完一个服务都没有 ——
+                 两者都得写出来，横线会让用户以为是"字段坏了"。 -->
             <div class="title-row">
               <span v-if="record.title" class="title-cell">{{ record.title }}</span>
-              <span v-else class="tk-muted title-cell">—</span>
+              <span v-else-if="portListOf(record).length" class="tk-muted title-cell">
+                有端口，无 HTTP 响应
+              </span>
+              <span v-else class="tk-muted title-cell">无响应</span>
               <span
                 v-if="record.status != null"
                 class="code-chip"
@@ -273,30 +339,254 @@
                 v-if="primaryStatus != null"
                 :color="statusClass(primaryStatus) === 'ok' ? 'green' : 'orange'"
               >HTTP {{ primaryStatus }}</a-tag>
+              <!-- 「未探活」只对**域名**成立。对裸 IP 说未探活是误导：它压根没走
+                   过 HTTP —— 端口扫描扫完发现没有 Web 服务，这才是事实。
+                   混为一谈会让用户以为这台机器被访问过而没有响应。 -->
+              <a-tag v-else-if="detail.domain.is_ip" color="orange">无 Web 服务</a-tag>
               <span v-else class="tk-muted">未探活</span>
               <a-tag v-if="detail.domain.is_cdn" color="cyan">CDN</a-tag>
               <a-tag v-if="detail.domain.is_wildcard" color="purple">泛解析</a-tag>
+              <a-tag v-if="detail.domain.is_cloud" color="gold">云主机</a-tag>
               <span class="tk-muted">{{ summaryText }}</span>
+            </div>
+            <div v-if="detail.domain.org" class="source-line">
+              <span class="tk-muted">归属</span>
+              <span class="tk-mono">{{ detail.domain.org }}</span>
+              <span v-if="detail.domain.country" class="tk-muted">
+                {{ detail.domain.country }}
+              </span>
             </div>
             <div v-if="detail.domain.source" class="source-line">
               <span class="tk-muted">来源</span>
               <a-tag v-for="s in allSources" :key="s" color="blue" class="src-tag">{{ s }}</a-tag>
             </div>
-            <div v-if="detail.domain.ips" class="ips-line">
-              <span class="tk-muted">IP</span>
-              <span class="tk-mono">{{ detail.domain.ips }}</span>
+            <!-- IP 列表。**每个 IP 一格**，超出 24 个折叠。
+                 原来是 ``1.180.16.1, 1.180.16.2, …`` 拼成一大段 ——
+                 71 个 IP（阿里云 CDN 调度域实测）横铺 8 行，既读不出是哪些、
+                 也点不开任何一个。
+                 每格可点：点进去就是那个 IP 的详情。
+                 ⚠️ ``ip_list`` 是后端给的**数组**（``ip_list`` 列），
+                 不是 split 逗号串 —— 串里 ``", "`` / ``","`` 两种分隔符
+                 混用，前端要处理两套，而数组还顺带区分了「解析过但 0 个」
+                 （``[]``）与「没查过」（``null``）。 -->
+            <div v-if="domainIpList.length" class="ips-line">
+              <span class="tk-muted">
+                IP<template v-if="domainIpList.length > 1">（{{ domainIpList.length }}）</template>
+              </span>
+              <a-space :size="[4, 4]" wrap class="ip-chips">
+                <a-tag
+                  v-for="ip in shownIps"
+                  :key="ip"
+                  color="default"
+                  class="ip-chip"
+                  @click="openIpDetail(ip)"
+                >{{ ip }}</a-tag>
+                <a-button
+                  v-if="domainIpList.length > IP_CHIPS_MAX"
+                  type="link"
+                  size="small"
+                  @click="showAllIps = !showAllIps"
+                >
+                  {{ showAllIps
+                    ? '收起'
+                    : `还有 ${domainIpList.length - IP_CHIPS_MAX} 个…` }}
+                </a-button>
+              </a-space>
             </div>
           </section>
 
-          <!-- 同域名空间下的其他域名。紧跟「基本信息」是因为它决定了这个域名在
-               整张攻击面里的位置 —— 哪些兄弟域名没解析出来、哪些和它共用
-               一台机器，都是一眼要看到的东西。 -->
+          <!-- 技术栈 -->
+          <section v-if="detail.technologies.length" class="d-section">
+            <h4 class="d-head">技术栈 ({{ detail.counts.technologies }})</h4>
+            <a-space wrap>
+              <a-tag v-for="t in detail.technologies" :key="t.name" color="geekblue">
+                {{ t.name }}<template v-if="t.version"> {{ t.version }}</template>
+              </a-tag>
+            </a-space>
+          </section>
+
+          <!-- 开放端口。**只在 IP 视图下出现**（detail.ports 只由后端的裸 IP
+               分支给出，域名分支没有这个字段）。
+               对 C 段扫出来的邻居地址来说，这往往是这个资产**唯一**的信息 ——
+               它没有域名、没有 HTTP 端点，但可能开着 80/443/8080。
+               实测 155.102.54.148：什么都没挂，却开着 25/80/110/143/443 五个
+               端口 —— 原来的面板对它是全空的，点开等于没东西可看。 -->
+          <section v-if="detail.ports && detail.ports.length" class="d-section">
+            <h4 class="d-head">
+              开放端口 ({{ detail.ports.length }})
+              <span v-if="detail.domain.netblock" class="d-head-warn">
+                C 段 {{ detail.domain.netblock }} 展开
+              </span>
+            </h4>
+            <a-space wrap>
+              <a-tag
+                v-for="p in detail.ports"
+                :key="p.port + '/' + p.protocol"
+                :color="portTagColor(p.port)"
+              >{{ p.port }}/{{ p.protocol }}</a-tag>
+            </a-space>
+          </section>
+
+          <!-- 探测 -->
+          <section v-if="detail.endpoints.length" class="d-section">
+            <h4 class="d-head">探测 ({{ detail.counts.endpoints }})</h4>
+            <a-descriptions :column="1" size="small" bordered>
+              <a-descriptions-item v-if="baseUrl" label="基础 URL">
+                <a :href="baseUrl" target="_blank" rel="noreferrer" class="tk-mono">
+                  {{ baseUrl }}
+                </a>
+              </a-descriptions-item>
+              <a-descriptions-item v-if="primaryEndpoint?.title" label="标题">
+                {{ primaryEndpoint.title }}
+              </a-descriptions-item>
+              <a-descriptions-item v-if="primaryEndpoint?.server" label="Server">
+                <span class="tk-mono">{{ primaryEndpoint.server }}</span>
+              </a-descriptions-item>
+              <a-descriptions-item v-if="primaryEndpoint?.content_length" label="长度">
+                {{ primaryEndpoint.content_length }}
+              </a-descriptions-item>
+              <a-descriptions-item label="入库时间">
+                {{ shortTime(detail.domain.first_seen) }}
+              </a-descriptions-item>
+            </a-descriptions>
+          </section>
+
+          <!-- 路径。
+               ⚠️ **未探活的默认折叠，不与探活过的混在一张表里。**
+               原来两种混排：一屏 37 行里 35 行写着「未探活」，真正有信息的
+               只有 2 行 —— 用户要翻很久才看到能用的信息。
+
+               但**不能删**：这些路径是 dir_brute / url_extract / js_assets
+               **发现**出来的，是真实资产线索。实测 www.yealink.com.cn：
+               /case、/contact、/material 手工 HEAD 验都是 200（真存在），
+               而 /new 是 js_assets 从 JS 里误抽的（404）—— 也就是说
+               这批里真货和误报混在一起，删掉就把真货也扔了。
+
+               所以：**折叠，不删**，并且写清楚为什么没探（见 unprobedHint）。-->
+          <section v-if="allPaths.length" class="d-section">
+            <h4 class="d-head">
+              URL / 目录与路径 ({{ probedPaths.length }}<template
+                v-if="unprobedPaths.length"
+              > / {{ allPaths.length }}</template>)
+            </h4>
+
+            <a-table
+              v-if="probedPaths.length"
+              :columns="pathColumns"
+              :data-source="probedPaths"
+              row-key="url"
+              size="small"
+              :pagination="{ pageSize: 10, showSizeChanger: false }"
+            >
+              <template #bodyCell="{ column, record }">
+                <template v-if="column.key === 'url'">
+                  <a :href="record.url" target="_blank" rel="noreferrer" class="tk-mono path-url">
+                    {{ record.url }}
+                  </a>
+                  <div v-if="record.parent_url" class="tk-muted parent">来自 {{ record.parent_url }}</div>
+                </template>
+                <template v-else-if="column.key === 'status'">
+                  <span class="status-pill" :class="statusClass(record.status)">
+                    {{ record.status }}
+                  </span>
+                </template>
+                <template v-else-if="column.key === 'title'">
+                  <span v-if="record.title" :title="record.title">{{ record.title }}</span>
+                  <span v-else class="tk-muted">—</span>
+                </template>
+              </template>
+            </a-table>
+
+            <!-- 未探活的：折叠 + 说清原因。**不能默默藏起来** ——
+                 用户看到「路径 37」却只有 2 行会以为数据丢了。 -->
+            <div v-if="unprobedPaths.length" class="unprobed-block">
+              <a-button type="link" size="small" @click="showUnprobed = !showUnprobed">
+                <template v-if="!showUnprobed">
+                  ▸ 还有 {{ unprobedPaths.length }} 条已发现但未探活的路径
+                </template>
+                <template v-else>▾ 收起未探活的路径</template>
+              </a-button>
+              <div v-if="unprobedHint" class="tk-muted unprobed-hint">
+                {{ unprobedHint }}
+              </div>
+              <a-table
+                v-if="showUnprobed"
+                :columns="pathColumns"
+                :data-source="unprobedPaths"
+                row-key="url"
+                size="small"
+                :pagination="{ pageSize: 10, showSizeChanger: false }"
+              >
+                <template #bodyCell="{ column, record }">
+                  <template v-if="column.key === 'url'">
+                    <a :href="record.url" target="_blank" rel="noreferrer" class="tk-mono path-url">
+                      {{ record.url }}
+                    </a>
+                    <div v-if="record.parent_url" class="tk-muted parent">
+                      来自 {{ record.parent_url }}
+                    </div>
+                  </template>
+                  <template v-else-if="column.key === 'status'">
+                    <span class="tk-muted">未探活</span>
+                  </template>
+                  <template v-else-if="column.key === 'title'">
+                    <span class="tk-muted">
+                      {{ record.source === 'js_assets' ? 'JS 里抽到的，未验证' : '未验证' }}
+                    </span>
+                  </template>
+                </template>
+              </a-table>
+            </div>
+          </section>
+
+          <!-- 发现。
+                 后端按 ``(kind, target, detail)`` 折叠过：同一条结论被重复
+                 上报（历史上把"18 条待验"这种会变的计数写进了 detail，
+                 压不住唯一键）时只留一条，带 ``repeat`` 标次数。 -->
+          <section v-if="detail.findings.length" class="d-section">
+            <h4 class="d-head">
+              发现 ({{ detail.counts.findings }})
+              <span
+                v-if="collapsedFindingCount > 0"
+                class="d-head-sub"
+              >已合并 {{ collapsedFindingCount }} 条重复结论</span>
+            </h4>
+            <div v-for="(f, i) in detail.findings" :key="i" class="finding-item">
+              <a-tag :color="severityColor(f.severity)" class="risk-tag">
+                {{ severityLabel(f.severity) }}
+              </a-tag>
+              <a-tooltip
+                v-if="f.repeat > 1"
+                :title="`同一结论本轮共上报 ${f.repeat} 次`"
+              >
+                <a-tag class="repeat-tag">×{{ f.repeat }}</a-tag>
+              </a-tooltip>
+              <div class="finding-body">
+                <div class="finding-kind">{{ f.kind }}</div>
+                <div v-if="f.detail" class="tk-muted finding-detail">{{ f.detail }}</div>
+              </div>
+            </div>
+          </section>
+
+          <!-- 同域名空间下的其他域名。放在**倒数第二**（2026-10-07 从「基本信息」
+               后面挪过来）。
+
+               原来的理由是"它决定了这个域名在整张攻击面里的位置"，但实践下来
+               那个理由站不住：这一屏 42 行兄弟域名、7 页分页，**它一个人就把
+               技术栈、端口、探测、路径、发现全顶到了折叠线以下** —— 而那些
+               区块才是"这个资产本身是什么"，先看这个才该先看它们。
+
+               它是**周边资产**，不是这个资产。放最后既符合阅读顺序
+               （主体 → 周边），也让上面每个区块不用先滚 7 页才看得全。 -->
           <section
             v-if="detail.related_domains && detail.related_domains.length"
             class="d-section"
           >
             <h4 class="d-head">
-              同域名空间的其他域名 ({{ detail.counts.related_domains }})
+              同根域的其他域名 ({{ detail.counts.related_domains }})
+              <span class="d-head-sub">
+                同一个根域下（{{ detail.domain.name?.split('.').slice(-2).join('.') }}）的兄弟域名
+              </span>
               <span
                 v-if="detail.counts.related_domains_unresolved"
                 class="d-head-warn"
@@ -341,91 +631,16 @@
             </a-table>
           </section>
 
-          <!-- 技术栈 -->
-          <section v-if="detail.technologies.length" class="d-section">
-            <h4 class="d-head">技术栈 ({{ detail.counts.technologies }})</h4>
-            <a-space wrap>
-              <a-tag v-for="t in detail.technologies" :key="t.name" color="geekblue">
-                {{ t.name }}<template v-if="t.version"> {{ t.version }}</template>
-              </a-tag>
-            </a-space>
-          </section>
+          <!-- 溯源：**放在最底部**（2026-10-07 从「发现」之前挪过来）。
 
-          <!-- 探测 -->
-          <section v-if="detail.endpoints.length" class="d-section">
-            <h4 class="d-head">探测 ({{ detail.counts.endpoints }})</h4>
-            <a-descriptions :column="1" size="small" bordered>
-              <a-descriptions-item v-if="baseUrl" label="基础 URL">
-                <a :href="baseUrl" target="_blank" rel="noreferrer" class="tk-mono">
-                  {{ baseUrl }}
-                </a>
-              </a-descriptions-item>
-              <a-descriptions-item v-if="primaryEndpoint?.title" label="标题">
-                {{ primaryEndpoint.title }}
-              </a-descriptions-item>
-              <a-descriptions-item v-if="primaryEndpoint?.server" label="Server">
-                <span class="tk-mono">{{ primaryEndpoint.server }}</span>
-              </a-descriptions-item>
-              <a-descriptions-item v-if="primaryEndpoint?.content_length" label="长度">
-                {{ primaryEndpoint.content_length }}
-              </a-descriptions-item>
-              <a-descriptions-item label="入库时间">
-                {{ shortTime(detail.domain.first_seen) }}
-              </a-descriptions-item>
-            </a-descriptions>
-          </section>
+               它回答的是"这条记录是哪几次任务带来的" —— 属于**元信息**，
+               不是这个资产本身的内容。放在主体区块（基本信息 / 端口 /
+               探测 / 路径 / 发现）之前，会让人先看到两个任务编号、
+               再去翻资产到底有什么。
 
-          <!-- 路径 -->
-          <section v-if="allPaths.length" class="d-section">
-            <h4 class="d-head">URL / 目录与路径 ({{ allPaths.length }})</h4>
-            <a-table
-              :columns="pathColumns"
-              :data-source="allPaths"
-              row-key="url"
-              size="small"
-              :pagination="{ pageSize: 10, showSizeChanger: false }"
-            >
-              <template #bodyCell="{ column, record }">
-                <template v-if="column.key === 'url'">
-                  <a :href="record.url" target="_blank" rel="noreferrer" class="tk-mono path-url">
-                    {{ record.url }}
-                  </a>
-                  <div v-if="record.parent_url" class="tk-muted parent">来自 {{ record.parent_url }}</div>
-                </template>
-                <template v-else-if="column.key === 'status'">
-                  <span v-if="record.status != null" class="status-pill" :class="statusClass(record.status)">
-                    {{ record.status }}
-                  </span>
-                  <!-- 写「未探活」而不是「—」。
-                       「—」读起来像"这个字段坏了"，而真实原因是：这条路径是
-                       dir_brute / url_extract **发现**出来的，从来没人去请求过
-                       它，所以根本没有状态码可显示。实测 mail.sinosoft.com.cn
-                       的 244 条路径里 243 条都是这种情况。 -->
-                  <span v-else class="tk-muted">未探活</span>
-                </template>
-                <template v-else-if="column.key === 'title'">
-                  <span v-if="record.title" :title="record.title">{{ record.title }}</span>
-                  <span v-else class="tk-muted">{{ record.status != null ? '—' : '未探活' }}</span>
-                </template>
-              </template>
-            </a-table>
-          </section>
-
-          <!-- 发现 -->
-          <section v-if="detail.findings.length" class="d-section">
-            <h4 class="d-head">发现 ({{ detail.counts.findings }})</h4>
-            <div v-for="(f, i) in detail.findings" :key="i" class="finding-item">
-              <a-tag :color="severityColor(f.severity)" class="risk-tag">
-                {{ severityLabel(f.severity) }}
-              </a-tag>
-              <div class="finding-body">
-                <div class="finding-kind">{{ f.kind }}</div>
-                <div v-if="f.detail" class="tk-muted finding-detail">{{ f.detail }}</div>
-              </div>
-            </div>
-          </section>
-
-          <!-- 溯源 -->
+               顺带一提：这一块常常是**跨任务**的（实测 www.yealink.com.cn
+               被 #50 与 #76 两次任务都扫到），所以它天然属于面板末尾 ——
+               看完当前这份数据，才想追溯它从哪儿来。 -->
           <section v-if="detail.scans.length" class="d-section">
             <h4 class="d-head">来源扫描</h4>
             <a-space wrap>
@@ -474,9 +689,13 @@ const keyword = ref('')
 //: 3. **「未探活」这个叫法不准。** 那 90 个「未探活」的域名里有 36% 其实**开着
 //:    端口**，只是端口不是 web 服务。它真正表达的是"这台机器有没有 Web 响应"。
 //:
-//: 那一列**保留**（列名改成「健康」，含义=status<400 染绿），要按这个维度筛的
-//: 时候走搜索词或右侧详情面板。⚠️ 若要恢复成筛选器，**必须下推给后端**
-//: （``/api/search/flat`` 的 ``live`` 口径走 ``scan_asset``），别再在前端过滤。
+//: 那一列现在叫「存活」（2026-10-07 从「健康」改回）：这一页的行按定义
+//: 都是活的（``live: true``，后端已保证有 HTTP 响应或有开放端口），
+//: 所以这一列真正在回答的是"**有没有 Web 服务**" —— 绿 = 有且正常，
+//: 灰 = 有机器但不是 Web（开着 3306 / 25 这些非 Web 端口）。
+//: 要按这个维度筛的时候走搜索词或右侧详情面板。⚠️ 若要恢复成筛选器，
+//: **必须下推给后端**（``/api/search/flat`` 的 ``live`` 口径走 ``scan_asset``），
+//: 别再在前端过滤。
 //: 时间段（按**首见时间**筛）。``null`` = 全部时间。
 //: 两个元素是 dayjs 对象；发给后端时转成 ISO 串（``since`` / ``until``）。
 const dateRange = ref(null)
@@ -490,6 +709,40 @@ const rangePresets = [
 
 /** 条件变了就重新查，并回到第 1 页（停在第 5 页会让人以为"搜不到东西"）。 */
 function onRangeChange() {
+  currentPage.value = 1
+  loadPage()
+}
+
+/**
+ * 状态码档位。四档互斥 → 单选。
+ *
+ * ``lo`` 闭区间下界、``hi`` **开**区间上界（5xx 上限是 599 而不是 600 ——
+ * 6xx 存在但不属于任何一档，写成闭区间会把它们错收进 5xx）。
+ */
+const STATUS_CLASSES = [
+  { value: '2xx', lo: 200, hi: 300 },
+  { value: '3xx', lo: 300, hi: 400 },
+  { value: '4xx', lo: 400, hi: 500 },
+  { value: '5xx', lo: 500, hi: 600 },
+]
+const statusBucket = ref(null)
+
+/** 选中的档位 → 后端 filters（两条范围条件）。未选 = 不传，**不筛**。
+ *
+ *  ⚠️ 不筛"没状态码的行"：C 段扫出来的邻居大量没有 HTTP 观测，
+ *  它们 ``status`` 是 NULL。选了 2xx 就不含它们 —— 这是对的，
+ *  "筛 2xx" 的意思就是"只看 2xx 的"。
+ */
+function statusFilters() {
+  const c = STATUS_CLASSES.find((x) => x.value === statusBucket.value)
+  if (!c) return null
+  return [
+    { field: 'status', op: 'gte', value: c.lo },
+    { field: 'status', op: 'lt', value: c.hi },
+  ]
+}
+
+function onStatusClassChange() {
   currentPage.value = 1
   loadPage()
 }
@@ -732,23 +985,58 @@ const columns = [
   //   G5EMSM1K  资产 491px(40.1%) / 标题 324px(26.4%)   ← 差 5.53 个百分点
   // （G5EMSM1K 的 asset_key 平均 45.5 字符，TS1XRYVZ 是 38.0。）
   //
-  // 现在这两列给**百分比**，比例直接取用户指定的标准任务 TS1XRYVZ 的实测占比。
-  // 配合 `table-layout="fixed"`，浏览器先兑现下面 5 个 px 列
-  // （60+60+70+80+140 = 410），剩下的空间再按 34.53 : 32.00 分给这两列：
-  //   容器 1225 → 资产 423、标题 392（**精确复现标准任务的比例**）
-  //   容器 1005 → 资产 309、标题 286
-  //   两个任务实测偏差 0.00 百分点
+  // 现在这两列给**百分比**，比例取自标准任务 TS1XRYVZ 的实测占比。
+  // 配合 `table-layout="fixed"`，浏览器先兑现下面 6 个 px 列
+  // （60+120+60+70+80+140 = 530），剩下的空间再按 34.53 : 32.00 分给这两列。
+  //
+  // ⚠️ **加一列固定宽就必须回来重算这个和。** 原来的清单是 5 列共 410px，
+  // 2026-10-07 加了「协议」列（120px）后变成 530px —— 和没重算的话，
+  // 容器窄一点时固定 px + 两个百分比 > 可用宽度，表格横向溢出。
+  //
+  // 「协议」这一列的宽度改过两轮，每轮理由都写在这里免得下次又改回去：
+  //   150px —— 第一版直接显示 `HTTP,HTTPS,SMTP` 全串
+  //    60px —— 第二版只显示个数（跟「端口」列对称）
+  //   120px —— 现在显示第一个 + `+N`；最长服务名 `PostgreSQL`(10 字符)
+  //           ≈70px + chip 28px + padding 16 = 114，留 6px 余量
   //
   // 为什么不直接写 px：写死 px 的总和一旦超过可用宽度就会溢出，而百分比
   // 永远装得下。**要比例统一就别写 px** —— 比例和宽度必须解耦。
   //
-  // 下面 5 列保持 px 不动：它们的内容是定长的（端口 chip 占 34px、
-  // 入库时间「2026-10-06 20:45」在 12px 等宽下 140px 刚好），缩小就会截字。
+  // 下面 6 列保持 px 不动：它们的内容都是定长的一格（协议/端口 chip 占
+  // 34px、入库时间「2026-10-06 20:45」在 12px 等宽下 140px 刚好），
+  // 缩小就会截字。
   { title: '资产', key: 'asset', width: '34.53%' },
-  // 「健康」而不是原来的「存活」：这一列按 ``status < 400`` 染绿，量的其实是
-  // "**响应是否正常**"，不是"这台机器活不活"。开着 3306 的数据库主机当然是活的，
-  // 但它没有 Web 响应、圆点必然是灰的 —— 叫「存活」会把它说成死的。
-  { title: '健康', key: 'alive', width: 60 },
+  // 「存活」：这一列判的是**有没有 Web 响应**，绿 = 有且正常（status < 400）。
+  //
+  // 为什么可以叫「存活」而不是「Web」：**资产管理页里的行按定义都是活的**
+  // —— 后端 `live` 口径已经保证进来的是"有 HTTP 响应**或**有开放端口"的资产
+  // （见 postgres.py::_live_clause）。所以在这一页里，
+  // "这台机器活着"已经是前提，"有没有 Web 服务"才是需要区分的信息 ——
+  // 前者是白纸，后者是内容。
+  //
+  // 灰点 = 有这台机器、但没有 Web 服务（开着 3306 / 25 这些非 Web 端口）。
+  // 那不是"站点挂了"，tooltip 会点明。
+  { title: '存活', key: 'alive', width: 60 },
+  // 「协议」：这台机器对外提供什么服务 —— 显示**第一个** + `+N`，悬停看全部。
+  //
+  // 为什么不给全串：实测 `155.102.54.250` 有 10 种服务
+  // （HTTP,HTTPS,HTTP-Alt,HTTPS-Alt,FTP,SSH,RDP,MSSQL,Oracle,MySQL），
+  // 铺在列里会把整行撑开、别的列全被挤没。
+  //
+  // 为什么不给纯个数（2026-10-07 先做过那个版本）：数字看不出**是什么**。
+  // 「协议 5」和「端口 5」并排放着是两个一样的数字，一个字都没多出来；
+  // 显示 `HTTP +9` 至少一眼知道这是台**开着 Web 服务**的机器 ——
+  // 而"有没有 Web"恰恰是「存活」那一列绿灰的判据。
+  //
+  // ⚠️ 名字叫「协议」但内容是**服务名**，不是传输层协议。
+  // `port.protocol` 那一列本来就是"协议"（tcp/udp），实测全库 16245 行
+  // 100% 是 tcp —— 显示它等于一整列没有信息量的 "TCP"。
+  // 端口→服务的映射在后端 `postgres.py::_PORT_SERVICES`。
+  //
+  // 宽 120 的依据：最长的服务名是 `HTTP-Alt` / `PostgreSQL`（8~10 字符，
+  // 14px 下约 70px）+ `+N` chip（28px）+ 左右 padding 16 = **114**，留 6px
+  // 余量。再宽就该给「标题 / 状态」了 —— 它是内容更长的一列。
+  { title: '协议', key: 'service', width: 120 },
   // 「端口」而不是「开放端口」：这一列只有**个数**，具体端口在悬停的
   // tooltip 里。原先标题带「开放」两个字是为了强调"这里只记真开着的"
   // （port 表不收 closed/filtered），但现在列里根本看不到端口本身，
@@ -829,6 +1117,9 @@ const displayQuery = computed(() => {
   if (groupId.value) parts.push(`分组:${currentGroupName.value}`)
   // 任务筛选也要出现在标题里 —— 否则筛完看不出当前看的是哪次任务的结果
   if (scanId.value != null) parts.push(`任务:${currentScanLabel.value}`)
+  // 状态码档位同理：筛完只剩 4xx 时标题得写出来，
+  // 否则用户看到结果全是 4xx 徽标却不知道为什么。
+  if (statusBucket.value) parts.push(`状态:${statusBucket.value}`)
   parts.push(keyword.value.trim() || '全部')
   return parts.filter(Boolean).join(' · ')
 })
@@ -847,6 +1138,7 @@ function resetAll() {
   dateRange.value = null
   groupId.value = null
   scanId.value = null
+  statusBucket.value = null
   scanKeyword.value = ''
   searched.value = false
   results.value = []
@@ -860,6 +1152,57 @@ function portListOf(r) {
   if (!r || !r.ports) return []
   return String(r.ports).split(',').map((s) => s.trim()).filter(Boolean)
 }
+
+/** 这一行提供的**服务**种类（协议列）。后端给的是去重后的 ``HTTP,HTTPS`` 串。
+ *
+ *  写法与 :func:`portListOf` 对称：列里显示 ``length``、tooltip 显示全串。
+ *  服务名里**没有逗号**（后端 ``_PORT_SERVICES`` 的取值都是单个词），
+ *  所以直接按逗号切是安全的 —— 未收录的端口回退成 ``tcp/<号>``，也不含逗号。 */
+function serviceListOf(r) {
+  if (!r || !r.service) return []
+  return String(r.service).split(',').map((s) => s.trim()).filter(Boolean)
+}
+
+/** IP 列表默认最多显示多少个。24 个 ≈ 三行，够看清是哪几个段，
+ *  又不至于把整个面板撑到要滚动。剩下的给「还有 N 个…」按钮。 */
+const IP_CHIPS_MAX = 24
+const showAllIps = ref(false)
+
+/** 这个域名解析到的 IP 列表（后端给的数组，**不是**逗号串）。 */
+const domainIpList = computed(() => {
+  const l = detail.value?.domain?.ip_list
+  return Array.isArray(l) ? l : []
+})
+const shownIps = computed(() =>
+  showAllIps.value ? domainIpList.value : domainIpList.value.slice(0, IP_CHIPS_MAX)
+)
+
+/** 点某个 IP 直接开它的详情 —— 省得回列表再搜一次。
+ *  走 ``openDetail`` 而不是 ``openIpDetail`` 的分支逻辑，形状要自己拼。 */
+function openIpDetail(ip) {
+  showAllIps.value = false
+  detailHost.value = ip
+  detailOpen.value = true
+  detailLoading.value = true
+  detail.value = null
+  getHostDetail(ip)
+    .then((d) => { detail.value = d })
+    .catch((e) => {
+      message.error(e.message)
+      detailOpen.value = false
+    })
+    .finally(() => { detailLoading.value = false })
+}
+
+/** 本次详情里被折叠掉的重复结论条数。
+ *
+ *  = 真实总数 − 折叠后列出的条数。写在标题上是为了让"发现 39"这个数字
+ *  与下面实际那几行对得上 —— 否则用户会以为还有 30 条没加载出来。 */
+const collapsedFindingCount = computed(() => {
+  const c = detail.value?.counts
+  if (!c) return 0
+  return Math.max(0, (c.findings || 0) - (c.findings_shown || 0))
+})
 
 /** 资产名。技术栈与发现的 asset_key 后端已拼上 host/kind 前缀保证唯一，
  *  这里拆回来只显示主体，前缀由 subtitleOf 补。 */
@@ -932,6 +1275,10 @@ const primaryStatus = computed(() => primaryEndpoint.value?.status ?? null)
  *  放在「探测」里当入口很奇怪：这个站点**本身**的地址应该是根。
  *  截到 authority 就对了，具体路径在下面的「URL / 目录与路径」表里。 */
 const baseUrl = computed(() => {
+  // 裸 IP 视图（后端 _ip_detail 分支）下 domain.name 就是 IP 本身。
+  // 拿它拼 scheme:// 会得到「http://1.2.3.4」这种**从没被请求过**的地址 ——
+  // 点下去必然连不上。不如不给：这一栏只在真有端点时才有意义。
+  if (detail.value?.domain?.is_ip) return ''
   const raw = primaryEndpoint.value?.url || detail.value?.domain?.name || ''
   if (!raw) return ''
   if (!/^https?:\/\//i.test(raw)) return `http://${raw}`
@@ -966,19 +1313,66 @@ const allPaths = computed(() => {
   return out
 })
 
+/** 未探活的路径默认折叠。开关状态放这里，不放组件局部 ——
+ *  切资产时它得回到折叠态，否则上一条展开状态会跟着串过来。 */
+const showUnprobed = ref(false)
+
+/** 已探活的路径（有状态码）与未探活的分开。
+ *
+ *  ⚠️ 判据是「有没有状态码」，不是列表来源 —— endpoints 与 urls 两路
+ *  合并后可能出现同一个 URL 两条（一条带状态、一条不带），按状态分
+ *  能保证每条只出现一次。
+ */
+const probedPaths = computed(() => allPaths.value.filter((p) => p.status != null))
+const unprobedPaths = computed(() => allPaths.value.filter((p) => p.status == null))
+
+/** 未探活的原因 —— 从 finding 里找，别在前端猜。
+ *
+ *  最常见的是 `url_verify` 因为**疑似 WAF** 主动收手（实测
+ *  www.yealink.com.cn 前面有阿里云盾，36 条 URL 只探活了 1 条）。
+ *  那不是"没扫到"，是**为了不被封 IP 主动停的** —— 界面上写清这点，
+ *  用户才不会以为功能坏了。
+ */
+const unprobedHint = computed(() => {
+  const d = detail.value
+  if (!d || !unprobedPaths.value.length) return ''
+  const waf = (d.findings || []).find((f) => /WAF/.test(f.kind || ''))
+  if (waf) {
+    return '这些路径已从页面与 JS 里发现，但扫描时该站前面有 WAF，'
+      + '为避免触发封 IP 主动停止了逐条请求 —— 它们大部分真实存在（可点开自行确认）。'
+  }
+  return '这些路径已从页面与 JS 里发现，但没有向它们发过请求，所以没有状态码。'
+})
+
 /** 摘要文字：告诉用户"我掌握了这个资产的哪些信息"，而不是给个神秘分数。
- *  （原来的信号强度条已删 —— 它把 CDN、指纹这些中性事实折算成"危险度"，
- *    没有评分模型支撑，容易被读成"CDN 站点更值得打"，属于误导。） */
 const summaryText = computed(() => {
   const d = detail.value
   if (!d) return ''
   const bits = []
+  // 端口排在最前：**裸 IP 视图下这往往就是全部内容**（C 段邻居没有端点、
+  // 没有路径、没有技术栈，只有端口是实的）。少了它，摘要会写成
+  // 「端点 0 · 路径 0 · 发现 0」，看起来像"什么都没扫到"。
+  if (d.counts.ports) bits.push(`端口 ${d.counts.ports}`)
   bits.push(`端点 ${d.counts.endpoints}`)
   bits.push(`路径 ${d.counts.urls}`)
   if (d.counts.technologies) bits.push(`技术 ${d.counts.technologies}`)
   if (d.counts.findings) bits.push(`发现 ${d.counts.findings}`)
   return bits.join(' · ')
 })
+
+/** 端口标签配色：把「常见的 Web / 管理端口」标出来，其余用默认色。
+ *
+ *  不是安全评分，只是让人在几十个端口里一眼找到 80/443/8080/22 这些
+ *  真正值得点开的。一屏 25 个同色标签等于没有标签。 */
+const _WEB_PORTS = new Set([80, 443, 8080, 8000, 8081, 8443, 8888, 9000, 3000, 5000])
+const _ADMIN_PORTS = new Set([22, 21, 23, 3389, 5900, 1433, 1521, 3306, 5432, 6379, 27017])
+const _MAIL_PORTS = new Set([25, 110, 143, 465, 587, 993, 995])
+function portTagColor(port) {
+  if (_WEB_PORTS.has(port)) return 'blue'
+  if (_ADMIN_PORTS.has(port)) return 'orange'
+  if (_MAIL_PORTS.has(port)) return 'green'
+  return 'default'
+}
 
 const allSources = computed(() => {
   const d = detail.value
@@ -1018,6 +1412,9 @@ function onRowClick(record) {
 async function openDetail(record) {
   const host = detailHostOf(record)
   if (!host) return
+  // ⚠️ **切资产要重置 IP 列表的展开态。** 上一条展开了 71 个 IP，
+  // 下一条只有 2 个却仍是展开态 —— 状态串过去了。
+  showAllIps.value = false
   detailHost.value = host
   detailOpen.value = true
   detailLoading.value = true
@@ -1075,9 +1472,6 @@ async function doSearch() {
 async function loadPage() {
   loading.value = true
   try {
-    // 不传 filters：状态码下拉已删（见上面 statusOptions 处那段说明 —— 它在
-    // 非 urls 类型下会被后端静默丢弃）。后端那条 `filters` 通道还在，
-    // 等哪天有**各类型都支持**的筛选再接上。
     const r = dateRange.value
     const data = await searchAssetsFlat(keyword.value.trim(), {
       // 固定域名 + IP（类型下拉已删）。写常量而不是留个 ref：
@@ -1090,12 +1484,39 @@ async function loadPage() {
       // 仍挂在首次发现者名下，用 t.scan_id 会一条都查不出来）。
       scanId: scanId.value,
       groupId: groupId.value,
+      // 状态码档位筛选（2026-10-07 接回）。
+      //
+      // ⚠️ **这个下拉曾经存在过、又被删过一次**，原因就写在这里：
+      // 当时后端只有 ``urls`` 配了 ``status`` 筛选字段，域名/IP/端口传了
+      // 会被**静默丢弃** —— 不报错、计数也不变，界面上就是"点了没反应"。
+      // 现在后端给三种类型都补上了 ``_ASSET_FILTER_FIELDS[...]["status"]``，
+      // 口径与 ``_FLAT_SPECS`` 那列一致（都取 ``ep.status``）。
+      //
+      // **接回来之前先验这个**：真打一次接口看 domains/ips/ports 的条数
+      // 有没有变，别只看前端渲染出来了就以为好了。
+      filters: statusFilters(),
       // 时间段闭区间。**必须带时区**：库里的 first_seen 是 ISO 带偏移的串，
       // 不带时区会按服务器本地时区解释，跨时区部署时边界会差几个小时。
       since: r && r[0] ? r[0].startOf('day').toISOString() : null,
       until: r && r[1] ? r[1].endOf('day').toISOString() : null,
-      // 显式带上 live=false，不靠后端默认值。见上面 liveOnly 那段说明。
-      live: false,
+      // live=true：**只列探活过且存活的**资产。
+      // 这一页的每一行都要经得起"这个资产为什么值得看"这个问题。
+      // 全量列表里混着大量**什么都没探到**的行：既没有 HTTP 响应、也
+      // 没有开放端口，标题列只能写"无响应"、协议与端口全是横线 ——
+      // 用户看到的就是一整排空行，还以为出了故障（2026-10-07 实测：
+      // 全量 21022 条里这类占绝大多数）。
+      //
+      // ⚠️ 口径全在后端 ``postgres.py::_LIVE_SQL``，**逐类型不同**：
+      //   domains  要有 HTTP 响应
+      //   urls     要有 HTTP 响应（只被 dir_brute「猜到存在」的路径藏起来）
+      //   ips      有 HTTP 响应**或**有开放端口
+      //   ports    **恒真** —— 这一行本身就代表端口开着
+      //   tech/finding 不参与过滤（它们是结论不是资产）
+      //
+      // 2026-10-06 曾经写成 live=false，理由是"后端默认 True 会藏掉 74%"。
+      // 那时 ports 的口径是错的（要求端口行也有 HTTP 观测，误杀 15055 行），
+      // 修掉之后 74% 里绝大部分是**本来就该藏的**空行，留着它们才是问题。
+      live: true,
     })
     results.value = data.rows || []
     totalCount.value = data.total || 0
@@ -1334,6 +1755,56 @@ function onPageChange(page, size) {
   font-variant-numeric: tabular-nums;
 }
 /* `.port-sample` 已删 —— 端口串搬进 tooltip 之后，列里不再有第二个元素。 */
+
+/* 协议：第一个服务名 + `+N`。 */
+.svc-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+}
+/* 主服务名用强调色：它决定"有没有 Web"，和左边「存活」列的绿灰同源。
+   ellipsis 而不是固定 width —— 最长的 `PostgreSQL`（10 字符）也要放得下，
+   而更长的（`tcp/65535` 那类未收录端口的回退值）截成…，tooltip 给全。 */
+.svc-main {
+  color: var(--tk-accent);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 「还有几种」。**用弱化色而不是主色的 chip** —— 它是补充信息不是主角，
+   抢了主服务名的注意力就本末倒置了。 */
+.svc-more {
+  flex: none;
+  color: var(--tk-muted, #999);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 未探活路径的折叠块：按钮紧贴表格上沿，不额外留白。 */
+.unprobed-block {
+  margin-top: 6px;
+  border-top: 1px dashed var(--tk-border, #e8e8e8);
+  padding-top: 6px;
+}
+/* 原因说明：这是"为什么不探"的解释，不是"这些数据没用"的说明。
+   12px 起步 —— 它要能在不展开折叠区时就读懂。 */
+.unprobed-hint {
+  font-size: 12px;
+  line-height: 1.6;
+  margin: 2px 0 6px 4px;
+}
+
+/* 「同段」归属标签。紫色与 C 段页签里那个标签同色 —— 同一个概念两处呈现，
+   颜色一致才连得起来。11px 是为了和下面的 type-label 同一档，
+   不会把资产名那一行压得太多。 */
+.owner-tag {
+  margin-left: 6px;
+  font-size: 11px;
+  line-height: 16px;
+}
+
 .risk-tag { font-size: 11px; }
 /* 入库时间：12px（不是 11px）+ 正常字色。等宽是为了让一列时间上下对齐，
    好扫读"哪几行是同一次扫描进来的"。 */
@@ -1345,7 +1816,7 @@ function onPageChange(page, size) {
 }
 
 /* ── 详情抽屉 ── */
-/* 同域名空间表：解析状态那一列是这张表的重点，标签要显眼。 */
+/* 兄弟域名表：解析状态那一列是这张表的重点，标签要显眼。 */
 .d-head-warn {
   margin-left: 8px;
   color: #c2410c;
@@ -1353,7 +1824,34 @@ function onPageChange(page, size) {
   text-transform: none;
   letter-spacing: 0;
 }
+/* 副标题（解释判据的那句话）：比标题弱，但比正文实。
+   `text-transform: none` 是必须的 —— .d-head 有 uppercase，
+   中文没事但域名里的点和小写字母会被拉成大写。 */
+.d-head-sub {
+  margin-left: 8px;
+  font-weight: 400;
+  color: var(--tk-text-muted, #999);
+  text-transform: none;
+  letter-spacing: 0;
+}
 .same-ip-tag { margin-left: 6px; font-size: 11px; }
+/* IP 列表：每格一个 chip，可点开进那个 IP 的详情。
+   11px 等宽 —— 一屏 24 个时要能塞进三行不出滚动。 */
+.ip-chips { max-width: 100%; }
+.ip-chip {
+  font-family: var(--tk-mono, monospace);
+  font-size: 11px;
+  line-height: 17px;
+  margin: 0;
+  cursor: pointer;
+  background: var(--tk-bg-subtle, #fafafa);
+  border-color: var(--tk-border, #e0e0e0);
+  color: var(--tk-text);
+}
+.ip-chip:hover {
+  color: var(--tk-accent);
+  border-color: var(--tk-accent);
+}
 .tk-resolved { color: var(--tk-text-muted); font-size: 12px; }
 .detail-title { font-size: 15px; font-weight: 600; }
 .d-section { margin-bottom: 20px; }
@@ -1416,5 +1914,15 @@ function onPageChange(page, size) {
   margin-top: 2px;
   line-height: 1.5;
   word-break: break-all;
+}
+/* 「×20」折叠计数。中性色 + 细边框 —— 它是**说明性**信息，
+   用了强调色会让人以为那是第 20 条不同的发现。 */
+.repeat-tag {
+  margin-left: 4px;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--tk-text-muted, #999);
+  border-color: var(--tk-border, #e0e0e0);
+  background: transparent;
 }
 </style>
