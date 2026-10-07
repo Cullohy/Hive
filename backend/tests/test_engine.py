@@ -12,6 +12,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -1071,6 +1074,116 @@ class TestEventLimitConverges(unittest.IsolatedAsyncioTestCase):
                 summary["stats"]["events.limit_hit"], 1,
                 "没触顶，测试没打到那条路径",
             )
+
+
+class TestScanTimeoutIsNotInfinite(EngineTestCase):
+    """扫描必须有超时上限 —— "没配"不等于"无限"。
+
+    ## 为什么这条要害
+
+    ``_check_idle`` 的注释记着 2026-10-04 同形状的一次事故：``_pending``
+    永不归零 → ``_idle`` 永不 set → **DB 那行永远停在 ``running``**。
+    那次只修了 ``_stop`` 的计数，**没修裸 ``await self._idle.wait()``** ——
+    同一个坑的后半截。
+
+    而它是必然发生的：**三个内置预设没有任何一个配了全局
+    ``settings.timeout``**（``active.yml`` 里那些 timeout 全是**模块段**的：
+    port_scan/http_probe/tls_cert/dir_brute；``_template.yml`` 的
+    ``timeout: 0`` 是假值）。所以修法不是"给预设补一行"，是
+    **让"没配"落到一个有限默认值** —— 否则谁漏配一次就又挂死一次。
+    """
+
+    #: 故意用**极小**的上限：测的是"上限真的会生效"，不是"默认是几小时"。
+    TINY = 0.4
+
+    async def _hang_forever(self, td, *, timeout=None):
+        """一个 ``handle_event`` 永远不返回的模块。
+
+        ``await asyncio.sleep(3600)`` 而不是死循环 —— 后者会把整个事件
+        循环卡死，测不出任何东西。
+        """
+        mods = td / "mods"
+        mods.mkdir(parents=True, exist_ok=True)
+        (mods / "hang.py").write_text(
+            textwrap.dedent('''
+                import asyncio
+
+                from core.engine.module import BaseModule
+                from core.engine.event import EventType
+
+
+                class hang(BaseModule):
+                    watched_events = (EventType.SEED,)
+                    produced_events = (EventType.DNS_NAME,)
+                    flags = ("safe",)
+
+                    async def handle_event(self, event):
+                        await asyncio.sleep(3600)
+            '''),
+            encoding="utf-8",
+        )
+        preset = Preset(name="hang", module_dirs=[str(mods)])
+        preset.include = ["hang"]
+        settings = {"max_scope_distance": 3}
+        if timeout is not None:
+            settings["timeout"] = timeout
+        # 不传 timeout 时**故意不配** —— 那才是要测的形状
+        preset.settings = settings
+        scanner = Scanner(targets=["example.com"], preset=preset, storage=None)
+        # 外层给 20 秒：若上限没生效，这一条会超时失败而不是挂死整个测试
+        return await asyncio.wait_for(scanner.scan(), timeout=20.0)
+
+    async def test_a_hanging_module_cannot_hang_the_scan_forever(self) -> None:
+        """模块不返回时，扫描**自己**收敛，不是靠外层 wait_for 兜。"""
+        with tempfile.TemporaryDirectory() as td:
+            summary = await self._hang_forever(Path(td), timeout=self.TINY)
+            self.assertEqual(
+                summary["stats"].get("scan.timeout"), 1,
+                "没走到超时收敛 —— 上限没生效，或预设里的 timeout 覆盖了它",
+            )
+            self.assertGreater(
+                summary["stats"].get("scan.timeout_pending", 0), 0,
+                "超时了但 _pending=0，说明不是「卡住」触发的超时，"
+                "这条用例没打到真正的场景",
+            )
+
+    async def test_unset_timeout_still_gets_a_finite_default(self) -> None:
+        """**没配 timeout 时拿到的是有限值，不是 None。**
+
+        这条是整组用例的核心：把默认改回 ``None`` 的话，上面那条会一直
+        挂到外层 20 秒 wait_for 超时 —— 现象是"测试失败"，而真实场景里
+        是"服务挂到重启"。
+        """
+        preset = Preset(name="t", include=[])
+        preset.settings = {}
+        scanner = Scanner(targets=["example.com"], preset=preset, storage=None)
+        self.assertIsNotNone(scanner.timeout)
+        self.assertGreater(scanner.timeout, 0)
+        self.assertLessEqual(
+            scanner.timeout, 86400, "默认值应该以「小时」计，不是「天」")
+
+    async def test_explicit_timeout_still_wins_over_the_default(self) -> None:
+        preset = Preset(name="t", include=[])
+        preset.settings = {"timeout": 42}
+        scanner = Scanner(targets=["example.com"], preset=preset, storage=None)
+        self.assertEqual(scanner.timeout, 42.0)
+
+    async def test_timeout_and_persist_failure_are_visible_in_progress(
+        self,
+    ) -> None:
+        """两件最容易被"跑了一半才发现"的事，必须在实时进度里看得见。
+
+        ``scan_timeout_pending > 0`` 才是"确实卡住了"的证据 —— 正常收敛时
+        必然是 0，两条计数缺一不可。``events_persist_failed`` 同理：
+        落库失败过几次，扫完就翻篇了，summary 之外没有第二次机会。
+        """
+        preset = Preset(name="t", include=[])
+        preset.settings = {"timeout": 1}
+        scanner = Scanner(targets=["example.com"], preset=preset, storage=None)
+        p = scanner.progress()
+        for key in ("scan_timeout_pending", "events_persist_failed"):
+            self.assertIn(key, p,
+                          f"progress() 里没有 {key} —— 超时/落库失败无法当场发现")
 
 
 

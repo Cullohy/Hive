@@ -22,7 +22,14 @@ cli = ["rich>=13.0"]
 web = ["fastapi>=0.110", "uvicorn>=0.27"]
 screenshot = ["playwright>=1.40"]
 export = ["openpyxl>=3.1"]
-dev = ["pytest>=8.0"]
+# ⚠️ **dev 必须能直接跑起全量测试。**
+# 原来只有 pytest，于是 `pip install -e .[dev]` 之后 `tests/base.py` 的
+# `from fastapi.testclient import TestClient` 直接 ImportError —— 也就是
+# 说「1426 条用例」在一个按文档装出来的干净环境里**根本跑不起来**，
+# 只在开发机（早就装过 web extra）上绿。
+# 测试基类要 TestClient，所以 fastapi/uvicorn 属于测试的**必要依赖**，
+# 不是可选功能。
+dev = ["pytest>=8.0", "fastapi>=0.110", "uvicorn>=0.27"]
 
 [project.scripts]
 recon = "core.server:main"
@@ -60,4 +67,15 @@ filterwarnings = [
     # 一次没跑的用例**伪装成通过**，比它响亮地红起来危险得多 ——
     # 而 warnings summary 里那 12 条 warning 就是唯一的线索，不能靠人眼。
     "error::pytest.PytestUnraisableExceptionWarning",
+    # ⚠️ **别加 ``error::pytest.PytestUnhandledCoroutineWarning``**（2026-10-07
+    # 实测纠正）。那个类名在 **pytest 9.1.1 里根本不存在** —— 写上去 pytest
+    # **启动即 AttributeError**，全仓一条测试都跑不了。而"模块级 async 会静默
+    # skip"这个前提也不成立：实测它会**失败**（"async def functions are not
+    # natively supported"）。
+    #
+    # 同步 TestCase 里的 async 用例（有 1 条 extra）留下的**第二条**痕迹是
+    # ``PytestReturnNotNoneWarning``（"It is deprecated to return a value that
+    # is not None from a test case"）。上面两条抓的是「协程没被 await」，
+    # 这一条抓的是「TestCase 没真的跑」—— 同一类假绿，两个信号都收。
+    "error::pytest.PytestReturnNotNoneWarning",
 ]

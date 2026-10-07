@@ -40,6 +40,12 @@ _recovery_*/
 *.rebuilt.py
 *.recover*.py
 RECOVERED_*.py
+# 2026-10-07 补：``scripts/migrate_title_dimension.py:239`` 会在**目标文件
+# 旁边**写 ``<name>.py.bak``。前面那几条全是**按扩展名枚举**的，
+# ``.bak`` 一个都不匹配 —— 文件名自己的注释就写着「枚举式忽略规则必然
+# 会漏」，而它自己正好是漏的那个。
+# 现状安全（已存在的 29 个 .bak 全在已忽略的 .testtmp/ 内），机制有洞。
+*.bak
 
 # ── 服务端日志（我用 Start-Process 起的本地实例会写这两个）────────
 .srv.log

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import unittest
 import uuid
 from pathlib import Path
@@ -404,6 +405,17 @@ class TestFingerprintHubImport(unittest.TestCase):
         self.root = TMP / f"fh_{uuid.uuid4().hex[:8]}"
         self.root.mkdir(parents=True, exist_ok=True)
         self.report = Report()
+
+    def tearDown(self) -> None:
+        # ⚠️ **原来漏了，于是 .testtmp/ 里堆了 957 个 fh_* 目录。**
+        #
+        # 每个用例建一个、没有一个删，跑一轮测试就在磁盘上留一层。
+        # 现象是 `.testtmp/` 慢慢涨到几百 MB，而 `.gitignore` 挡得住提交
+        # 却挡不住磁盘。**上面那条"独立目录"的修复只解决了"用例之间互相
+        # 污染"，没解决"目录会一直累积"** —— 修一半。
+        #
+        # 用 ``ignore_errors=True``：tearDown 失败不该把一条绿测试变红。
+        shutil.rmtree(self.root, ignore_errors=True)
 
     def _write(self, name: str, text: str) -> Path:
         p = self.root / name

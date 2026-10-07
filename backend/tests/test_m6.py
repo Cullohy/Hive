@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import shutil
@@ -470,6 +471,190 @@ class TestPageTitleSoftFail(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(page_title, "_launch", boom):
             result = await module.setup()
         self.assertEqual(result, (None, "启动 Chromium 失败: 假装没有浏览器"))
+
+
+class TestPageTitleCannotHang(unittest.IsolatedAsyncioTestCase):
+    """浏览器僵死时，本模块**不能**把扫描的收尾拖死（2026-10-07）。
+
+    ## 为什么这条是「健壮性」里最要紧的一条
+
+    ``page_title`` 的 ``handle_event`` 只做 ``await self._queue.put()`` ——
+    **它自己不会阻塞**，所以扫描主流程不受影响。卡住发生在 worker 里
+    （``_fill`` 里的 ``new_page()``），而 worker 是在 ``cleanup()`` 里被
+    cancel 的。
+
+    问题是：``cleanup()`` 是本模块**唯一的退出路径**，引擎在 ``scan()`` 的
+    ``finally`` 里用 ``shield`` 调它。worker 不响应取消时，原来那个裸
+    ``gather`` 会一直等 → **finish_scan 不执行 → DB 那行永远停在
+    ``running`` → 界面永远转圈 → 只能重启服务**。
+
+    而且触发条件**完全由目标站控制**：返回空 ``<title></title>`` 加任意
+    JS 就会起浏览器渲染那个页面。所以这不是「理论上可能」，是遇得到。
+
+    这组用例**不起真浏览器** —— 用一个永不返回的 ``new_page()`` 替身，
+    这样本机没装 playwright 也能跑。
+    """
+
+    def _module(self):
+        from core.domains.web_hunter.page_title import page_title
+
+        scanner = mock.Mock()
+        scanner.storage = mock.AsyncMock()
+        scanner.settings = {}
+        m = page_title(scanner, {})
+        m.log = mock.Mock()
+        # 走 setup() 里那几个字段的初始化，但**不**真起浏览器
+        m.new_page_timeout = 0.2
+        m.cleanup_gather_timeout = 0.2
+        return m
+
+    async def test_new_page_timeout_is_enforced(self) -> None:
+        """``new_page()`` 永不返回时，``_fill`` 自己超时退出。
+
+        ⚠️ 判据是 **``_fill`` 有没有返回**，不是「有没有抛异常」。
+        ``gather`` / ``wait_for`` 都可能把挂住的协程一起吞掉，让调用方
+        以为没事 —— 真正要看的是它最终回到调用者手上。
+        """
+        m = self._module()
+
+        class _Wedged:
+            async def new_page(self):
+                await asyncio.sleep(3600)          # 永远不返回
+
+        m._context = _Wedged()
+
+        t0 = time.monotonic()
+        await asyncio.wait_for(m._fill("https://example.com/"), timeout=10.0)
+        elapsed = time.monotonic() - t0
+
+        self.assertLess(
+            elapsed, 5.0,
+            f"``_fill`` 花了 {elapsed:.1f}s 才返回 —— new_page() 的超时没生效",
+        )
+        self.assertEqual(
+            m.stats.get("new_page_timeout"), 1,
+            "没记 new_page_timeout → 这种情况在界面上完全不可见",
+        )
+        self.assertEqual(m.stats.get("failed"), 0,
+                         "超时不等于「这条 URL 坏了」：它是「浏览器僵死」。"
+                         "两者混在一个计数里，就看不出是哪一种了")
+
+    async def test_cleanup_gives_up_instead_of_waiting_forever(self) -> None:
+        """worker 不响应取消时，``cleanup()`` 到点就走 —— **继续收尾**。
+
+        这条是整组的重点：宁可漏一个 Chromium 进程（重启后端即走），也不能
+        让 ``scan()`` 的 ``finally`` 卡住。
+
+        ⚠️ **替身必须"有限不听话"。** 真写成"吞掉 CancelledError 永远循环"
+        的话，这个 task 会活到事件循环收尾 —— 而收尾会等它，于是**测试自己**
+        挂住（本条第一版就踩了）。所以它只吞**第一次**取消、第二次就放行：
+        ``cleanup()`` 只 cancel 一次，所以它对该次"不听话"（这才是要测的），
+        而循环收尾的那一次能把它真正带走。
+        """
+        m = self._module()
+        m._queue = None
+        swallowed: list[int] = []
+
+        async def _stuck() -> None:
+            cancelled = 0
+            while True:
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    cancelled += 1
+                    swallowed.append(cancelled)
+                    if cancelled >= 2:      # 第二次：放行，让循环能收尾
+                        raise
+
+        task = asyncio.create_task(_stuck())
+        await asyncio.sleep(0.05)
+        m._workers = [task]
+
+        try:
+            t0 = time.monotonic()
+            await asyncio.wait_for(m.cleanup(), timeout=10.0)
+            elapsed = time.monotonic() - t0
+
+            self.assertLess(
+                elapsed, 5.0,
+                f"``cleanup()`` 花了 {elapsed:.1f}s —— 收尾被拖住了，"
+                f"扫描会永远停在 running",
+            )
+            self.assertEqual(m.stats.get("cleanup_timeout"), 1)
+            self.assertEqual(m._workers, [],
+                             "worker 列表没清空 → 下次 cleanup 会重复 cancel")
+            self.assertEqual(
+                swallowed[0], 1,
+                "替身没吞掉 cleanup 那次取消 → 测的不是「不响应取消」那种情况",
+            )
+        finally:
+            # 双保险：确保替身一定被带走，别让它活到循环收尾
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(task, timeout=5.0)
+
+    async def test_browser_close_also_cannot_hang(self) -> None:
+        """关浏览器同样可能挂（僵死时 ``close()`` 不返回）。
+
+        和上面那个 ``gather`` 是**同一类死法**，所以共用同一个时限。
+        """
+        m = self._module()
+        m._queue = None
+        m._workers = []
+
+        class _WedgedCtx:
+            async def close(self):
+                await asyncio.sleep(3600)
+
+        m._context = _WedgedCtx()
+        m._browser = None
+        m._playwright = None
+
+        t0 = time.monotonic()
+        await asyncio.wait_for(m.cleanup(), timeout=10.0)
+        elapsed = time.monotonic() - t0
+
+        self.assertLess(
+            elapsed, 5.0,
+            f"``cleanup()`` 花了 {elapsed:.1f}s —— 关浏览器把收尾拖住了",
+        )
+        self.assertEqual(m.stats.get("cleanup_timeout"), 1)
+
+    def test_both_timeouts_have_finite_defaults(self) -> None:
+        """两个超时都必须有**有限默认**，不能是 None。
+
+        这是整组用例的核心：把它们改回「无超时」的话，上面两条会一直挂到
+        外层 10 秒 wait_for —— 现象是"测试失败"，而真实场景里是
+        "扫描卡到要重启服务"。
+        """
+        from core.domains.web_hunter.page_title import page_title
+
+        self.assertGreater(page_title.new_page_timeout, 0)
+        self.assertGreater(page_title.cleanup_gather_timeout, 0)
+        self.assertLessEqual(
+            page_title.cleanup_gather_timeout, 120,
+            "收尾的等待上限应该以「分钟」计，不是「小时」")
+
+    def test_loud_is_denied_by_the_active_preset(self) -> None:
+        """``page_title`` 带 ``loud`` 标记，而 ``active.yml`` 拒绝它。
+
+        「SPA 标题补全」是锦上添花，不该在用户没要求时就默认起浏览器 ——
+        那台浏览器跑在你的机器上，页面里的 JS 能让它访问本机可达的任何地址。
+        要用就在「新建任务」里显式勾选。
+        """
+        from core.domains.web_hunter.page_title import page_title
+
+        self.assertIn("loud", page_title.flags,
+                      "page_title 是唯一的浏览器模块，必须带 loud 标记")
+        import yaml
+        raw = yaml.safe_load(
+            (Path(__file__).resolve().parents[1] / "core" / "presets"
+             / "active.yml").read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "loud", (raw.get("deny_flags") or []),
+            "active.yml 的 deny_flags 不含 loud → 浏览器渲染仍是默认启用的",
+        )
 
 
 class TestPageTitleReal(unittest.IsolatedAsyncioTestCase):
