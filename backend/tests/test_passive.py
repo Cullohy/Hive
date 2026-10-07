@@ -269,7 +269,15 @@ class TestCommonCrawlModule(EngineTestCase):
         async def fake_get_json(self, url, *, params=None, headers=None):  # noqa: ANN001
             return [{"id": "CC-MAIN-2025-30", "cdx-api": "https://index.commoncrawl.org/CC-MAIN-2025-30-index"}]
 
-        async def fake_get_text(self, url, *, params=None, headers=None):  # noqa: ANN001
+        async def fake_get_text(self, url, *, params=None, headers=None,
+                                max_bytes=0):  # noqa: ANN001
+            # ⚠️ ``max_bytes`` 必须接（2026-10-07）：本模块给索引端点传了
+            # ``max_bytes=MAX_BODY_BYTES``，而这个替身原先的签名里没有它 →
+            # ``TypeError: unexpected keyword argument 'max_bytes'``，
+            # 源整条软失败、测试只看到"0 产出"。
+            #
+            # 这与「别给假响应加真实对象没有的能力」是同一族问题的反面：
+            # 真实对象**加了**能力而替身没跟上。签名要和真的一起长。
             return TestCommonCrawlModule.NDJSON
 
         with mock.patch.object(HTTPClient, "get_json", fake_get_json), \

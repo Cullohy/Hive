@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import os
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import httpx
@@ -687,6 +688,133 @@ class TestSlowSourceTimeouts(unittest.TestCase):
             float(preset.module_config["passive_commoncrawl"]["http_timeout"]),
             Query.default_http_timeout,
         )
+
+
+class TestPassiveSourceBodyCap(unittest.IsolatedAsyncioTestCase):
+    """``get_text`` / ``get_json`` 的**响应体上限**（2026-10-07）。
+
+    ## 为什么要有
+
+    12 个被动源全都走 ``request``，而它内部是
+    ``client.request()`` = ``send(stream=False)`` —— **body 在返回时就已经
+    全进内存**。所以"取回来再切片"一分内存都省不下，那正是
+    ``_read_bounded`` 存在的理由（``fetch`` 早就是流式的）。
+
+    于是这条给 ``get_json`` / ``get_text`` 开了 ``max_bytes``，走
+    :meth:`HTTPClient._read_text` 的流式路径。
+
+    ## 默认值是 0（不限），**不是**一个"安全默认"
+
+    因为**截断对不同响应形状的后果完全不同**：
+
+    * **NDJSON**（commoncrawl 的 CDX 端点，一行一个 JSON）：安全降级，
+      末尾半行被解析循环的 ValueError 分支吃掉。
+    * **整体 JSON**（crt.sh）：**硬失败**。截断后 ``json.loads`` 直接抛。
+
+    盲目给个默认上限，只会让"截断"变成"这个源坏了"。所以默认不限、
+    由确认过形状的调用方显式传。
+
+    ## 判据是"流被读完了吗"，不是"拿到的字节 <= 上限"
+
+    只断言后者的话，回退成 ``await response.aread()`` 再切片也一样成立 ——
+    而那正是这次要治的毛病。``ChunkedResponse.consumed`` 才是真判据。
+    """
+
+    async def test_default_is_unbounded_and_goes_through_request(self) -> None:
+        """不传 ``max_bytes`` 时行为与以前**逐字一致**（走 request）。"""
+        fake = fake_httpx_client(FakeResponse(b"hello"))
+        async with HTTPClient() as client:
+            client._client = fake
+            self.assertEqual(await client.get_text("http://x/"), "hello")
+            self.assertEqual(client.stats.get("truncated"), None,
+                             "没传上限却记了截断")
+
+    async def test_bounded_read_does_not_drain_the_whole_stream(self) -> None:
+        resp = ChunkedResponse(total=300_000, chunk=1000)
+        fake = fake_httpx_client(resp)
+        async with HTTPClient() as client:
+            client._client = fake
+            text = await client.get_text("http://x/", max_bytes=5000)
+        self.assertEqual(len(text), 5000)
+        # 真判据：**没把流读完**。
+        #
+        # ⚠️ 别断言"恰好读了 5 块"—— ``_read_bounded`` 是 ``got > max_bytes``
+        # 才 break，所以**必须读过线才知道超了**，末块会多读一块。这是
+        # ``max_bytes + 一个数据块`` 的由来，不是 bug。
+        self.assertLess(
+            resp.consumed, resp.total_chunks,
+            f"读了 {resp.consumed}/{resp.total_chunks} 块 —— 流被读完了，内存没省下",
+        )
+        self.assertFalse(resp.aread_called,
+                         "走了 aread() = 整包进内存 = 白改")
+
+    async def test_truncation_is_counted_and_logged(self) -> None:
+        """截断必须**可观测**。
+
+        静默返回一个不完整的响应，会让"这个域名资产少"看起来像源本身的性质 ——
+        排查时先怀疑源，怀疑不到真凶。
+        """
+        resp = ChunkedResponse(total=300_000, chunk=1000)
+        async with HTTPClient() as client:
+            client._client = fake_httpx_client(resp)
+            await client.get_text("http://x/", max_bytes=5000)
+            self.assertEqual(client.stats["truncated"], 1)
+
+    async def test_4xx_still_raises_in_the_streaming_path(self) -> None:
+        """被动源靠**异常**判断"这一条源挂了"，所以 4xx 必须抛。
+
+        ⚠️ 这条是 :meth:`HTTPClient._read_text` 存在的理由：``fetch`` 那条
+        流式路径 4xx **不抛**（探活要看到状态码），直接拿来用会让所有被动源
+        把错误当空结果。
+
+        ⚠️ ``get_text`` 与 ``get_json`` 各有一份，**两条都得测** —— 只测一个
+        时另一个被改成"不抛"照样全绿（变异验证实测过一次）。
+        """
+        async with HTTPClient() as client:
+            client._client = fake_httpx_client(FakeResponse(b"nope", status=500))
+            with self.assertRaises(httpx.HTTPStatusError):
+                await client.get_text("http://x/", max_bytes=1000)
+
+        async with HTTPClient() as client:
+            client._client = fake_httpx_client(FakeResponse(b"{}", status=503))
+            with self.assertRaises(httpx.HTTPStatusError):
+                await client.get_json("http://x/", max_bytes=1000)
+
+    async def test_network_error_propagates(self) -> None:
+        async with HTTPClient(retries=0) as client:
+            client._client = fake_httpx_client(httpx.ConnectError("boom"))
+            with self.assertRaises(httpx.ConnectError):
+                await client.get_text("http://x/", max_bytes=1000)
+
+    async def test_get_json_bounded_parses_normally_when_under_limit(
+        self,
+    ) -> None:
+        payload = b'[{"id": "CC-MAIN-2025-30"}]'
+        async with HTTPClient() as client:
+            client._client = fake_httpx_client(FakeResponse(payload))
+            data = await client.get_json("http://x/", max_bytes=10_000)
+        self.assertEqual(data, [{"id": "CC-MAIN-2025-30"}])
+        self.assertEqual(client.stats.get("truncated"), None)
+
+    def test_commoncrawl_passes_a_cap_because_its_shape_is_ndjson(self) -> None:
+        """只有 NDJSON 形状才敢传 ``max_bytes``。
+
+        这是本条改动最容易被人"顺手统一"的地方 —— 一旦有人给 crt.sh
+        （整体 JSON）也加上限，截断会让 ``json.loads`` 抛，源从"慢"变成"坏"。
+        所以把判据钉在这里。
+        """
+        from core.domains.subdomain.passive.commoncrawl import MAX_BODY_BYTES
+
+        src = Path(
+            "core/domains/subdomain/passive/commoncrawl.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("max_bytes=MAX_BODY_BYTES", src,
+                      "commoncrawl 的索引端点没传上限 —— 单次流量最大的源")
+        self.assertGreater(MAX_BODY_BYTES, 8 * 1024 * 1024,
+                           "上限比实测的 qq.com 7.9MB 还小 → 会损失正常产出")
+        # 解析循环必须能吃掉被截断的半行
+        self.assertIn("except ValueError", src,
+                      "NDJSON 解析循环没有跳过坏行的分支 → 截断会硬失败")
 
 
 if __name__ == "__main__":
