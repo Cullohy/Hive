@@ -32,8 +32,8 @@ class TestNotFoundIsNeverAHit(unittest.TestCase):
 
     ## 为什么不能用 ``exclude_status`` 默认值来做
 
-    爆破循环里 ``_status_allowed``（1411 行）**比**软 404 基线（1425 行）
-    更早判。默认排除 404 会在基线之前短路 —— ``stats["noise"]`` 永远记不上，
+    爆破循环里 ``_status_allowed`` **比**软 404 基线（``is_noise``）更早判。
+    默认排除 404 会在基线之前短路 —— ``stats["noise"]`` 永远记不上，
     而那正是判断「这台机器的字典还值不值得继续撞」的依据。
     实测踩到：改成默认排除后 ``test_stats_are_reported`` 立刻变红
     （"软 404 丢弃数应大于 0"，实际是 0）。

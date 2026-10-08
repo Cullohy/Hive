@@ -108,7 +108,7 @@
                 停止
               </a-button>
               <a-popconfirm
-                :title="`删除这次扫描？它带出的域名 / IP / 端口 / URL / 端点 / 技术栈 / 发现会一起删除，其他扫描也共用到的资产同样会没。审计日志保留。`"
+                title="确认删除？"
                 ok-text="删除"
                 cancel-text="取消"
                 @confirm="onDelete(record)"
@@ -237,17 +237,29 @@ async function onDelete(record) {
   }
 }
 
-async function load(toast = false) {
-  loading.value = true
+/**
+ * 取列表 + 统计。
+ *
+ * ⚠️ ``silent`` 是为轮询加的：有任务在跑时每 3 秒调一次，而 ``:loading``
+ * 会让 a-table **在表格正中**画一个 Spin —— 于是屏幕每 3 秒闪一次加载圈，
+ * 比不刷新还干扰（用户反馈的正是这个）。轮询静默即可，数据照常替换，
+ * 肉眼只会看到状态列的数字在变。
+ *
+ * 仍然转圈的：**首次加载**（页面是空的，不转圈像卡死）和用户点刷新按钮。
+ */
+async function load(toast = false, silent = false) {
+  if (!silent) loading.value = true
   try {
     const [list, overview] = await Promise.all([listScans(100), getStats()])
     scans.value = list
     stats.value = overview
     if (toast) message.success('刷新成功')
   } catch (e) {
-    message.error(e.message)
+    // 轮询失败不弹红字：它是后台动作，用户可能正在干别的。
+    // 真的取不到数据时列表本来就停在旧值，不会误导。
+    if (!silent) message.error(e.message)
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
   }
 }
 
@@ -260,7 +272,10 @@ watch(
       clearInterval(timer)
       timer = null
     }
-    if (busy) timer = setInterval(load, 3000)
+    // 必须包一层箭头显式传 `silent=true`：``setInterval`` 调用回调时**不传任何
+    // 实参**，直接写 ``setInterval(load, 3000)`` 等于 ``load()`` —— silent 取
+    // 默认值 false，加载圈照样每 3 秒闪一次，等于没改。
+    if (busy) timer = setInterval(() => load(false, true), 3000)
   },
   { deep: false },
 )

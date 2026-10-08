@@ -86,26 +86,24 @@
 
       <!-- ── 资产标签页 ── -->
       <div class="tk-card">
-        <div class="asset-toolbar">
-          <InfoCircleOutlined class="tk-muted" />
-          <span class="toolbar-label">只显示探活确认过的资产</span>
-          <a-tooltip>
-            <template #title>
-              <div style="max-width: 360px; line-height: 1.7">
-                只显示被 <b>HTTP 探活确认过</b>的资产：<br />
-                · 域名 —— 它本身或其子域有 HTTP 端点<br />
-                · IP —— 它上面有端口给出了 HTTP 响应<br />
-                · 端口 —— 这个端口给出了 HTTP 响应<br />
-                · URL —— 这个 URL 被探活过<br /><br />
-                原始清单里 96% 是「发现了但没探过」的 URL（目录爆破、
-                JS 接口提取的产出），混在一起看没有意义，所以这里不展示。
-                需要完整清单请用导出。
-              </div>
-            </template>
-            <QuestionCircleOutlined class="tk-muted" style="margin-left: 2px" />
-          </a-tooltip>
-        </div>
+        <!--
+          原来这里有一行 ``.asset-toolbar``：「ⓘ 只显示探活确认过的资产  ⓘ?」，
+          问号里是完整的探活口径说明。**2026-10-07 按要求删掉**（这是本页最后
+          一处常驻说明文字）。
 
+          ⚠️ 口径留在代码里 —— 它解释的是**这一页为什么看不到某些资产**，没有它，
+          用户看到列表变短只会以为数据丢了：
+
+          * 只显示被 **HTTP 探活确认过**的资产：
+            · 域名 —— 它本身或其子域有 HTTP 端点
+            · IP —— 它上面有端口给出了 HTTP 响应
+            · 端口 —— 这个端口给出了 HTTP 响应
+            · URL —— 这个 URL 被探活过
+          * 原始清单里 96% 是「发现了但没探过」的 URL（目录爆破、JS 接口提取的
+            产出），混在一起看没有意义，所以这里不展示。**需要完整清单请用导出。**
+          * 同一套判据的后端实现见 ``storage/postgres.py::_LIVE_SQL``，
+            并由 ``backend/tests/test_storage.py::TestLiveFilterShape`` 钉住。
+        -->
         <a-tabs v-model:activeKey="tab">
           <!--
             影子资产单独一个页签，而且**是最前面那个** —— 它是"漏洞浓度最高的
@@ -121,19 +119,15 @@
             key="shadow"
             :tab="`影子资产 (${tabCount('domains_shadow', (assets.shadow_domains || []).length)})`"
           >
-            <a-alert
-              type="warning"
-              show-icon
-              style="margin-bottom: 12px"
-              message="测试环境 / 废弃系统 / 临时服务 —— 漏洞浓度最高的角落"
-            >
-              <template #description>
-                这些名字**早就被发现了**，只是没人注意到它们是什么。
-                分类由 <code>shadow_asset</code> 模块按标签判定（只看整标签，
-                所以 <code>device</code> 不会被误判成 <code>dev</code>）。
-                它们的存活状态大多未知 —— 这里**不按探活过滤**。
-              </template>
-            </a-alert>
+            <!--
+              原来的 ``a-alert``（type="warning"）「测试环境 / 废弃系统 / 临时服务
+              —— 漏洞浓度最高的角落」**2026-10-07 按要求删掉**，同「同款系统」那处。
+
+              口径留在代码里：这些名字**早就被发现了**，只是没人注意到它们是什么。
+              分类由 ``shadow_asset`` 模块按标签判定（只看整标签，所以 ``device``
+              不会被误判成 ``dev``）。它们的存活状态大多未知 —— **这里不按探活
+              过滤**（上面的页签注释解释了为什么不能过滤）。
+            -->
             <a-table
               :columns="domainColumns"
               :data-source="assets.shadow_domains || []"
@@ -245,24 +239,24 @@
             key="netblocks"
             :tab="`C段探测 (${(assets.netblocks || []).length})`"
           >
-            <a-alert
-              type="info"
-              show-icon
-              style="margin-bottom: 12px"
-              message="按 /24 聚合本任务看到的 IP —— 归属证据是 netblock_expand 的展开闸门"
-            >
-              <template #description>
-                <b>归属证据</b> = 这一段里挂在<b>你自己域名</b>下的机器台数。
-                <code>netblock_expand</code> 默认 <code>min_owned=2</code>，
-                够格才把整段展开成 IP_ADDRESS 送进端口扫描与探活。<br />
-                证据不足的段<b>没有被动过</b> —— 那是刻意为之：一个 C 段里往往
-                混着同段其它租户（云主机邻居占库里已知 IP 的 25%），无条件展开
-                等于对第三方发扫描。<br />
-                想要整段无条件扫，点「扫描」直接用该 C 段建一个 <code>active</code>
+            <!--
+              原来的 ``a-alert``（type="info"）「按 /24 聚合本任务看到的 IP
+              —— 归属证据是 netblock_expand 的展开闸门」**2026-10-07 按要求删掉**。
+              这是本文件里最后一个说明框，现在整页只剩表格本身。
+
+              ⚠️ 这段口径**尤其要留在代码里**（它解释的是"为什么某些段不会被扫"，
+              界面上没有了，只剩这里）：
+
+              * **归属证据** = 这一段里挂在**你自己域名**下的机器台数。
+                ``netblock_expand`` 默认 ``min_owned=2``，够格才把整段展开成
+                IP_ADDRESS 送进端口扫描与探活。
+              * 证据不足的段**没有被动过** —— 那是刻意为之：一个 C 段里往往混着
+                同段其它租户（云主机邻居占库里已知 IP 的 25%），无条件展开等于
+                对第三方发扫描。
+              * 想要整段无条件扫，点「扫描」直接用该 C 段建一个 ``active``
                 任务（254 个地址的端口扫描，即刻生效）—— 用户显式下发一个段
                 即视为明确授权该段，这也是 ARL「任务目标支持 IP 段」的做法。
-              </template>
-            </a-alert>
+            -->
             <a-table
               :columns="netblockColumns"
               :data-source="assets.netblocks || []"
@@ -528,20 +522,18 @@
             key="clusters"
             :tab="`同款系统 (${(assets.clusters?.favicon?.length || 0) + (assets.clusters?.title?.length || 0)})`"
           >
-            <a-alert
-              type="info"
-              show-icon
-              style="margin-bottom: 12px"
-              message="同一套系统会在不同主机上留下同一个 favicon / 同一个标题"
-            >
-              <template #description>
-                「图标」按 <code>favicon_hash</code>（mmh3，Shodan 口径）聚类，
-                特异性最高；「标题」已排除 <code>404 Not Found</code> 这类错误页
-                文本 —— 那是"都出错了"，不是"同款系统"。
-                只在**本次扫描内**聚，不跨扫描（跨客户目标关联有外泄面）。
-              </template>
-            </a-alert>
+            <!--
+              这一页原来的顶部有一个 ``a-alert`` 说明框（「同一套系统会在不同主机上
+              留下同一个 favicon / 同一个标题」+ 三行口径说明），**2026-10-07 按要求
+              删掉了** —— 进这一页的人要看的是簇，不是方法论。
 
+              口径写在这里，别再搬回界面上：
+
+              * 「图标」按 ``favicon_hash``（mmh3，Shodan 口径）聚类，**特异性最高**
+              * 「标题」已排除 ``404 Not Found`` 这类错误页文本 —— 那是"都出错了"，
+                不是"同款系统"
+              * **只在本次扫描内聚，不跨扫描** —— 跨客户目标关联有外泄面
+            -->
             <div class="toolbar" style="margin-bottom: 12px">
               <a-radio-group v-model:value="clusterBy" size="small" button-style="solid">
                 <a-radio-button value="favicon">
@@ -809,8 +801,8 @@
 import {
   ArrowLeftOutlined,
   DownOutlined,
-  InfoCircleOutlined,
-  QuestionCircleOutlined,
+  // InfoCircleOutlined / QuestionCircleOutlined 已删（2026-10-07）：
+  // 只被「只显示探活确认过的资产」那一行用着，那行已去掉。
 } from '@ant-design/icons-vue'
 import { message } from 'ant-design-vue'
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
@@ -1457,18 +1449,8 @@ onUnmounted(() => {
   font-size: 12px;
   word-break: break-all;
 }
-.asset-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 4px 0;
-  margin-bottom: 4px;
-  flex-wrap: wrap;
-}
-.toolbar-label {
-  font-size: 13px;
-  font-weight: 500;
-}
+/* `.asset-toolbar` / `.toolbar-label` 已删（2026-10-07）—— 它们只服务于
+   「只显示探活确认过的资产」那一行，那行已按要求去掉。留着就是死 CSS。 */
 .toolbar-hint {
   font-size: 12px;
   margin-left: 14px;

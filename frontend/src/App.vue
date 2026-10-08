@@ -79,7 +79,6 @@ import {
   AppstoreOutlined,
   ClusterOutlined,
   DatabaseOutlined,
-  DeploymentUnitOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   SearchOutlined,
@@ -88,6 +87,7 @@ import {
 
 import { getHealth } from '@/api'
 import SettingsDrawer from '@/components/SettingsDrawer.vue'
+import FingerprintIcon from '@/components/FingerprintIcon.vue'
 //: ant-design-vue 的默认语言是 en_US：日期选择器会显示英文月份、Su/Mo/Tu
 //: 星期缩写、Now / Today，以及 "Start date" / "End date" 提示。
 //: 没有 locale 时这套文案**静默**是英文的（没有任何报错），所以必须显式给。
@@ -125,7 +125,11 @@ const menuItems = [
   { key: 'task', label: '任务管理', icon: AppstoreOutlined, path: '/taskList' },
   { key: 'assets', label: '资产管理', icon: DatabaseOutlined, path: '/assets' },
   { key: 'asset-groups', label: '资产分组', icon: ClusterOutlined, path: '/asset-groups' },
-  { key: 'fingerprints', label: '指纹规则', icon: DeploymentUnitOutlined, path: '/fingerprints' },
+  // 「指纹规则」原来是 DeploymentUnitOutlined（部署拓扑图，节点+连线），
+  // 和「指纹」毫无关系，看着像网络拓扑页。图标库（icons-vue 793 个 /
+  // icons-svg 848 个）里都没有指纹 —— ant-design 的 FingerprintOutlined
+  // 是后加的、这个版本没收录，所以本地画了一个 SVG（见 FingerprintIcon.vue）。
+  { key: 'fingerprints', label: '指纹规则', icon: FingerprintIcon, path: '/fingerprints' },
 ]
 
 const selectedKey = computed(() => route.meta?.menu || 'task')
@@ -280,7 +284,17 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
 }
-.footer-btn {
+/* 选择器**故意写长**（.app-sider .sidebar-footer .footer-btn = 0,3,0）。
+ *
+ * 「系统设置」是 `type="link"` 按钮，而 global.css 有
+ * `.ant-btn-link:not(.ant-btn-dangerous) { color: accent !important }`，
+ * 那条是 (0,2,0)。两条都带 !important，**比的是特异性**不是源码顺序 ——
+ * 本规则原来只有 `.footer-btn` (0,1,0)，之前靠"写在后面"险胜，
+ * 一旦 global.css 给 link 规则加了 `:not()`，特异性涨到 (0,2,0)，
+ * 侧栏的「系统设置」立刻被染成主色橙。
+ *
+ * 别把这段前缀"简化"回去 —— 简化了就是一次静默的视觉回归。 */
+.app-sider .sidebar-footer .footer-btn {
   color: var(--tk-side-text) !important;
   height: 40px !important;
   padding: 0 16px 0 21px !important;
@@ -295,7 +309,7 @@ onUnmounted(() => {
   padding: 0 !important;
   justify-content: center;
 }
-.footer-btn:hover {
+.app-sider .sidebar-footer .footer-btn:hover {
   color: var(--tk-accent-hover) !important;
   background: var(--tk-accent-soft) !important;
 }

@@ -11,15 +11,14 @@
     @update:open="$emit('update:open', $event)"
   >
     <a-form layout="vertical" style="margin-bottom: 0">
-      <a-form-item required>
-        <template #label>
-          任务名称
-          <a-tooltip
-            title="必填。会显示在「任务管理」与「任务分组」里 —— 分组同步就是按名字挑哪次扫描。只是标签：不参与扫描逻辑，也允许重名（每月都叫「月度巡检」没问题）。"
-          >
-            <QuestionCircleOutlined class="tk-muted" />
-          </a-tooltip>
-        </template>
+        <!-- 原来「任务名称」标签后面挂了个问号 tooltip（讲"必填、只是标签、
+             允许重名"），**2026-10-07 按要求去掉**。口径留在下面 ``name`` 的
+             注释里：「必填」（后端也强制），任务管理与任务分组都靠它标识一次扫描，
+             只是标签、不参与扫描逻辑，允许重名。 -->
+        <a-form-item required>
+          <template #label>
+            任务名称
+          </template>
         <a-input
           v-model:value="name"
           :maxlength="120"
@@ -108,6 +107,8 @@ const emit = defineEmits(['update:open', 'created'])
 
 const targets = ref('')
 //: 任务名称。**必填**（后端也强制）—— 任务管理与任务分组都靠它标识一次扫描。
+//: 只是标签：**不参与扫描逻辑**，也**允许重名**（每月都叫「月度巡检」没问题）。
+//: 这两句原先在标签旁边那个问号 tooltip 里，2026-10-07 按要求去掉问号时挪到这里。
 const name = ref('')
 //: 默认选**被动**。这个工具会向目标发包，默认就该是安全的那一档 ——
 //: 以前叫 `default`，合并成两模式后它的能力被 `passive` 完整吸收了。

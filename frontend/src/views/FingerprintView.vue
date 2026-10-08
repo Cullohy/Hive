@@ -1,7 +1,7 @@
 <template>
   <div class="tk-page">
     <div class="tk-card">
-      <h3 class="tk-card-title"><DeploymentUnitOutlined /> 指纹规则</h3>
+      <h3 class="tk-card-title"><FingerprintIcon /> 指纹规则</h3>
 
       <div class="stat-row">
         <div class="stat">
@@ -213,7 +213,9 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
-import { DeploymentUnitOutlined, PlusOutlined } from '@ant-design/icons-vue'
+import { PlusOutlined } from '@ant-design/icons-vue'
+// 与侧栏同一个自绘指纹图标（见 App.vue 菜单项处的说明：图标库里没有指纹）。
+import FingerprintIcon from '@/components/FingerprintIcon.vue'
 
 import {
   createFingerprint,

@@ -30,12 +30,22 @@
             当前实际走：<b>直连</b>
           </div>
         </a-form-item>
-        <div class="tk-muted hint" style="margin: -6px 0 12px">
-          「跟随环境」会读 <code>RECON_PROXY</code> → <code>HTTPS_PROXY</code> →
-          <code>HTTP_PROXY</code>。⚠️ 代理进程关掉后，出站会静悄悄断掉 ——
-          任务表现为"卡住、界面像死了"，日志里一条错都没有。所以代理不用时
-          请显式选「强制直连」，别留在「跟随环境」。
-        </div>
+        <!--
+          原来这里有一段说明：「跟随环境」会读 RECON_PROXY → HTTPS_PROXY →
+          HTTP_PROXY；⚠️ 代理进程关掉后出站会静悄悄断掉，任务表现为「卡住、
+          界面像死了」，日志里一条错都没有，所以不用代理时要显式选「强制直连」。
+          **2026-10-07 按要求删掉。**
+
+          口径在别处都有、而且比这里细，删掉不丢：
+          * `README.md` §出站代理（含 2026-10-05 那次 24 分钟零进展的实录）
+          * `backend/core/web/settings.py` 的 ``proxy`` 字段注释（为什么必须三态）
+          * `backend/core/web/manager.py::inject_proxy`（⚠️ 三态原样传，别归一化）
+          * `backend/core/services/http.py::resolve_proxy`（优先级与空串语义）
+          * `backend/tests/test_http.py::test_explicit_empty_string_forces_direct`
+
+          界面上保留下来的那个「当前实际走：X（来自环境变量 Y）」才是真正有用的
+          排查入口 —— 出站被甩去一个关掉的代理时，**只有它**能一眼看出来。
+        -->
 
         <a-divider style="margin: 4px 0 16px" />
 

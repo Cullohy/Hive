@@ -1,6 +1,4 @@
-/* ─────────────────────────────────────────────────────────────
-   主题令牌 —— 与 ARL (HunterX 配色) 一致：近黑侧栏 + 橙红强调色
-   ───────────────────────────────────────────────────────────── */
+/* 主题令牌 —— 与 ARL (HunterX 配色) 一致：近黑侧栏 + 橙红强调色 */
 :root {
   --tk-primary: #1a1a1a;
   --tk-primary-hover: #333333;
@@ -59,31 +57,47 @@ a:hover {
   color: var(--tk-accent-hover);
 }
 
-/* ─────────────────────────────────────────────────────────────
-   ant-design-vue 覆盖：默认主色是紫色，这里统一压成橙红
-   ───────────────────────────────────────────────────────────── */
-.ant-btn-primary {
+/* ── ant-design-vue 覆盖：默认主色是紫色，这里统一压成橙红 ── */
+
+/* ⚠️ 下面三条**必须把 antd 的变体类排除掉**，否则变体会被改坏 —— 而且坏得
+   静默、还不报错，只是"看着不对"：
+
+   · .ant-btn-background-ghost（ghost，本项目 C 段探测页的「扫描」按钮）
+     ghost 的定义是**透明底 + 主色字**。上面那条实心橙底一盖，字色仍是主色橙
+     → **橙字压橙底，字整个看不见**，按钮退化成一个纯色块。
+   · .ant-btn-dangerous（danger，7 处「删除 / 停止」）
+     danger 的红是 antd 自己按 colorError 算的（项目只覆盖了 colorPrimary，
+     没碰 colorError，所以那条红本来就是对的）。被压成橙之后，「删除」跟旁边
+     的「详情」长得一模一样，危险操作一点提示都没有。
+
+   修法是**排除**而不是自己指定颜色 —— 变体交给 antd 自己渲染。
+   验过类名：.ant-btn-background-ghost（table/style 同源，见
+   node_modules/ant-design-vue/es/button/style/index.js）、
+   .ant-btn-dangerous（渲染出的 DOM 上确实带这个类）。 */
+.ant-btn-primary:not(.ant-btn-background-ghost):not(.ant-btn-dangerous) {
   background-color: var(--tk-accent) !important;
   border-color: var(--tk-accent) !important;
 }
-.ant-btn-primary:not(:disabled):hover,
-.ant-btn-primary:not(:disabled):focus {
+.ant-btn-primary:not(.ant-btn-background-ghost):not(.ant-btn-dangerous):not(:disabled):hover,
+.ant-btn-primary:not(.ant-btn-background-ghost):not(.ant-btn-dangerous):not(:disabled):focus {
   background-color: var(--tk-accent-hover) !important;
   border-color: var(--tk-accent-hover) !important;
 }
-.ant-btn-primary:not(:disabled):active {
+.ant-btn-primary:not(.ant-btn-background-ghost):not(.ant-btn-dangerous):not(:disabled):active {
   background-color: var(--tk-accent-dark) !important;
   border-color: var(--tk-accent-dark) !important;
 }
 .ant-btn-default {
   border-color: var(--tk-border);
 }
-.ant-btn-default:not(:disabled):hover {
+/* 同样排除 danger：普通 danger 按钮悬停时不该变成主色橙 */
+.ant-btn-default:not(.ant-btn-dangerous):not(:disabled):hover {
   border-color: var(--tk-accent);
   color: var(--tk-accent);
 }
-.ant-btn-link,
-.ant-btn-link:hover {
+/* 同理排除 danger，否则「删除 / 停止」这些 link 按钮会被染成橙色 */
+.ant-btn-link:not(.ant-btn-dangerous),
+.ant-btn-link:not(.ant-btn-dangerous):hover {
   color: var(--tk-accent) !important;
 }
 
@@ -138,10 +152,10 @@ a:hover {
  * 固定列 —— 固定列自带阴影，再叠一条线会变成双线。
  *
  * ⚠️ 颜色用 **rgba 不用 token**（2026-10-06）：这一列全是白底格，token 里最浅的
- * ``--tk-border-light``(#f0f0f0 ≈ 6% 黑) 画出来仍然一眼就能看见，用户的原话是
+ * `--tk-border-light`(#f0f0f0 ≈ 6% 黑) 画出来仍然一眼就能看见，用户的原话是
  * "线太明显了"。竖线在这里只是"读横向时的锚点"，不是边框，给到 4% 才够。
  * 用 rgba 而不是新增一个 token：这是唯一一处需要比 border-light 更浅的地方，
- * 为它开一个变量会让 ``:root`` 多一个没人用的名字。
+ * 为它开一个变量会让 `:root` 多一个没人用的名字。
  */
 .ant-table-thead > tr > th:not(:last-child),
 .ant-table-tbody > tr > td:not(:last-child) {
@@ -172,6 +186,21 @@ a:hover {
   color: var(--tk-accent) !important;
   border-color: var(--tk-accent) !important;
 }
+/* `button-style="solid"` 的单选组要的是「主色底 + 白字」。
+ *
+ * ⚠️ 上面那条只给了 color、没碰 background，而 solid 组的底色本来就是
+ * antd 的主色（= --tk-accent）—— 两者撞成同一个橙，**橙字压橙底、整块看不见**。
+ * 这与 `.ant-btn-primary` 实心底覆盖 `ghost` 变体是同一类错：只改一半。
+ *
+ * antd 自己那条规则是
+ * `.ant-radio-group-solid .ant-radio-button-wrapper-checked:not(…disabled)`
+ * 且本来就写了白字（radioSolidCheckedColor），这里只是把项目的主题色
+ * 一并补上，别让它退回默认蓝。 */
+.ant-radio-group-solid .ant-radio-button-wrapper-checked:not(.ant-radio-button-wrapper-disabled) {
+  color: #fff !important;
+  background-color: var(--tk-accent) !important;
+  border-color: var(--tk-accent) !important;
+}
 .ant-modal-title,
 .ant-drawer-title {
   color: var(--tk-text) !important;
@@ -183,37 +212,32 @@ a:hover {
 
 /* 日期选择器主题覆盖。
  *
- * 更正一处此前的错误结论：曾写「antd 的浅色调是从 colorPrimary 推导的，
- * #c2410c 推出来偏黄」。**这是错的** —— 用 TinyColor 实测 colorPrimary1..9
+ * 先更正一处曾写进注释的错误结论：「antd 浅色调由 colorPrimary 推导，
+ * #c2410c 会推出来偏黄」。**这是错的** —— TinyColor 实测 colorPrimary1..9
  * 全部落在色相 17-18°（橙红），与主色同色系，没有一档进黄色区间(40-70°)。
- * 当时没验证就写了这段注释。
  *
  * 真正需要覆盖的是下面两类**没有主题 token 管**的色块：
- *   1. .ant-picker-active-bar —— 聚焦时贴着输入框下沿的那条横条。
- *      antd 用 colorPrimary 填充、聚焦时 opacity:1，不受 --tk-* 变量管。
- *      **2026-10-06 起整个 display:none 掉了** —— 它不带信息（选中结果已经
- *      写在输入框里了），详见下面那条规则自己的注释。
- *   2. 面板里单元格的选中/区间/hover 底色。
+ *   1. .ant-picker-active-bar —— 聚焦时贴着输入框下沿的那条横条。antd 用
+ *      colorPrimary 填充、聚焦时 opacity:1，不受 --tk-* 变量管。
+ *      **2026-10-06 起整个 display:none 掉了**，详见下面那条规则自己的注释。
+ *   2. 面板里单元格的选中/区间/today/hover 底色 —— **2026-10-06 起整块拆掉**，
+ *      一律回到"普通日期格"观感（原打算改灰阶，没落地，见下面各条注释）。
  *
- * **② 整块面板在 2026-10-06 改成了灰阶**（选中格深灰 + 白字、today 框与
- * 区间底色用中浅灰）。原先整套跟着主色 #c2410c 走，在一屏灰白的表格里显得很跳。
- * 下面每条规则自己写的是哪个 token，这里只记"为什么"。
- *
- * ⚠️ **输入框聚焦态的外框（.ant-picker-focused）仍然是主色**，不在这次范围内 ——
- *    它标的是"焦点在这个控件上"，是有信息的，且不在面板里。
  * 都**显式**定死，不依赖 antd 的推导算法 —— 算法一改这里也不会跑偏。
- */
+ *
+ * ⚠️ **输入框聚焦态的外框（.ant-picker-focused）仍然是主色**，有意保留：
+ *    它标的是"焦点在这个控件上"，是有信息的，且不在面板里。 */
 /* 选中日期后贴着输入框下沿的那条横条 —— **2026-10-06 起整个去掉**。
  *
- * 它是 antd「焦点在哪个输入框」的指示条：选了起始日就画在起始那一段下面。
- * 先是主色橙红（在一排灰白输入框里像划了一道红线），改成灰的之后更确认了一件事：
- * **这条线本来就不带信息**。焦点在哪个输入框，看光标在哪、看的是"结束日期"
- * 这个占位符有没有被替换掉，都不需要靠一条线来说；选中结果已经明明白白写在
- * 输入框里了（"2026-10-06"）。所以与其挑一个不刺眼的颜色，不如直接不画。
+ * 它是 antd「焦点在哪个输入框」的指示条（选了起始日就画在起始那一段下面）。先是
+ * 主色橙红（在一排灰白输入框里像划了一道红线），改成灰之后更确认了一件事：
+ * **这条线本来就不带信息** —— 焦点在哪个输入框，看光标、看"结束日期"这个占位符
+ * 有没有被替换掉都够，选中结果已经明明白白写在输入框里了（"2026-10-06"）。
+ * 与其挑一个不刺眼的颜色，不如直接不画。
  *
- * 用 ``display: none`` 而不是 ``opacity: 0`` / ``background: transparent``：
- * 前两者这条元素仍然在文档流里被布局与测量，留着一条"看不见但占位"的元素
- * 只会给下一个人添麻烦（曾经就因为"看不见但还在"的东西反复排查过）。
+ * 用 `display: none` 而不是 `opacity: 0` / `background: transparent`：前两者这条
+ * 元素仍然在文档流里被布局与测量，留着一条"看不见但占位"的元素只会给下一个人
+ * 添麻烦（曾经就因为"看不见但还在"的东西反复排查过）。
  */
 .ant-picker-active-bar {
   display: none !important;
@@ -234,61 +258,59 @@ a:hover {
 .ant-picker-dropdown .ant-picker-panel {
   background: var(--tk-surface);
 }
-/* ────────────────────────────────────────────────────────────────────
- * 日期格子的绘制结构（读 antd 4.2.6 源码 date-picker/style/index.js
- * 的 genPickerCellInnerStyle 得出，**不要凭直觉猜**）：
+/* ── 日期格子的绘制结构（读 antd 4.2.6 源码 date-picker/style/index.js 的
+ * genPickerCellInnerStyle 得出，**不要凭直觉猜**）：
  *
- *   td                      选区底色带的一半
- *   td > .cell-inner        圆角方块本体（选中态的实心色画在这）
- *   .cell-inner::before     ① 选区底色带的另一半（controlItemBgActive）
- *                           ② today 标记时叠一圈 **lineType = dashed** 边框
- *                           ③ range-start 时 inset-inline-start: 50%
- *                              range-end   时 inset-inline-end: 50%
+ *   td                   选区底色带的一半
+ *   td > .cell-inner     圆角方块本体（选中态的实心色画在这）
+ *   .cell-inner::before  ① 选区底色带的另一半（controlItemBgActive）
+ *                        ② today 标记时叠一圈 **lineType = dashed** 边框
+ *                        ③ range-start 时 inset-inline-start: 50%
+ *                           range-end   时 inset-inline-end: 50%
  *
  * 两个关键点（都是踩出来的）：
- *   1. 底色带画在 **::before** 上，是 position:absolute 的独立矩形。
- *      只改 td.background，选区会一半新色一半旧色。
- *   2. today 的虚线是 `border: Npx dashed colorPrimary` 写在 ::before 上。
- *      **只改 border-color 改不掉虚线**，border-style 仍是 dashed ——
- *      我上一次就只写了 border-color，结果虚线原封不动地留着
- *      （用户第二次贴图说「还是好丑，你看看这个虚线」）。
- * ──────────────────────────────────────────────────────────────────── */
+ *   1. 底色带画在 **::before** 上，是 position:absolute 的独立矩形 —— 只改
+ *      td.background，选区会一半新色一半旧色。
+ *   2. today 的虚线是 `border: Npx dashed colorPrimary` 写在 ::before 上，
+ *      **只改 border-color 改不掉**，border-style 仍是 dashed（曾只写了
+ *      border-color，虚线原封不动，用户第二次贴图还在问「这个虚线」）。
+ * ── */
 
 /* ══ 兜底：悬停预览选区**不允许出现任何虚线** ══
  *
- * 放在最前面**故意如此** —— 它靠特异性（0,1,0 + 伪元素）低于下面那些
- * 精确规则（0,2,0 及以上），所以即使同文件里在后面，两者也不打架。
+ * 放在最前面**故意如此** —— 它靠特异性（0,1,0 + 伪元素）低于下面那些精确规则
+ * （0,2,0 及以上），所以即使同文件里排在后面，两者也不打架。
  *
  * 为什么需要兜底：antd 在 date-picker 里用 dashed 画了**不止一处**（源码
  * `es/date-picker/style/index.js` 里 grep 到 8 处），载体有 ::before/::after、
- * 触发条件有 today / range-hover / edge-start / edge-end，而且**只在鼠标
- * 悬停时**才出现。我前两版都是「枚举一部分 class 覆盖」，连着漏了两次
- * （先漏 today 的 ::before，再漏 range-hover 的 ::after）。
+ * 触发条件有 today / range-hover / edge-start / edge-end，而且**只在鼠标悬停
+ * 时**才出现。前两版都是「枚举一部分 class 覆盖」，连着漏了两次（先漏 today 的
+ * ::before，再漏 range-hover 的 ::after）。
  *
- * ⚠️ 这里**只能用 border:none，不能用 border-style:solid** ——
- *    solid 会让原本 border-width:0 的元素也显形出边框，整个面板变成一堆
- *    黑框（试过，很丑）。none 是「本来就什么都没有」的语义，天然安全。
+ * ⚠️ 这里**只能用 border:none，不能用 border-style:solid** —— solid 会让原本
+ *    border-width:0 的元素也显形出边框，整个面板变成一堆黑框（试过，很丑）。
+ *    none 是「本来就什么都没有」的语义，天然安全。
  *
- * 用 [class*="range-hover"] 属性选择器而不是逐个枚举 class 名：
- * antd 的变体很多（hover / hover-start / hover-end / edge-start /
- * edge-end / 各 near-range 组合），枚举必然漏，属性选择器一次盖全，
- * 且不影响普通格子（普通格子的 class 里没有 range-hover）。
+ * 用 [class*="range-hover"] 属性选择器而不是逐个枚举 class 名：antd 变体很多
+ * （hover / hover-start / hover-end / edge-start / edge-end / 各 near-range 组合），
+ * 枚举必然漏；属性选择器一次盖全，且不影响普通格子（普通格子 class 里没有
+ * range-hover）。
  */
 /* ══ 选区**不做任何视觉处理**（2026-10-06，用户要求）══
  *
  * 之前这一段堆了十几条规则专门调颜色：深灰实心块、中灰 today 块、浅灰区间带、
  * 悬停预览同色、虚线框……每修一版就冒出下一版（灰带乱弹 → 块断开 → today 认不出）。
- * 根因是 antd 把选区画在**三个载体**上，而 rc-picker 的悬停预览还会在运行期
+ * 根因是 antd 把选区画在**四个载体**上，而 rc-picker 的悬停预览还会在运行期
  * 临时改写其中两个：
- *   ① td ::before            —— 区间底色带（position:absolute 的独立矩形）
- *   ② td > .cell-inner       —— 选中格的圆角实心块
- *   ③ .cell-inner::after     —— 悬停预览那条 top:0/bottom:0 的带
- *   ④ .cell-inner::before    —— today 的虚线圈 / 两端的半圆头（inset 50%）
+ *   ① td ::before         —— 区间底色带（position:absolute 的独立矩形）
+ *   ② td > .cell-inner    —— 选中格的圆角实心块
+ *   ③ .cell-inner::after  —— 悬停预览那条 top:0/bottom:0 的带
+ *   ④ .cell-inner::before —— today 的虚线圈 / 两端的半圆头（inset 50%）
  * 逐个调色必然顾此失彼 —— 枚举永远追不全。
  *
- * 所以整块拆掉：选中 / 区间 / today / 悬停预览 / 禁用格一律回到"普通日期格"
- * 的观感。选了哪几天，**输入框里写着**（"2026-10-08 → 2026-10-17"），
- * 面板不必再重复表达一遍 —— 之前那堆颜色唯一真正携带的信息，就是这个。
+ * 所以整块拆掉：选中 / 区间 / today / 悬停预览 / 禁用格一律回到"普通日期格"的
+ * 观感。选了哪几天，**输入框里写着**（"2026-10-08 → 2026-10-17"），面板不必
+ * 再重复表达一遍 —— 之前那堆颜色唯一真正携带的信息，就是这个。
  *
  * ⚠️ 下面四类载体必须**一起**清，漏一个就会在面板上漏出半截色块（缺 ② 最明显：
  * 深色带子上浮着一排看不清的字）。清 background 用 transparent 而不是"不写"，
@@ -308,17 +330,14 @@ a:hover {
   border: none !important;
 }
 
-/* ⚠️ ⑤ 禁用格（`disabledDate` 限定范围之外的日期）—— 这一条是 2026-10-06
- * 补上的，之前漏了整整一版。
+/* ⚠️ ⑤ 禁用格（`disabledDate` 限定范围之外的日期）—— 2026-10-06 才补上，之前漏了
+ * 整整一版。症状是"选区起点的上方连着好几行灰带"。
  *
- * 症状是"选区起点的上方连着好几行灰带"。查 antd 源码 194-202 行：
- *   `-disabled` → `cell-inner { background: transparent }`
- *               → `&::before  { background: colorBgContainerDisabled }`
- * **灰带画在 td 的 ::before 上**，而我们只清了 `.cell-inner` —— 所以看起来
- * "清了一半"。`inner` 明明是透明的，底下还压着一条整格的 ::before。
- *
- * 之前一直没认出来，是因为它长得太像"选区底色带"了：同样是横贯一整行、
- * 同样是浅灰、同样在 ::before 上。
+ * antd date-picker 源码里 `-disabled` 那段：`cell-inner { background: transparent }`
+ * → `&::before { background: colorBgContainerDisabled }`。**灰带画在 td 的
+ * ::before 上**，而我们只清了 `.cell-inner`，所以看起来像"清了一半" —— `inner`
+ * 明明是透明的，底下还压着一条整格的 ::before。之前一直没认出来，是因为它长得
+ * 太像"选区底色带"了：同样是横贯一整行、同样浅灰、同样在 ::before 上。
  */
 .ant-picker-cell-disabled::before,
 .ant-picker-cell-disabled::after {
@@ -351,23 +370,21 @@ a:hover {
 
 /* ── 悬停预览选区的虚线框（这才是「横在选区上那道橙虚线」的真正来源）──
  *
- * antd 画它用的是 **::after**，四条边全是 dashed：
- *   borderTop / borderBottom                     —— 上下两条横线
- *   borderInlineStart（Edge start）/ borderInlineEnd（Edge end） —— 左右两条竖线
- * 合起来是一个虚线矩形，颜色 ``pickerDateHoverRangeBorderColor``（跟随主色，
- * 所以看起来是橙红）。
+ * antd 画它用的是 **::after**，四条边全是 dashed：borderTop / borderBottom
+ * （上下两条横线）与 borderInlineStart（Edge start）/ borderInlineEnd（Edge end）
+ * （左右两条竖线），合起来是一个虚线矩形，颜色 `pickerDateHoverRangeBorderColor`
+ * 跟随主色，所以看起来是橙红。
  *
  * ⚠️ 两个关键点（我前两次都漏了）：
- *   1. 载体是 **::after**，不是 ::before。前面那几条 today/两端规则全打在
+ *   1. 载体是 **::after**，不是 ::before —— 前面那几条 today/两端规则全打在
  *      ::before 上，对它一点用都没有。
- *   2. 只在**鼠标悬停**时出现（class 名带 ``range-hover``）。静态扫 DOM
- *      扫不到它 —— 我就是因此连续两次漏掉，最后是 grep antd 源码里
- *      所有 `dashed` 字面量才定位到（date-picker/style/index.js 共 8 处）。
+ *   2. 只在**鼠标悬停**时出现（class 名带 `range-hover`），静态扫 DOM 扫不到 ——
+ *      我就是因此连续两次漏掉，最后是 grep antd 源码里所有 `dashed` 字面量才定位到
+ *      （date-picker/style/index.js 共 8 处）。
  *
- * 精确覆盖已在下面用 [class*='range-hover'] 一次盖全（三个载体都要管，而且
- * **必须与真实选区同色而不是设成透明** —— 见那条规则自己的注释），这里不再
- * 逐个枚举 class 名 —— 枚举必然漏（antd 有 hover/hover-start/hover-end/edge-start/
- * edge-end 以及各自的 near-range 组合），这是我前两版反复漏网的直接原因。
+ * 精确覆盖见下面那条 `[class*='range-hover']` —— 一次盖全，不再逐个枚举 class 名
+ * （枚举必然漏：antd 有 hover/hover-start/hover-end/edge-start/edge-end 以及各自
+ * 的 near-range 组合，这是我前两版反复漏网的直接原因）。
  */
 
 /* 非本月/非本年的占位格（上一月尾、下月头）：淡灰无底色。
@@ -383,14 +400,13 @@ a:hover {
 }
 /* hover 也一并平掉（2026-10-06）。
  *
- * 选区特效拆干净之后，鼠标停在某一天上还会留下一块浅灰圆角块 —— 那是
- * antd 的 cell hover（我们自己也覆盖过一次，用的是 --tk-border）。
- * 用户看到的就是"怎么还有选中特效"：那个方块落在**刚选中的那一天**上，
- * 视觉上完全没法和选中态区分开。既然面板已经不表达选区了，
- * hover 再单独涂一块颜色只会更像"选中"。整块一起清掉。
+ * 选区特效拆干净之后，鼠标停在某一天上还会留下一块浅灰圆角块 —— 那是 antd 的
+ * cell hover（我们自己也覆盖过一次，用的是 --tk-border）。用户看到的就是"怎么
+ * 还有选中特效"：那个方块落在**刚选中的那一天**上，视觉上完全没法和选中态区分开。
+ * 既然面板已经不表达选区了，hover 再单独涂一块颜色只会更像"选中"，整块清掉。
  *
- * 一条 ``:hover .inner`` 盖全即可，不需要再排开 selected/in-range ——
- * 那些状态本身已经不涂底色了。
+ * 一条 `:hover .inner` 盖全即可，不需要再排开 selected/in-range —— 那些状态
+ * 本身已经不涂底色了。
  */
 .ant-picker-cell:hover .ant-picker-cell-inner {
   background: transparent !important;
@@ -445,9 +461,7 @@ a:hover {
   background: #9ca3af;
 }
 
-/* ─────────────────────────────────────────────────────────────
-   通用小工具
-   ───────────────────────────────────────────────────────────── */
+/* ── 通用小工具 ── */
 .tk-page {
   /* 页面内容容器：所有视图统一用它，保证留白一致 */
   padding: 0;
