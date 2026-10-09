@@ -78,6 +78,7 @@ import { useRoute, useRouter } from 'vue-router'
 import {
   AppstoreOutlined,
   ClusterOutlined,
+  DashboardOutlined,
   DatabaseOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
@@ -122,6 +123,7 @@ const router = useRouter()
 // 「一键收集」曾经单独占一页，现在收进任务管理的工具栏（创建任务按钮）——
 // 它的产物本来就是任务，单独一页只是多一次跳转。
 const menuItems = [
+  { key: 'dashboard', label: '仪表盘', icon: DashboardOutlined, path: '/dashboard' },
   { key: 'task', label: '任务管理', icon: AppstoreOutlined, path: '/taskList' },
   { key: 'assets', label: '资产管理', icon: DatabaseOutlined, path: '/assets' },
   { key: 'asset-groups', label: '资产分组', icon: ClusterOutlined, path: '/asset-groups' },

@@ -5,12 +5,18 @@ const TaskDetailView = () => import('@/views/TaskDetailView.vue')
 const AssetView = () => import('@/views/AssetView.vue')
 const AssetGroupView = () => import('@/views/AssetGroupView.vue')
 const FingerprintView = () => import('@/views/FingerprintView.vue')
+const DashboardView = () => import('@/views/DashboardView.vue')
 
 // 菜单结构对标 ARL：图标 + 中文标签，顺序也保持一致的观感
 const routes = [
-  // 首页就是任务管理 —— 创建任务的入口在那一页的工具栏上，
-  // 不再单独占一个「一键收集」页面。
-  { path: '/', redirect: '/taskList' },
+  // 首页重定向到仪表盘（2026-10-08 新增）
+  { path: '/', redirect: '/dashboard' },
+  {
+    path: '/dashboard',
+    name: 'dashboard',
+    component: DashboardView,
+    meta: { title: '仪表盘', menu: 'dashboard' },
+  },
   {
     path: '/taskList',
     name: 'task-list',
